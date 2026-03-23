@@ -17,8 +17,8 @@ export async function preloadSounds(): Promise<void> {
       { shouldPlay: false, volume: 0.6 }
     );
     scanErrorSound = error;
-  } catch (e) {
-    console.warn('[feedback] Failed to preload sounds:', e);
+  } catch {
+    // sounds unavailable — continue without audio
   }
 }
 

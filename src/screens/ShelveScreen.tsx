@@ -8,6 +8,7 @@ import {
   Alert,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
+import { useNavigation } from '@react-navigation/native';
 import { useApp } from '../context/AppContext';
 import { getOrCreateShelf, addShelfItem, getShelfItemCount } from '../database/shelves';
 import { addToSyncQueue } from '../database/sync-queue';
@@ -18,12 +19,14 @@ import ScanInput from '../components/ScanInput';
 import BucketEntry from '../components/BucketEntry';
 import SyncBanner from '../components/SyncBanner';
 import ScanConfirmation from '../components/ScanConfirmation';
+import EntriesLog from '../components/EntriesLog';
 import { ScanPhase, ShelvedBucketEntry } from '../types';
 import { onScanSuccess, onScanError } from '../utils/feedback';
 import { colors, fontFamily, fontSize, spacing, borderRadius } from '../theme';
 
 export default function ShelveScreen() {
-  const { isConnected, refreshStats } = useApp();
+  const { isConnected, refreshStats, isXflora } = useApp();
+  const navigation = useNavigation<any>();
   const [phase, setPhase] = useState<ScanPhase>('scan-shelf');
   const [currentShelf, setCurrentShelf] = useState<string | null>(null);
   const [bucketCount, setBucketCount] = useState(0);
@@ -37,6 +40,11 @@ export default function ShelveScreen() {
   const showConfirmation = (type: 'success' | 'error', message: string) => {
     setConfirmation({ visible: true, type, message });
   };
+
+  const handleGoToReceiving = useCallback((bucketId: string) => {
+    if (isXflora) return;
+    navigation.navigate('Receive', { prefillBucketId: bucketId });
+  }, [navigation, isXflora]);
 
   const resetToShelfScan = useCallback(() => {
     setPhase('scan-shelf');
@@ -168,23 +176,32 @@ export default function ShelveScreen() {
 
             {/* Bucket scan input */}
             <View style={styles.inputSection}>
-              <Text style={styles.label}>Scan bucket</Text>
+              <Text style={styles.label}>{isXflora ? 'Scan coldroom bucket' : 'Scan bucket'}</Text>
               <ScanInput
-                placeholder="Bucket ID"
-                scannerTitle="Scan Bucket QR Code"
+                placeholder={isXflora ? 'Coldroom bucket ID' : 'Bucket ID'}
+                scannerTitle={isXflora ? 'Scan Coldroom Bucket QR Code' : 'Scan Bucket QR Code'}
                 onScan={handleBucketScanned}
               />
             </View>
 
-            {/* Entries */}
-            <Text style={styles.countText}>{entries.length} scanned</Text>
-            {entries.map((entry, idx) => (
-              <BucketEntry key={`${entry.bucket_id}-${idx}`} entry={entry} index={idx} />
-            ))}
-
             {entries.length === 0 && (
-              <Text style={styles.emptyText}>Scan buckets to shelve them</Text>
+              <Text style={styles.emptyText}>
+                {isXflora ? 'Scan coldroom buckets to shelve them' : 'Scan buckets to shelve them'}
+              </Text>
             )}
+
+            <EntriesLog
+              entries={entries}
+              label="bucket"
+              renderEntry={(entry, idx) => (
+                <BucketEntry
+                  key={`${entry.bucket_id}-${idx}`}
+                  entry={entry}
+                  index={idx}
+                  onGoToReceiving={isXflora ? undefined : handleGoToReceiving}
+                />
+              )}
+            />
 
             {/* Next shelf */}
             <TouchableOpacity style={styles.nextButton} onPress={resetToShelfScan} activeOpacity={0.6}>

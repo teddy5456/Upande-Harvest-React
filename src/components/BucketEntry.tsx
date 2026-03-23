@@ -1,15 +1,29 @@
 import React from 'react';
-import { View, Text, StyleSheet } from 'react-native';
+import { View, Text, StyleSheet, TouchableOpacity } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { ShelvedBucketEntry } from '../types';
-import { colors, fontFamily, fontSize, spacing } from '../theme';
+import { colors, fontFamily, fontSize, spacing, borderRadius } from '../theme';
 
 interface BucketEntryProps {
   entry: ShelvedBucketEntry;
   index: number;
+  onGoToReceiving?: (bucketId: string) => void;
 }
 
-export default function BucketEntry({ entry, index }: BucketEntryProps) {
+function isReceivingError(message?: string): boolean {
+  if (!message) return false;
+  const lower = message.toLowerCase();
+  return (
+    lower.includes('receiv') ||
+    lower.includes('not in use') ||
+    lower.includes('no stock entry') ||
+    lower.includes('not found')
+  );
+}
+
+export default function BucketEntry({ entry, index, onGoToReceiving }: BucketEntryProps) {
+  const isError = entry.status === 'error';
+
   const statusColor =
     entry.status === 'success'
       ? colors.success
@@ -24,8 +38,10 @@ export default function BucketEntry({ entry, index }: BucketEntryProps) {
         ? 'time'
         : 'alert-circle';
 
+  const showReceivingAction = isError && isReceivingError(entry.message) && !!onGoToReceiving;
+
   return (
-    <View style={styles.row}>
+    <View style={[styles.row, isError && styles.rowError]}>
       <View style={styles.indexCol}>
         <Text style={styles.indexText}>{index + 1}</Text>
       </View>
@@ -45,6 +61,19 @@ export default function BucketEntry({ entry, index }: BucketEntryProps) {
             <Text style={styles.detailText}>{entry.greenhouse}</Text>
           ) : null}
         </View>
+        {isError && entry.message ? (
+          <Text style={styles.errorMsg}>{entry.message}</Text>
+        ) : null}
+        {showReceivingAction ? (
+          <TouchableOpacity
+            style={styles.actionButton}
+            onPress={() => onGoToReceiving!(entry.bucket_id)}
+            activeOpacity={0.7}
+          >
+            <Ionicons name="download-outline" size={13} color={colors.textOnPrimary} />
+            <Text style={styles.actionButtonText}>Receive this bucket first</Text>
+          </TouchableOpacity>
+        ) : null}
         <Text style={styles.time}>{entry.time}</Text>
       </View>
       <View style={styles.statusCol}>
@@ -62,6 +91,11 @@ const styles = StyleSheet.create({
     padding: spacing.md,
     borderBottomWidth: StyleSheet.hairlineWidth,
     borderBottomColor: colors.border,
+  },
+  rowError: {
+    backgroundColor: '#FFF5F5',
+    borderLeftWidth: 3,
+    borderLeftColor: colors.error,
   },
   indexCol: {
     width: 28,
@@ -100,5 +134,27 @@ const styles = StyleSheet.create({
   },
   statusCol: {
     marginLeft: spacing.sm,
+  },
+  errorMsg: {
+    fontFamily: fontFamily.regular,
+    fontSize: fontSize.xs,
+    color: colors.error,
+    marginTop: 3,
+  },
+  actionButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 5,
+    backgroundColor: colors.error,
+    paddingHorizontal: spacing.sm,
+    paddingVertical: 5,
+    borderRadius: borderRadius.sm,
+    alignSelf: 'flex-start',
+    marginTop: spacing.sm,
+  },
+  actionButtonText: {
+    fontFamily: fontFamily.semiBold,
+    fontSize: fontSize.xs,
+    color: colors.textOnPrimary,
   },
 });

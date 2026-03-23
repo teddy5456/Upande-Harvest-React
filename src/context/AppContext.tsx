@@ -5,12 +5,23 @@ import { getPendingCount, getFailedCount } from '../database/sync-queue';
 import { syncPendingEntries, SyncResult } from '../services/sync';
 import { useNetworkStatus } from '../hooks/useNetworkStatus';
 import { getDatabase } from '../database/database';
-import { getAuthToken, getSid, clearAuth as clearAuthStorage, getFullName as getStoredFullName, getUserEmail as getStoredUserEmail } from '../database/settings';
+import { getSid, getApiUrl, clearAuth as clearAuthStorage, getFullName as getStoredFullName, getUserEmail as getStoredUserEmail, getUserRoles as getStoredUserRoles } from '../database/settings';
 import { preloadSounds, unloadSounds } from '../utils/feedback';
+import { clearFarmCache } from '../utils/farm-cache';
+
+export interface SyncLog {
+  id: string;
+  type: 'error' | 'success' | 'warning' | 'info';
+  message: string;
+  time: string;
+}
 
 interface AppContextType {
   isReady: boolean;
   isLoggedIn: boolean;
+  isXflora: boolean;
+  isHarvester: boolean;
+  userRoles: string[];
   fullName: string;
   userEmail: string;
   stats: DashboardStats;
@@ -19,17 +30,23 @@ interface AppContextType {
   isConnected: boolean;
   isSyncing: boolean;
   lastSyncResult: SyncResult | null;
+  logs: SyncLog[];
   refreshStats: () => Promise<void>;
   triggerSync: () => Promise<void>;
+  retryConnection: () => Promise<void>;
+  pushLog: (type: SyncLog['type'], message: string) => void;
   setLoggedIn: (value: boolean) => void;
+  setIsXflora: (value: boolean) => void;
   setFullName: (name: string) => void;
   setUserEmail: (email: string) => void;
+  setUserRoles: (roles: string[]) => void;
   logout: () => Promise<void>;
 }
 
 const AppContext = createContext<AppContextType>({
   isReady: false,
   isLoggedIn: false,
+  isXflora: false,
   fullName: '',
   userEmail: '',
   stats: { total_shelves: 0, occupied_shelves: 0, empty_shelves: 0, total_buckets: 0, pending_sync: 0 },
@@ -38,19 +55,29 @@ const AppContext = createContext<AppContextType>({
   isConnected: true,
   isSyncing: false,
   lastSyncResult: null,
+  logs: [],
   refreshStats: async () => {},
   triggerSync: async () => {},
+  retryConnection: async () => {},
+  pushLog: () => {},
   setLoggedIn: () => {},
+  setIsXflora: () => {},
   setFullName: () => {},
   setUserEmail: () => {},
+  setUserRoles: () => {},
   logout: async () => {},
+  isHarvester: false,
+  userRoles: [],
 });
 
 export function AppProvider({ children }: { children: React.ReactNode }) {
   const [isReady, setIsReady] = useState(false);
   const [isLoggedIn, setLoggedIn] = useState(false);
+  const [isXflora, setIsXflora] = useState(false);
+  const [userRoles, setUserRoles] = useState<string[]>([]);
   const [fullName, setFullName] = useState('');
   const [userEmail, setUserEmail] = useState('');
+  const isHarvester = userRoles.some(r => r.toLowerCase().includes('harvest'));
   const [stats, setStats] = useState<DashboardStats>({
     total_shelves: 0, occupied_shelves: 0, empty_shelves: 0, total_buckets: 0, pending_sync: 0,
   });
@@ -58,26 +85,58 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [failedSync, setFailedSync] = useState(0);
   const [isSyncing, setIsSyncing] = useState(false);
   const [lastSyncResult, setLastSyncResult] = useState<SyncResult | null>(null);
-  const isConnected = useNetworkStatus();
+  const [logs, setLogs] = useState<SyncLog[]>([]);
+  const { isConnected, forceCheck } = useNetworkStatus();
   const syncInProgress = useRef(false);
+  const prevConnected = useRef<boolean | null>(null);
+
+  const pushLog = useCallback((type: SyncLog['type'], message: string) => {
+    const entry: SyncLog = {
+      id: `${Date.now()}-${Math.random()}`,
+      type,
+      message,
+      time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+    };
+    setLogs(prev => [entry, ...prev].slice(0, 50));
+  }, []);
 
   useEffect(() => {
     (async () => {
       await getDatabase();
       await preloadSounds();
-      const sid = await getSid();
-      const auth = await getAuthToken();
-      if (sid || auth) {
+      const auth = await getSid();
+      if (auth) {
         setLoggedIn(true);
         const name = await getStoredFullName();
         const email = await getStoredUserEmail();
+        const roles = await getStoredUserRoles();
         if (name) setFullName(name);
         if (email) setUserEmail(email);
+        if (roles.length > 0) setUserRoles(roles);
+        const url = await getApiUrl();
+        setIsXflora(url.toLowerCase().includes('xflora'));
       }
       setIsReady(true);
     })();
     return () => { unloadSounds(); };
   }, []);
+
+  // Log connectivity changes (skip initial mount)
+  useEffect(() => {
+    if (!isReady) return;
+    if (prevConnected.current === null) {
+      prevConnected.current = isConnected;
+      return;
+    }
+    if (prevConnected.current !== isConnected) {
+      if (!isConnected) {
+        pushLog('warning', 'Went offline');
+      } else {
+        pushLog('info', 'Back online');
+      }
+      prevConnected.current = isConnected;
+    }
+  }, [isConnected, isReady, pushLog]);
 
   const refreshStats = useCallback(async () => {
     try {
@@ -97,17 +156,32 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     try {
       const result = await syncPendingEntries();
       setLastSyncResult(result);
+      if (result.synced > 0) {
+        pushLog('success', `Synced ${result.synced} entr${result.synced === 1 ? 'y' : 'ies'}`);
+      }
+      if (result.failed > 0) {
+        pushLog('error', `${result.failed} entr${result.failed === 1 ? 'y' : 'ies'} failed to sync`);
+      }
       await refreshStats();
-    } catch {}
+    } catch (err: any) {
+      pushLog('error', `Sync error: ${err?.message ?? 'Unknown error'}`);
+    }
     setIsSyncing(false);
     syncInProgress.current = false;
-  }, [refreshStats]);
+  }, [refreshStats, pushLog]);
+
+  const retryConnection = useCallback(async () => {
+    pushLog('info', 'Checking connection…');
+    await forceCheck();
+  }, [forceCheck, pushLog]);
 
   const logout = useCallback(async () => {
+    clearFarmCache();
     await clearAuthStorage();
     setLoggedIn(false);
     setFullName('');
     setUserEmail('');
+    setUserRoles([]);
   }, []);
 
   useEffect(() => {
@@ -127,6 +201,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       value={{
         isReady,
         isLoggedIn,
+        isXflora,
+        isHarvester,
+        userRoles,
         fullName,
         userEmail,
         stats,
@@ -135,11 +212,16 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         isConnected,
         isSyncing,
         lastSyncResult,
+        logs,
         refreshStats,
         triggerSync,
+        retryConnection,
+        pushLog,
         setLoggedIn,
+        setIsXflora,
         setFullName,
         setUserEmail,
+        setUserRoles,
         logout,
       }}
     >

@@ -1,326 +1,420 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useRef } from 'react';
 import {
   View,
   Text,
   StyleSheet,
   ScrollView,
-  Alert,
+  TouchableOpacity,
+  TextInput,
+  ActivityIndicator,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { useApp } from '../context/AppContext';
 import { addToSyncQueue } from '../database/sync-queue';
 import { getFarm } from '../database/settings';
 import { addGradingEntry } from '../database/grading';
-import { submitGrading } from '../services/api';
+import { submitGrading, getBucketBalance, submitBucketReject } from '../services/api';
 import {
-  parseScannedBunchQR,
-  parseScannedGraderQR,
-  parseScannedGradingBucketQR,
+  detectGradingQRType,
+  extractGradingQRValue,
 } from '../utils/grading-utils';
 import ScanInput from '../components/ScanInput';
 import GradingEntryComponent from '../components/GradingEntry';
 import SyncBanner from '../components/SyncBanner';
 import ScanConfirmation from '../components/ScanConfirmation';
-import { GradingScanPhase, GradedEntry } from '../types';
+import EntriesLog from '../components/EntriesLog';
+import { GradedEntry, BucketBalance } from '../types';
 import { onScanSuccess, onScanError } from '../utils/feedback';
 import { colors, fontFamily, fontSize, spacing, borderRadius } from '../theme';
 
-const STEPS: { key: GradingScanPhase; label: string; title: string; hint: string }[] = [
-  {
-    key: 'scan-bunch',
-    label: 'Bunch',
-    title: 'Scan Bunch',
-    hint: 'Point your camera at a bunch QR code to begin grading',
-  },
-  {
-    key: 'scan-grader',
-    label: 'Grader',
-    title: 'Scan Grader',
-    hint: "Now scan the grader's employee QR code",
-  },
-  {
-    key: 'scan-bucket',
-    label: 'Bucket',
-    title: 'Scan Bucket',
-    hint: 'Finally, scan the destination bucket QR code',
-  },
-];
+type SlotKey = 'bunch' | 'grader' | 'bucket';
+const SLOT_ORDER: SlotKey[] = ['bunch', 'grader', 'bucket'];
+
+const SLOT_META: Record<SlotKey, { label: string; icon: keyof typeof Ionicons.glyphMap }> = {
+  bunch: { label: 'Bunch', icon: 'leaf-outline' },
+  grader: { label: 'Grader', icon: 'person-outline' },
+  bucket: { label: 'Bucket', icon: 'archive-outline' },
+};
+
+type Mode = 'grade' | 'rejects';
 
 export default function GradeScreen() {
   const { isConnected, refreshStats } = useApp();
-  const [phase, setPhase] = useState<GradingScanPhase>('scan-bunch');
-  const [bunchId, setBunchId] = useState<string | null>(null);
-  const [graderId, setGraderId] = useState<string | null>(null);
+
+  // ── Grade mode state ──────────────────────────────────────────
+  const [slots, setSlots] = useState<Record<SlotKey, string | null>>({ bunch: null, grader: null, bucket: null });
   const [entries, setEntries] = useState<GradedEntry[]>([]);
-  const [confirmation, setConfirmation] = useState<{
-    visible: boolean;
-    type: 'success' | 'error';
-    message: string;
-  }>({ visible: false, type: 'success', message: '' });
+  const [submitting, setSubmitting] = useState(false);
+  const forcedSlotRef = useRef<SlotKey | null>(null);
 
-  const showConfirmation = (type: 'success' | 'error', message: string) => {
+  // ── Rejects mode state ────────────────────────────────────────
+  const [mode, setMode] = useState<Mode>('grade');
+  const [rejBucketId, setRejBucketId] = useState<string | null>(null);
+  const [rejGrader, setRejGrader] = useState<string | null>(null);
+  const [rejQty, setRejQty] = useState<string>('');
+  const [bucketBalance, setBucketBalance] = useState<BucketBalance | null>(null);
+  const [loadingBalance, setLoadingBalance] = useState(false);
+  const [rejSubmitting, setRejSubmitting] = useState(false);
+  const [rejSlot, setRejSlot] = useState<'bucket' | 'grader'>('bucket');
+
+  // ── Shared confirmation ───────────────────────────────────────
+  const [confirmation, setConfirmation] = useState<{ visible: boolean; type: 'success' | 'error'; message: string }>(
+    { visible: false, type: 'success', message: '' }
+  );
+
+  const showConfirmation = (type: 'success' | 'error', message: string) =>
     setConfirmation({ visible: true, type, message });
-  };
 
-  const resetToStart = useCallback(() => {
-    setPhase('scan-bunch');
-    setBunchId(null);
-    setGraderId(null);
+  // ── Grade mode handlers ───────────────────────────────────────
+  const resetSlots = useCallback(() => {
+    setSlots({ bunch: null, grader: null, bucket: null });
+    forcedSlotRef.current = null;
   }, []);
 
-  const handleBunchScanned = useCallback(
-    (data: string) => {
-      const parsed = parseScannedBunchQR(data);
-      if (!parsed) {
-        onScanError();
-        Alert.alert('Invalid', 'Could not read a bunch ID.');
-        return;
-      }
-      setBunchId(parsed);
-      setPhase('scan-grader');
-      onScanSuccess();
-      showConfirmation('success', `Bunch ${parsed}`);
-    },
-    []
-  );
+  const handleScanned = useCallback(async (data: string) => {
+    if (submitting) return;
+    const value = extractGradingQRValue(data);
+    if (!value) return;
 
-  const handleGraderScanned = useCallback(
-    (data: string) => {
-      const parsed = parseScannedGraderQR(data);
-      if (!parsed) {
-        onScanError();
-        Alert.alert('Invalid', 'Could not read a grader ID.');
-        return;
-      }
-      setGraderId(parsed);
-      setPhase('scan-bucket');
-      onScanSuccess();
-      showConfirmation('success', `Grader ${parsed}`);
-    },
-    []
-  );
+    let detected = detectGradingQRType(data);
+    if (forcedSlotRef.current) { detected = forcedSlotRef.current; forcedSlotRef.current = null; }
+    if (detected === 'unknown') {
+      const next = SLOT_ORDER.find((s) => !slots[s]);
+      if (!next) return;
+      detected = next;
+    }
 
-  const handleBucketScanned = useCallback(
-    async (data: string) => {
-      const bucketId = parseScannedGradingBucketQR(data);
-      if (!bucketId || !bunchId || !graderId) {
-        onScanError();
-        Alert.alert('Invalid QR', 'Could not read a bucket ID from this QR code.');
-        return;
-      }
+    const target = detected as SlotKey;
+    const newSlots = { ...slots, [target]: value };
+    setSlots(newSlots);
+    onScanSuccess();
+    showConfirmation('success', `${SLOT_META[target].label}: ${value}`);
 
-      const now = new Date().toLocaleTimeString();
-      const farm = await getFarm();
+    if (newSlots.bunch && newSlots.grader && newSlots.bucket) {
+      setSubmitting(true);
+      await doSubmit(newSlots.bunch, newSlots.grader, newSlots.bucket);
+      setSubmitting(false);
+      resetSlots();
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [slots, submitting, resetSlots]);
 
-      if (isConnected) {
-        try {
-          const response = await submitGrading(bunchId, graderId, bucketId, farm);
+  const doSubmit = async (bunchId: string, graderId: string, bucketId: string) => {
+    const now = new Date().toLocaleTimeString();
+    const farm = await getFarm();
 
-          await addGradingEntry(
-            bunchId,
-            graderId,
-            bucketId,
-            farm,
-            response.variety ?? '',
-            response.stem_length ?? '',
-            response.qty ?? 0,
-            true
-          );
-
-          const newEntry: GradedEntry = {
-            bunch_id: bunchId,
-            grader: graderId,
-            bucket_id: bucketId,
-            variety: response.variety ?? '',
-            stem_length: response.stem_length ?? '',
-            qty: response.qty ?? 0,
-            time: now,
-            status: 'success',
-            message: `${response.qty} stems`,
-          };
-
-          setEntries((prev) => [newEntry, ...prev]);
-          await refreshStats();
-          onScanSuccess();
-          showConfirmation('success', `Graded: ${response.qty ?? 0} stems`);
-        } catch (error: any) {
-          await addToSyncQueue('mobile_grading_entry', {
-            bunch_id: bunchId,
-            grader: graderId,
-            bucket_id: bucketId,
-            farm,
-          });
-
-          await addGradingEntry(bunchId, graderId, bucketId, farm, '', '', 0, false);
-
-          const newEntry: GradedEntry = {
-            bunch_id: bunchId,
-            grader: graderId,
-            bucket_id: bucketId,
-            variety: '',
-            stem_length: '',
-            qty: 0,
-            time: now,
-            status: 'error',
-            message: error.message,
-          };
-          setEntries((prev) => [newEntry, ...prev]);
-          await refreshStats();
-          onScanError();
-          showConfirmation('error', error.message);
-        }
-      } else {
-        await addToSyncQueue('mobile_grading_entry', {
-          bunch_id: bunchId,
-          grader: graderId,
-          bucket_id: bucketId,
-          farm,
-        });
-
-        await addGradingEntry(bunchId, graderId, bucketId, farm, '', '', 0, false);
-
-        const newEntry: GradedEntry = {
-          bunch_id: bunchId,
-          grader: graderId,
-          bucket_id: bucketId,
-          variety: '',
-          stem_length: '',
-          qty: 0,
-          time: now,
-          status: 'queued',
-          message: 'Saved offline',
-        };
-        setEntries((prev) => [newEntry, ...prev]);
+    if (isConnected) {
+      try {
+        const response = await submitGrading(bunchId, graderId, bucketId, farm);
+        await addGradingEntry(bunchId, graderId, bucketId, farm, response.variety ?? '', response.stem_length ?? '', response.qty ?? 0, true);
+        setEntries((prev) => [{ bunch_id: bunchId, grader: graderId, bucket_id: bucketId, variety: response.variety ?? '', stem_length: response.stem_length ?? '', qty: response.qty ?? 0, time: now, status: 'success', message: `${response.qty} stems` }, ...prev]);
         await refreshStats();
         onScanSuccess();
-        showConfirmation('success', 'Saved offline');
+        showConfirmation('success', `Graded: ${response.qty ?? 0} stems`);
+      } catch (error: any) {
+        await addToSyncQueue('mobile_grading_entry', { bunch_id: bunchId, grader: graderId, bucket_id: bucketId, farm });
+        await addGradingEntry(bunchId, graderId, bucketId, farm, '', '', 0, false);
+        setEntries((prev) => [{ bunch_id: bunchId, grader: graderId, bucket_id: bucketId, variety: '', stem_length: '', qty: 0, time: now, status: 'error', message: error.message }, ...prev]);
+        await refreshStats();
+        onScanError();
+        showConfirmation('error', error.message);
       }
+    } else {
+      await addToSyncQueue('mobile_grading_entry', { bunch_id: bunchId, grader: graderId, bucket_id: bucketId, farm });
+      await addGradingEntry(bunchId, graderId, bucketId, farm, '', '', 0, false);
+      setEntries((prev) => [{ bunch_id: bunchId, grader: graderId, bucket_id: bucketId, variety: '', stem_length: '', qty: 0, time: now, status: 'queued', message: 'Saved offline' }, ...prev]);
+      await refreshStats();
+      onScanSuccess();
+      showConfirmation('success', 'Saved offline');
+    }
+  };
 
-      resetToStart();
-    },
-    [bunchId, graderId, isConnected, refreshStats, resetToStart]
-  );
+  // ── Rejects mode handlers ─────────────────────────────────────
+  const resetRejects = useCallback(() => {
+    setRejBucketId(null);
+    setRejGrader(null);
+    setRejQty('');
+    setBucketBalance(null);
+    setRejSlot('bucket');
+  }, []);
 
-  const currentStepIndex = STEPS.findIndex((s) => s.key === phase);
-  const currentStep = STEPS[currentStepIndex];
+  const handleRejectScan = useCallback(async (data: string) => {
+    if (rejSubmitting) return;
+    const value = extractGradingQRValue(data) || data.trim();
+    if (!value) return;
 
-  const handleScanned =
-    phase === 'scan-bunch'
-      ? handleBunchScanned
-      : phase === 'scan-grader'
-        ? handleGraderScanned
-        : handleBucketScanned;
+    if (rejSlot === 'bucket') {
+      setLoadingBalance(true);
+      try {
+        const balance = await getBucketBalance(value);
+        setBucketBalance(balance);
+        setRejBucketId(value);
+        // Pre-fill with remaining stems
+        setRejQty(String(balance.remaining_stems > 0 ? balance.remaining_stems : 0));
+        setRejSlot('grader');
+        onScanSuccess();
+        showConfirmation('success', `Bucket: ${value} — ${balance.remaining_stems} stems remaining`);
+      } catch (err: any) {
+        onScanError();
+        showConfirmation('error', err.message);
+      } finally {
+        setLoadingBalance(false);
+      }
+    } else {
+      setRejGrader(value);
+      onScanSuccess();
+      showConfirmation('success', `Grader: ${value}`);
+    }
+  }, [rejSlot, rejSubmitting]);
 
-  const scannerTitle =
-    phase === 'scan-bunch'
-      ? 'Scan Bunch QR Code'
-      : phase === 'scan-grader'
-        ? 'Scan Grader QR Code'
-        : 'Scan Bucket QR Code';
+  const handleRejectSubmit = async () => {
+    if (!rejBucketId || !rejGrader) {
+      showConfirmation('error', 'Scan bucket and grader first');
+      return;
+    }
+    const qty = parseInt(rejQty, 10);
+    if (!qty || qty <= 0) {
+      showConfirmation('error', 'Enter a valid reject quantity');
+      return;
+    }
+    setRejSubmitting(true);
+    try {
+      const farm = await getFarm();
+      const resp = await submitBucketReject(rejBucketId, rejGrader, qty, farm);
+      await refreshStats();
+      onScanSuccess();
+      showConfirmation('success', `${qty} rejects recorded. ${resp.remaining_stems} stems remaining.`);
+      resetRejects();
+    } catch (err: any) {
+      onScanError();
+      showConfirmation('error', err.message);
+    } finally {
+      setRejSubmitting(false);
+    }
+  };
 
-  const scanPlaceholder =
-    phase === 'scan-bunch'
-      ? 'Bunch ID'
-      : phase === 'scan-grader'
-        ? 'Grader ID'
-        : 'Bucket ID';
+  const filledCount = SLOT_ORDER.filter((s) => slots[s]).length;
+  const allFilled = filledCount === 3;
 
   return (
     <View style={styles.container}>
       <SyncBanner />
 
-      <ScrollView style={styles.scroll} contentContainerStyle={styles.scrollContent}>
-        {/* Stepper */}
-        <View style={styles.stepper}>
-          {STEPS.map((step, idx) => {
-            const isCompleted = idx < currentStepIndex;
-            const isCurrent = idx === currentStepIndex;
-            return (
-              <React.Fragment key={step.key}>
-                {idx > 0 && (
-                  <View
-                    style={[
-                      styles.stepLine,
-                      isCompleted && styles.stepLineCompleted,
-                    ]}
-                  />
-                )}
-                <View style={styles.stepItem}>
-                  <View
-                    style={[
-                      styles.stepDot,
-                      isCompleted && styles.stepDotCompleted,
-                      isCurrent && styles.stepDotActive,
-                    ]}
+      {/* Mode toggle */}
+      <View style={styles.modeToggle}>
+        <TouchableOpacity
+          style={[styles.modeBtn, mode === 'grade' && styles.modeBtnActive]}
+          onPress={() => setMode('grade')}
+          activeOpacity={0.7}
+        >
+          <Ionicons name="clipboard-outline" size={14} color={mode === 'grade' ? '#fff' : colors.textMuted} />
+          <Text style={[styles.modeBtnText, mode === 'grade' && styles.modeBtnTextActive]}>Grade</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={[styles.modeBtn, mode === 'rejects' && styles.modeBtnReject]}
+          onPress={() => { setMode('rejects'); resetRejects(); }}
+          activeOpacity={0.7}
+        >
+          <Ionicons name="close-circle-outline" size={14} color={mode === 'rejects' ? '#fff' : colors.textMuted} />
+          <Text style={[styles.modeBtnText, mode === 'rejects' && styles.modeBtnTextActive]}>Rejects</Text>
+        </TouchableOpacity>
+      </View>
+
+      {mode === 'grade' ? (
+        <ScrollView style={styles.scroll} contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
+          {/* Slot pills */}
+          <View style={styles.pillRow}>
+            {SLOT_ORDER.map((slot, i) => {
+              const filled = !!slots[slot];
+              return (
+                <React.Fragment key={slot}>
+                  {i > 0 && <View style={[styles.pillConnector, filled && i <= filledCount ? styles.pillConnectorDone : null]} />}
+                  <TouchableOpacity
+                    style={[styles.pill, filled ? styles.pillFilled : null]}
+                    onPress={() => { if (!filled) forcedSlotRef.current = slot; }}
+                    activeOpacity={0.7}
                   >
-                    {isCompleted && (
-                      <Ionicons name="checkmark" size={10} color={colors.textOnPrimary} />
+                    <Ionicons
+                      name={filled ? 'checkmark-circle' : SLOT_META[slot].icon}
+                      size={14}
+                      color={filled ? colors.success : colors.textMuted}
+                    />
+                    <Text style={[styles.pillLabel, filled && styles.pillLabelFilled]}>
+                      {filled ? slots[slot]! : SLOT_META[slot].label}
+                    </Text>
+                    {filled && (
+                      <TouchableOpacity
+                        onPress={() => setSlots((p) => ({ ...p, [slot]: null }))}
+                        hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                      >
+                        <Ionicons name="close-circle" size={14} color={colors.textMuted} />
+                      </TouchableOpacity>
                     )}
-                  </View>
-                  <Text
-                    style={[
-                      styles.stepText,
-                      isCurrent && styles.stepTextActive,
-                      isCompleted && styles.stepTextCompleted,
-                    ]}
-                  >
-                    {step.label}
-                  </Text>
-                </View>
-              </React.Fragment>
-            );
-          })}
-        </View>
-
-        {/* Collected data cards */}
-        {bunchId && (
-          <View style={styles.collectedCard}>
-            <Ionicons name="leaf-outline" size={16} color={colors.primary} />
-            <Text style={styles.collectedLabel}>Bunch:</Text>
-            <Text style={styles.collectedValue}>{bunchId}</Text>
+                  </TouchableOpacity>
+                </React.Fragment>
+              );
+            })}
           </View>
-        )}
-        {graderId && (
-          <View style={styles.collectedCard}>
-            <Ionicons name="person-outline" size={16} color={colors.primary} />
-            <Text style={styles.collectedLabel}>Grader:</Text>
-            <Text style={styles.collectedValue}>{graderId}</Text>
-          </View>
-        )}
 
-        {/* Scan input */}
-        <View style={styles.inputSection}>
-          <Text style={styles.label}>{currentStep.title}</Text>
-          <ScanInput
-            placeholder={scanPlaceholder}
-            scannerTitle={scannerTitle}
-            onScan={handleScanned}
+          <View style={styles.scanSection}>
+            <ScanInput
+              placeholder={allFilled ? 'Submitting…' : 'Scan bunch / grader / bucket'}
+              scannerTitle="Scan QR Code"
+              onScan={handleScanned}
+              disabled={submitting || allFilled}
+            />
+          </View>
+
+          <EntriesLog
+            entries={entries}
+            label="entry"
+            renderEntry={(entry, idx) => (
+              <GradingEntryComponent entry={entry} index={idx} />
+            )}
           />
-        </View>
+        </ScrollView>
+      ) : (
+        <ScrollView style={styles.scroll} contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
 
-        {/* Entries list */}
-        <View style={styles.entriesSection}>
-          <View style={styles.entriesHeader}>
-            <Ionicons name="layers-outline" size={18} color={colors.text} />
-            <Text style={styles.entriesTitle}>
-              Graded Entries ({entries.length})
-            </Text>
+          {/* Step indicators */}
+          <View style={styles.pillRow}>
+            {(['bucket', 'grader'] as const).map((slot, i) => {
+              const value = slot === 'bucket' ? rejBucketId : rejGrader;
+              const filled = !!value;
+              const label = slot === 'bucket' ? 'Bucket' : 'Grader';
+              const icon: keyof typeof Ionicons.glyphMap = slot === 'bucket' ? 'archive-outline' : 'person-outline';
+              return (
+                <React.Fragment key={slot}>
+                  {i > 0 && <View style={[styles.pillConnector, filled ? styles.pillConnectorDone : null]} />}
+                  <TouchableOpacity
+                    style={[styles.pill, filled ? styles.pillFilled : null]}
+                    onPress={() => { if (!filled) setRejSlot(slot); }}
+                    activeOpacity={0.7}
+                  >
+                    <Ionicons
+                      name={filled ? 'checkmark-circle' : icon}
+                      size={14}
+                      color={filled ? colors.success : colors.textMuted}
+                    />
+                    <Text style={[styles.pillLabel, filled && styles.pillLabelFilled]}>
+                      {filled ? value! : label}
+                    </Text>
+                    {filled && (
+                      <TouchableOpacity
+                        onPress={() => {
+                          if (slot === 'bucket') { setRejBucketId(null); setBucketBalance(null); setRejQty(''); setRejSlot('bucket'); }
+                          else { setRejGrader(null); setRejSlot('grader'); }
+                        }}
+                        hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                      >
+                        <Ionicons name="close-circle" size={14} color={colors.textMuted} />
+                      </TouchableOpacity>
+                    )}
+                  </TouchableOpacity>
+                </React.Fragment>
+              );
+            })}
           </View>
-          {entries.length === 0 ? (
-            <View style={styles.emptyEntries}>
-              <Text style={styles.emptyEntriesText}>No entries graded yet</Text>
-            </View>
-          ) : (
-            entries.map((entry, idx) => (
-              <GradingEntryComponent
-                key={`${entry.bunch_id}-${entry.time}`}
-                entry={entry}
-                index={idx}
+
+          {/* Scan input */}
+          <View style={styles.scanSection}>
+            {loadingBalance ? (
+              <View style={styles.balanceLoading}>
+                <ActivityIndicator size="small" color={colors.text} />
+                <Text style={styles.balanceLoadingText}>Fetching bucket balance…</Text>
+              </View>
+            ) : (
+              <ScanInput
+                placeholder={
+                  !rejBucketId ? 'Scan bucket' :
+                  !rejGrader   ? 'Scan grader' :
+                  'Ready to submit'
+                }
+                scannerTitle={!rejBucketId ? 'Scan Bucket' : 'Scan Grader'}
+                onScan={handleRejectScan}
+                disabled={rejSubmitting || (!!rejBucketId && !!rejGrader)}
               />
-            ))
+            )}
+          </View>
+
+          {/* Bucket balance card */}
+          {bucketBalance && (
+            <View style={styles.balanceCard}>
+              <View style={styles.balanceRow}>
+                <Text style={styles.balanceLabel}>Variety</Text>
+                <Text style={styles.balanceValue}>{bucketBalance.variety || '—'}</Text>
+              </View>
+              <View style={styles.balanceDivider} />
+              <View style={styles.balanceStats}>
+                <View style={styles.balanceStat}>
+                  <Text style={styles.balanceStatNum}>{bucketBalance.bucket_total}</Text>
+                  <Text style={styles.balanceStatLabel}>Received</Text>
+                </View>
+                <View style={styles.balanceStat}>
+                  <Text style={styles.balanceStatNum}>{bucketBalance.already_graded}</Text>
+                  <Text style={styles.balanceStatLabel}>Graded</Text>
+                </View>
+                <View style={styles.balanceStat}>
+                  <Text style={styles.balanceStatNum}>{bucketBalance.already_rejected}</Text>
+                  <Text style={styles.balanceStatLabel}>Rejected</Text>
+                </View>
+                <View style={[styles.balanceStat, styles.balanceStatHighlight]}>
+                  <Text style={[styles.balanceStatNum, styles.balanceStatNumHighlight]}>{bucketBalance.remaining_stems}</Text>
+                  <Text style={[styles.balanceStatLabel, styles.balanceStatLabelHighlight]}>Remaining</Text>
+                </View>
+              </View>
+            </View>
           )}
-        </View>
-      </ScrollView>
+
+          {/* Reject qty input */}
+          {rejBucketId && (
+            <View style={styles.qtySection}>
+              <Text style={styles.qtyLabel}>Reject Quantity</Text>
+              <View style={styles.qtyRow}>
+                <TouchableOpacity
+                  style={styles.qtyBtn}
+                  onPress={() => setRejQty((v) => String(Math.max(0, parseInt(v || '0', 10) - 1)))}
+                >
+                  <Ionicons name="remove" size={20} color={colors.text} />
+                </TouchableOpacity>
+                <TextInput
+                  style={styles.qtyInput}
+                  value={rejQty}
+                  onChangeText={setRejQty}
+                  keyboardType="number-pad"
+                  selectTextOnFocus
+                />
+                <TouchableOpacity
+                  style={styles.qtyBtn}
+                  onPress={() => setRejQty((v) => String(parseInt(v || '0', 10) + 1))}
+                >
+                  <Ionicons name="add" size={20} color={colors.text} />
+                </TouchableOpacity>
+              </View>
+            </View>
+          )}
+
+          {/* Submit button */}
+          {rejBucketId && rejGrader && (
+            <TouchableOpacity
+              style={[styles.submitBtn, rejSubmitting && styles.submitBtnDisabled]}
+              onPress={handleRejectSubmit}
+              disabled={rejSubmitting}
+              activeOpacity={0.8}
+            >
+              {rejSubmitting ? (
+                <ActivityIndicator size="small" color="#fff" />
+              ) : (
+                <>
+                  <Ionicons name="close-circle-outline" size={18} color="#fff" />
+                  <Text style={styles.submitBtnText}>Submit {rejQty || '0'} Rejects</Text>
+                </>
+              )}
+            </TouchableOpacity>
+          )}
+
+        </ScrollView>
+      )}
 
       <ScanConfirmation
         visible={confirmation.visible}
@@ -333,116 +427,215 @@ export default function GradeScreen() {
 }
 
 const styles = StyleSheet.create({
-  container: {
+  container: { flex: 1, backgroundColor: colors.background },
+  scroll: { flex: 1 },
+  content: { padding: spacing.lg, paddingBottom: spacing.xxl },
+
+  modeToggle: {
+    flexDirection: 'row',
+    margin: spacing.lg,
+    marginBottom: 0,
+    backgroundColor: colors.surface,
+    borderRadius: borderRadius.full,
+    borderWidth: 1,
+    borderColor: colors.border,
+    padding: 3,
+  },
+  modeBtn: {
     flex: 1,
-    backgroundColor: colors.background,
-  },
-  scroll: {
-    flex: 1,
-  },
-  scrollContent: {
-    padding: spacing.lg,
-    paddingBottom: spacing.xxl,
-  },
-  stepper: {
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
-    marginBottom: spacing.lg,
+    gap: 5,
+    paddingVertical: 8,
+    borderRadius: borderRadius.full,
   },
-  stepItem: {
-    alignItems: 'center',
-    gap: spacing.xs,
+  modeBtnActive: {
+    backgroundColor: colors.text,
   },
-  stepDot: {
-    width: 20,
-    height: 20,
-    borderRadius: 10,
-    backgroundColor: colors.border,
-    justifyContent: 'center',
-    alignItems: 'center',
+  modeBtnReject: {
+    backgroundColor: '#ef4444',
   },
-  stepDotActive: {
-    backgroundColor: colors.primary,
-  },
-  stepDotCompleted: {
-    backgroundColor: colors.success,
-  },
-  stepLine: {
-    width: 40,
-    height: 2,
-    backgroundColor: colors.border,
-    marginHorizontal: spacing.sm,
-    marginBottom: spacing.lg,
-  },
-  stepLineCompleted: {
-    backgroundColor: colors.success,
-  },
-  stepText: {
+  modeBtnText: {
     fontFamily: fontFamily.medium,
-    fontSize: fontSize.xs,
+    fontSize: fontSize.sm,
     color: colors.textMuted,
   },
-  stepTextActive: {
-    fontFamily: fontFamily.semiBold,
-    color: colors.primary,
+  modeBtnTextActive: {
+    color: '#fff',
   },
-  stepTextCompleted: {
+
+  pillRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: spacing.lg,
+    flexWrap: 'nowrap',
+    marginTop: spacing.lg,
+  },
+  pill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    backgroundColor: colors.surface,
+    borderRadius: borderRadius.full,
+    borderWidth: 1,
+    borderColor: colors.border,
+    paddingHorizontal: spacing.sm,
+    paddingVertical: 6,
+    flex: 1,
+    minWidth: 0,
+  },
+  pillFilled: {
+    borderColor: colors.success,
+    backgroundColor: '#F0FDF4',
+  },
+  pillLabel: {
+    fontFamily: fontFamily.medium,
+    fontSize: 11,
+    color: colors.textMuted,
+    flex: 1,
+    numberOfLines: 1,
+  } as any,
+  pillLabelFilled: {
     color: colors.success,
   },
-  collectedCard: {
+  pillConnector: {
+    width: 12,
+    height: 1,
+    backgroundColor: colors.border,
+    marginHorizontal: 2,
+  },
+  pillConnectorDone: {
+    backgroundColor: colors.success,
+  },
+
+  scanSection: {
+    marginBottom: spacing.sm,
+  },
+  balanceLoading: {
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: colors.primaryMuted,
-    borderRadius: borderRadius.sm,
-    padding: spacing.md,
-    marginBottom: spacing.sm,
     gap: spacing.sm,
-  },
-  collectedLabel: {
-    fontFamily: fontFamily.semiBold,
-    fontSize: fontSize.sm,
-    color: colors.primary,
-  },
-  collectedValue: {
-    fontFamily: fontFamily.bold,
-    fontSize: fontSize.sm,
-    color: colors.primary,
-  },
-  inputSection: {
-    marginBottom: spacing.lg,
-  },
-  label: {
-    fontFamily: fontFamily.semiBold,
-    fontSize: fontSize.sm,
-    color: colors.text,
-    marginBottom: spacing.sm,
-  },
-  entriesSection: {
-    marginBottom: spacing.lg,
-  },
-  entriesHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    marginBottom: spacing.sm,
-    gap: 6,
-  },
-  entriesTitle: {
-    fontFamily: fontFamily.bold,
-    fontSize: fontSize.md,
-    color: colors.text,
-  },
-  emptyEntries: {
+    padding: spacing.md,
     backgroundColor: colors.surface,
     borderRadius: borderRadius.md,
-    padding: spacing.xl,
-    alignItems: 'center',
     borderWidth: 1,
     borderColor: colors.border,
   },
-  emptyEntriesText: {
+  balanceLoadingText: {
     fontFamily: fontFamily.regular,
     fontSize: fontSize.sm,
     color: colors.textMuted,
+  },
+
+  balanceCard: {
+    backgroundColor: colors.surface,
+    borderRadius: borderRadius.md,
+    borderWidth: 1,
+    borderColor: colors.border,
+    marginBottom: spacing.md,
+    overflow: 'hidden',
+  },
+  balanceRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    padding: spacing.md,
+  },
+  balanceLabel: {
+    fontFamily: fontFamily.medium,
+    fontSize: fontSize.sm,
+    color: colors.textMuted,
+  },
+  balanceValue: {
+    fontFamily: fontFamily.medium,
+    fontSize: fontSize.sm,
+    color: colors.text,
+  },
+  balanceDivider: {
+    height: 1,
+    backgroundColor: colors.border,
+  },
+  balanceStats: {
+    flexDirection: 'row',
+    padding: spacing.md,
+    gap: spacing.sm,
+  },
+  balanceStat: {
+    flex: 1,
+    alignItems: 'center',
+    gap: 2,
+  },
+  balanceStatHighlight: {
+    backgroundColor: '#FEF2F2',
+    borderRadius: borderRadius.sm,
+    paddingVertical: 6,
+  },
+  balanceStatNum: {
+    fontFamily: fontFamily.semiBold,
+    fontSize: fontSize.lg,
+    color: colors.text,
+  },
+  balanceStatNumHighlight: {
+    color: '#ef4444',
+  },
+  balanceStatLabel: {
+    fontFamily: fontFamily.regular,
+    fontSize: 10,
+    color: colors.textMuted,
+  },
+  balanceStatLabelHighlight: {
+    color: '#ef4444',
+  },
+
+  qtySection: {
+    marginBottom: spacing.md,
+  },
+  qtyLabel: {
+    fontFamily: fontFamily.medium,
+    fontSize: fontSize.sm,
+    color: colors.textMuted,
+    marginBottom: spacing.xs,
+  },
+  qtyRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: colors.surface,
+    borderRadius: borderRadius.md,
+    borderWidth: 1,
+    borderColor: colors.border,
+    overflow: 'hidden',
+  },
+  qtyBtn: {
+    padding: spacing.md,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  qtyInput: {
+    flex: 1,
+    textAlign: 'center',
+    fontFamily: fontFamily.semiBold,
+    fontSize: 24,
+    color: colors.text,
+    paddingVertical: spacing.sm,
+  },
+
+  submitBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: spacing.sm,
+    backgroundColor: '#ef4444',
+    borderRadius: borderRadius.md,
+    padding: spacing.md,
+    marginTop: spacing.sm,
+  },
+  submitBtnDisabled: {
+    opacity: 0.6,
+  },
+  submitBtnText: {
+    fontFamily: fontFamily.semiBold,
+    fontSize: fontSize.md,
+    color: '#fff',
   },
 });

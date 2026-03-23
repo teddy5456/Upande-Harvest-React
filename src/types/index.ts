@@ -194,15 +194,17 @@ export interface RoseItemsResponse {
 // Receiving types
 export interface ReceivingEntry {
   id: number;
-  bunch_id: string;
-  receiver: string;
-  farm: string;
+  bucket_id: string;
   date_added: string;
   synced: number;
 }
 
 export interface ReceivingListEntry {
-  bunch_id: string;
+  bucket_id: string;
+  coldroom_bucket_id?: string;
+  variety?: string;
+  greenhouse?: string;
+  qty?: number;
   time: string;
   status: 'success' | 'error' | 'queued';
   message?: string;
@@ -210,5 +212,170 @@ export interface ReceivingListEntry {
 
 export interface ReceivingResponse {
   message: string;
+  stock_entry_name: string;
+  // xflora: returns item details read from the bucket
+  variety?: string;
+  item_code?: string;
+  greenhouse?: string;
+  qty?: number;
+}
+
+export interface BucketTransferResponse {
+  message: string;
+  stock_entry_name: string;
+  from_bucket: string;
+  to_bucket: string;
+  variety?: string;
+  greenhouse?: string;
+  item_code?: string;
+}
+
+// Packing types
+export interface PackingBox {
+  box_id: string;
+  farm: string;
+  date_created: string;
+  synced: number;
+}
+
+export interface PackingBoxItem {
+  id: number;
+  box_id: string;
   bunch_id: string;
+  date_added: string;
+  synced: number;
+}
+
+export interface PackingListEntry {
+  bunch_id: string;
+  time: string;
+  status: 'success' | 'error' | 'queued';
+  message?: string;
+}
+
+export interface PackingResponse {
+  message: string;
+  box_id: string;
+}
+
+// Quality types
+export type QualitySection = 'field_reject' | 'receiving_reject' | 'grading_reject' | 'packhouse_discard';
+export type QuarantineAction = 'discard' | 'intake' | '';
+
+export const QUALITY_SECTIONS: { key: QualitySection; label: string; icon: string }[] = [
+  { key: 'field_reject', label: 'Field', icon: 'leaf-outline' },
+  { key: 'receiving_reject', label: 'Receiving', icon: 'download-outline' },
+  { key: 'grading_reject', label: 'Grading', icon: 'clipboard-outline' },
+  { key: 'packhouse_discard', label: 'Discard', icon: 'trash-outline' },
+];
+
+export const QUALITY_REASONS: Record<QualitySection, string[]> = {
+  field_reject: ['Botrytis', 'Rust', 'Downy Mildew', 'Thrips Damage', 'Broken Stem', 'Short Stem', 'Drooping', 'Bent Neck', 'Mixed Variety', 'Other'],
+  receiving_reject: ['Botrytis', 'Rust', 'Downy Mildew', 'Thrips Damage', 'Broken Stem', 'Short Stem', 'Drooping', 'Bent Neck', 'Mixed Variety', 'Damaged in Transit', 'Over-aged', 'Other'],
+  grading_reject: ['Botrytis', 'Bent Neck', 'Short Stem', 'Broken Stem', 'Thrips Damage', 'Bruised', 'Rust', 'Mixed Variety', 'Tight Cut Stage', 'Advanced Cut Stage', 'Other'],
+  packhouse_discard: ['Bent Neck', 'Short Stem', 'Botrytis', 'Thrips', 'Bruised', 'Other'],
+};
+
+// A single reject line: one reason with a quantity
+export interface RejectLine {
+  reason: string;
+  quantity: number;
+}
+
+export interface QualityEntry {
+  id: number;
+  section: QualitySection;
+  ref_id: string;
+  quantity: number;
+  reason: string;
+  notes: string;
+  farm: string;
+  greenhouse: string;
+  variety: string;
+  quarantined: number;
+  quarantine_action: string;
+  date_added: string;
+  synced: number;
+}
+
+export interface QualityListEntry {
+  ref_id: string;
+  quantity: number;
+  reason: string;
+  time: string;
+  status: 'success' | 'error' | 'queued';
+  message?: string;
+}
+
+export interface QualityResponse {
+  message: string;
+}
+
+// Actual harvest types
+export interface ActualHarvestEntry {
+  id: number;
+  greenhouse: string;
+  variety: string;
+  quantity: number;
+  harvest_date: string;
+  notes: string;
+  farm: string;
+  date_added: string;
+  synced: number;
+}
+
+// Dashboard report types
+export interface GreenhouseHarvestRow {
+  greenhouse: string;
+  stems: number;
+  varieties: string;
+  rejects: number;
+}
+
+export interface GradingDashboardData {
+  total_graded: number;
+  grading_count: number;
+  active_graders: number;
+  rejection_rate: number;
+}
+
+export interface BucketBalance {
+  bucket_id: string;
+  variety: string;
+  stem_length: string;
+  bucket_total: number;
+  already_graded: number;
+  already_rejected: number;
+  remaining_stems: number;
+  bucket_full: boolean;
+}
+
+export interface RejectResponse {
+  message: string;
+  reject_entry: string;
+  bucket_id: string;
+  variety: string;
+  rejects: number;
+  grader: string;
+  bucket_total: number;
+  already_graded: number;
+  already_rejected: number;
+  remaining_stems: number;
+  bucket_full: boolean;
+}
+
+// Quarantine batch types
+export type QuarantineScope = 'buckets' | 'greenhouse';
+
+export interface QuarantineBatchListEntry {
+  id: number;
+  batch_id: string;
+  scope: QuarantineScope;
+  greenhouse: string;
+  bucket_ids: string; // JSON-encoded string array
+  reason: string;
+  notes: string;
+  status: 'pending' | 'discarded' | 'intake';
+  date_added: string;
+  synced: number;
 }

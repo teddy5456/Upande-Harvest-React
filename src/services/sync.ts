@@ -1,5 +1,5 @@
 import { getPendingEntries, markSynced, markFailed } from '../database/sync-queue';
-import { submitShelve, submitGrading, submitHarvest, submitReceiving } from './api';
+import { submitShelve, submitGrading, submitHarvest, submitReceiving, submitQualityEntry, submitActualHarvest } from './api';
 
 export interface SyncResult {
   synced: number;
@@ -26,7 +26,29 @@ export async function syncPendingEntries(): Promise<SyncResult> {
           payload.harvester, payload.bucket_id, payload.farm, payload.greenhouse
         );
       } else if (entry.action === 'receiving_entry') {
-        await submitReceiving(payload.bunch_id, payload.receiver, payload.farm);
+        await submitReceiving(payload.bucket_id);
+      } else if (entry.action === 'create_quality_entry') {
+        await submitQualityEntry(
+          payload.section,
+          payload.ref_id,
+          payload.quantity,
+          payload.reason,
+          payload.notes ?? '',
+          payload.farm ?? '',
+          payload.greenhouse ?? '',
+          payload.variety ?? '',
+          !!(payload.quarantined),
+          payload.quarantine_action ?? ''
+        );
+      } else if (entry.action === 'submit_actual_harvest') {
+        await submitActualHarvest(
+          payload.greenhouse ?? '',
+          payload.variety ?? '',
+          payload.quantity ?? 0,
+          payload.harvest_date ?? '',
+          payload.notes ?? '',
+          payload.farm ?? ''
+        );
       }
 
       await markSynced(entry.id);

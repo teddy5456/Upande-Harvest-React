@@ -4,7 +4,6 @@ import {
   Text,
   StyleSheet,
   ScrollView,
-  TextInput,
   TouchableOpacity,
   Alert,
 } from 'react-native';
@@ -14,8 +13,11 @@ import { getPendingCount, getFailedCount, retryFailed, clearSynced, getAllEntrie
 import { resetDatabase } from '../database/database';
 import { useApp } from '../context/AppContext';
 import SyncBanner from '../components/SyncBanner';
+import Dropdown, { DropdownOption } from '../components/Dropdown';
+import { getCachedFarms } from '../utils/farm-cache';
 import { SyncQueueEntry } from '../types';
 import { colors, fontFamily, fontSize, spacing, borderRadius } from '../theme';
+import { version } from '../../package.json';
 
 function Row({ icon, label, value, onPress, color }: {
   icon: keyof typeof Ionicons.glyphMap;
@@ -42,7 +44,7 @@ function Row({ icon, label, value, onPress, color }: {
 export default function SettingsScreen() {
   const { triggerSync, refreshStats, logout, fullName, userEmail } = useApp();
   const [farm, setFarm] = useState('');
-  const [editingFarm, setEditingFarm] = useState(false);
+  const [farmOptions, setFarmOptions] = useState<DropdownOption[]>([]);
   const [pendingCount, setPendingCount] = useState(0);
   const [failedCount, setFailedCount] = useState(0);
   const [queueEntries, setQueueEntries] = useState<SyncQueueEntry[]>([]);
@@ -54,12 +56,17 @@ export default function SettingsScreen() {
       if (f) setFarm(f);
       setPendingCount(await getPendingCount());
       setFailedCount(await getFailedCount());
+      // Load farm options from Farm doctype (cached)
+      const farms = await getCachedFarms();
+      if (farms.length > 0) {
+        setFarmOptions(farms.map((f) => ({ label: f.farm_name || f.name, value: f.name })));
+      }
     })();
   }, []);
 
-  const handleFarmBlur = async () => {
-    setEditingFarm(false);
-    await setSetting('farm', farm.trim());
+  const handleFarmSelect = async (value: string) => {
+    setFarm(value);
+    await setSetting('farm', value);
   };
 
   const handleRetryFailed = async () => {
@@ -143,30 +150,19 @@ export default function SettingsScreen() {
         {/* General */}
         <Text style={styles.sectionHeader}>General</Text>
         <View style={styles.section}>
-          <TouchableOpacity
-            style={styles.row}
-            onPress={() => setEditingFarm(true)}
-            activeOpacity={0.5}
-          >
+          <View style={styles.row}>
             <Ionicons name="leaf-outline" size={20} color={colors.text} />
-            {editingFarm ? (
-              <TextInput
-                style={styles.inlineInput}
+            <Text style={styles.rowLabel}>Farm</Text>
+            <View style={{ flex: 1 }}>
+              <Dropdown
                 value={farm}
-                onChangeText={setFarm}
-                onBlur={handleFarmBlur}
-                placeholder="Enter farm name"
-                placeholderTextColor={colors.textMuted}
-                autoFocus
+                options={farmOptions}
+                placeholder={farmOptions.length === 0 ? 'No farms available' : 'Select farm'}
+                onSelect={handleFarmSelect}
+                disabled={farmOptions.length === 0}
               />
-            ) : (
-              <>
-                <Text style={styles.rowLabel}>Farm</Text>
-                <Text style={styles.rowValue}>{farm || 'Not set'}</Text>
-                <Ionicons name="chevron-forward" size={16} color={colors.textMuted} />
-              </>
-            )}
-          </TouchableOpacity>
+            </View>
+          </View>
         </View>
 
         {/* Sync */}
@@ -236,7 +232,7 @@ export default function SettingsScreen() {
           <Row icon="log-out-outline" label="Sign out" onPress={handleLogout} color={colors.error} />
         </View>
 
-        <Text style={styles.versionText}>Upande Harvest v1.0</Text>
+        <Text style={styles.versionText}>Upande Harvest v{version}</Text>
       </ScrollView>
     </View>
   );
@@ -328,14 +324,6 @@ const styles = StyleSheet.create({
     fontSize: fontSize.sm,
     color: colors.textMuted,
   },
-  inlineInput: {
-    flex: 1,
-    fontFamily: fontFamily.regular,
-    fontSize: fontSize.sm,
-    color: colors.text,
-    padding: 0,
-  },
-
   // Dividers
   dividerFull: {
     height: StyleSheet.hairlineWidth,

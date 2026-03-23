@@ -1,4 +1,4 @@
-import React, { useRef, useEffect, useCallback } from 'react';
+import React, { useRef, useEffect, useCallback, useState } from 'react';
 import {
   View,
   TextInput,
@@ -27,8 +27,10 @@ export default function ScanInput({
   disabled = false,
 }: ScanInputProps) {
   const inputRef = useRef<TextInput>(null);
-  const [value, setValue] = React.useState('');
-  const [cameraOpen, setCameraOpen] = React.useState(false);
+  const [value, setValue] = useState('');
+  const [cameraOpen, setCameraOpen] = useState(false);
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const valueRef = useRef('');
 
   useEffect(() => {
     if (autoFocus && !disabled) {
@@ -37,14 +39,32 @@ export default function ScanInput({
     }
   }, [autoFocus, disabled]);
 
-  const handleSubmit = useCallback(() => {
-    const trimmed = value.trim();
+  const submitCurrent = useCallback(() => {
+    if (debounceRef.current) {
+      clearTimeout(debounceRef.current);
+      debounceRef.current = null;
+    }
+    const trimmed = valueRef.current.trim();
     if (!trimmed) return;
     onScan(trimmed);
     setValue('');
+    valueRef.current = '';
     // Re-focus for next scan
     setTimeout(() => inputRef.current?.focus(), 100);
-  }, [value, onScan]);
+  }, [onScan]);
+
+  const handleSubmit = submitCurrent;
+
+  // Auto-submit after 200ms of no new input — handles Honeywell scanners
+  // that output all characters instantly without an Enter suffix
+  const handleChangeText = useCallback((text: string) => {
+    setValue(text);
+    valueRef.current = text;
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    if (text.trim()) {
+      debounceRef.current = setTimeout(submitCurrent, 200);
+    }
+  }, [submitCurrent]);
 
   const handleCameraScan = useCallback(
     (data: string) => {
@@ -69,7 +89,7 @@ export default function ScanInput({
           ref={inputRef}
           style={styles.input}
           value={value}
-          onChangeText={setValue}
+          onChangeText={handleChangeText}
           onSubmitEditing={handleSubmit}
           placeholder={placeholder}
           placeholderTextColor={colors.textMuted}

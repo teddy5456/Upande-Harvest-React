@@ -65,3 +65,13 @@ export async function getUserEmail(): Promise<string> {
 export async function setUserEmail(email: string): Promise<void> {
   await setSetting('user_email', email);
 }
+
+export async function getUserRoles(): Promise<string[]> {
+  const raw = await getSetting('user_roles');
+  if (!raw) return [];
+  try { return JSON.parse(raw); } catch { return []; }
+}
+
+export async function setUserRoles(roles: string[]): Promise<void> {
+  await setSetting('user_roles', JSON.stringify(roles));
+}

@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useEffect } from 'react';
+import React, { useState, useCallback, useEffect, useRef } from 'react';
 import {
   View,
   Text,
@@ -9,6 +9,7 @@ import {
   Alert,
   ActivityIndicator,
   KeyboardAvoidingView,
+  Keyboard,
   Platform,
   Modal,
   FlatList,
@@ -16,14 +17,16 @@ import {
 import { Ionicons } from '@expo/vector-icons';
 import { useApp } from '../context/AppContext';
 import { addToSyncQueue } from '../database/sync-queue';
-import { getFarm } from '../database/settings';
+import { getFarm, getSetting, setSetting } from '../database/settings';
 import { addHarvestEntry } from '../database/harvest';
 import { submitHarvest, fetchGreenhouses } from '../services/api';
 import ScanInput from '../components/ScanInput';
 import SyncBanner from '../components/SyncBanner';
 import ScanConfirmation from '../components/ScanConfirmation';
+import EntriesLog from '../components/EntriesLog';
 import { HarvestListEntry, Greenhouse, GreenhouseSection, GreenhouseVariety } from '../types';
 import { onScanSuccess, onScanError } from '../utils/feedback';
+import { parseScannedBucketQR } from '../utils/shelf-utils';
 import { colors, fontFamily, fontSize, spacing, borderRadius } from '../theme';
 
 interface BorrowedHarvester {
@@ -48,14 +51,27 @@ export default function HarvestScreen() {
   // Team overrides: section_name -> borrowed employees
   const [teamOverrides, setTeamOverrides] = useState<Record<string, BorrowedHarvester[]>>({});
 
-  // Picker modals
-  const [ghPickerOpen, setGhPickerOpen] = useState(false);
+  // Inline dropdowns
+  const [ghDropdownOpen, setGhDropdownOpen] = useState(false);
   const [ghSearch, setGhSearch] = useState('');
-  const [sectionPickerOpen, setSectionPickerOpen] = useState(false);
+  const [sectionDropdownOpen, setSectionDropdownOpen] = useState(false);
   const [sectionSearch, setSectionSearch] = useState('');
-  const [varietyPickerOpen, setVarietyPickerOpen] = useState(false);
+  const [varietyDropdownOpen, setVarietyDropdownOpen] = useState(false);
   const [varietySearch, setVarietySearch] = useState('');
-  const [harvesterPickerOpen, setHarvesterPickerOpen] = useState(false);
+  const [harvesterDropdownOpen, setHarvesterDropdownOpen] = useState(false);
+
+  // Sort order per dropdown (true = A→Z, false = Z→A)
+  const [ghSortAZ, setGhSortAZ] = useState(true);
+  const [sectionSortAZ, setSectionSortAZ] = useState(true);
+  const [varietySortAZ, setVarietySortAZ] = useState(true);
+
+  // Blur timers (so list item taps register before dropdown closes)
+  const ghBlurTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const sectionBlurTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const varietyBlurTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Quantity input ref for auto-focus after variety selection
+  const quantityRef = useRef<TextInput>(null);
 
   // Team modal
   const [teamModalOpen, setTeamModalOpen] = useState(false);
@@ -106,10 +122,26 @@ export default function HarvestScreen() {
   const loadData = async () => {
     setDataLoading(true);
     try {
-      const res = await fetchGreenhouses();
-      setGreenhouses(res.greenhouses ?? []);
-    } catch (error: any) {
-      console.log('Failed to load greenhouses:', error.message);
+      const [res, lastGhName, lastVariety] = await Promise.all([
+        fetchGreenhouses(),
+        getSetting('last_greenhouse'),
+        getSetting('last_variety'),
+      ]);
+      const ghs = res.greenhouses ?? [];
+      setGreenhouses(ghs);
+
+      if (lastGhName) {
+        const gh = ghs.find((g) => g.name === lastGhName);
+        if (gh) {
+          setSelectedGreenhouse(gh);
+          if (lastVariety) {
+            const v = gh.custom_varieties_grown?.find((vr) => vr.variety === lastVariety);
+            if (v) setSelectedVariety(v);
+          }
+        }
+      }
+    } catch {
+      // silently continue — user can retry
     } finally {
       setDataLoading(false);
     }
@@ -121,20 +153,27 @@ export default function HarvestScreen() {
     setSelectedVariety(null);
     setSelectedHarvester('');
     setTeamOverrides({});
-    setGhPickerOpen(false);
+    setGhDropdownOpen(false);
     setGhSearch('');
+    setSetting('last_greenhouse', gh.name);
+    setSetting('last_variety', '');
   }, []);
 
   const handleSelectSection = useCallback((sec: GreenhouseSection) => {
     setSelectedSection(sec);
-    setSectionPickerOpen(false);
+    setSectionDropdownOpen(false);
     setSectionSearch('');
+    // Auto-open variety dropdown after section is chosen
+    setTimeout(() => setVarietyDropdownOpen(true), 150);
   }, []);
 
   const handleSelectVariety = useCallback((v: GreenhouseVariety) => {
     setSelectedVariety(v);
-    setVarietyPickerOpen(false);
+    setVarietyDropdownOpen(false);
     setVarietySearch('');
+    setSetting('last_variety', v.variety);
+    // Auto-focus quantity after variety is chosen
+    setTimeout(() => quantityRef.current?.focus(), 150);
   }, []);
 
   const handleAddBorrowed = useCallback((section: string, emp: BorrowedHarvester) => {
@@ -162,7 +201,7 @@ export default function HarvestScreen() {
 
   const handleBucketScanned = useCallback(
     async (data: string) => {
-      const bucketId = data.trim();
+      const bucketId = parseScannedBucketQR(data);
       if (!bucketId) return;
 
       if (!selectedGreenhouse) {
@@ -217,6 +256,8 @@ export default function HarvestScreen() {
           }, ...prev]);
           await refreshStats();
           onScanSuccess();
+          setSelectedSection(null);
+          setSelectedHarvester('');
           showConfirmation('success', bucketId);
         } catch (error: any) {
           await addToSyncQueue('createHarvestEntry', {
@@ -233,6 +274,8 @@ export default function HarvestScreen() {
           }, ...prev]);
           await refreshStats();
           onScanError();
+          setSelectedSection(null);
+          setSelectedHarvester('');
           showConfirmation('error', error.message);
         }
       } else {
@@ -250,32 +293,49 @@ export default function HarvestScreen() {
         }, ...prev]);
         await refreshStats();
         onScanSuccess();
+        setSelectedSection(null);
+        setSelectedHarvester('');
         showConfirmation('success', 'Saved offline');
       }
     },
     [isConnected, refreshStats, selectedGreenhouse, selectedSection, selectedHarvester, selectedVariety, quantity]
   );
 
-  // Filtered lists
+  // Sorted + filtered lists (all items always included, sorted A→Z by default)
+  const sortedGreenhouses = [...greenhouses].sort((a, b) =>
+    ghSortAZ
+      ? a.warehouse_name.localeCompare(b.warehouse_name)
+      : b.warehouse_name.localeCompare(a.warehouse_name)
+  );
   const filteredGreenhouses = ghSearch
-    ? greenhouses.filter((g) =>
+    ? sortedGreenhouses.filter((g) =>
         g.warehouse_name.toLowerCase().includes(ghSearch.toLowerCase()) ||
         g.name.toLowerCase().includes(ghSearch.toLowerCase())
       )
-    : greenhouses;
+    : sortedGreenhouses;
 
   const sections = selectedGreenhouse?.custom_sections ?? [];
+  const sortedSections = [...sections].sort((a, b) =>
+    sectionSortAZ
+      ? a.section_name.localeCompare(b.section_name)
+      : b.section_name.localeCompare(a.section_name)
+  );
   const filteredSections = sectionSearch
-    ? sections.filter((s) =>
+    ? sortedSections.filter((s) =>
         s.section_name.toLowerCase().includes(sectionSearch.toLowerCase()) ||
         s.employee_name.toLowerCase().includes(sectionSearch.toLowerCase())
       )
-    : sections;
+    : sortedSections;
 
   const varieties = selectedGreenhouse?.custom_varieties_grown ?? [];
+  const sortedVarieties = [...varieties].sort((a, b) =>
+    varietySortAZ
+      ? a.variety.localeCompare(b.variety)
+      : b.variety.localeCompare(a.variety)
+  );
   const filteredVarieties = varietySearch
-    ? varieties.filter((v) => v.variety.toLowerCase().includes(varietySearch.toLowerCase()))
-    : varieties;
+    ? sortedVarieties.filter((v) => v.variety.toLowerCase().includes(varietySearch.toLowerCase()))
+    : sortedVarieties;
 
   // Employees from OTHER greenhouses (for borrowing)
   const otherEmployees = greenhouses
@@ -319,21 +379,100 @@ export default function HarvestScreen() {
           contentContainerStyle={styles.content}
           keyboardShouldPersistTaps="handled"
         >
-          {/* Greenhouse */}
+          {/* ── Greenhouse ── */}
           <Text style={styles.label}>Greenhouse</Text>
-          <TouchableOpacity
-            style={styles.pickerButton}
-            onPress={() => setGhPickerOpen(true)}
-            activeOpacity={0.7}
-          >
-            <Text
-              style={selectedGreenhouse ? styles.pickerValue : styles.pickerPlaceholder}
-              numberOfLines={1}
-            >
-              {selectedGreenhouse?.warehouse_name ?? 'Select greenhouse...'}
-            </Text>
-            <Ionicons name="chevron-down" size={16} color={colors.textMuted} />
-          </TouchableOpacity>
+          <View style={styles.dropdownWrapper}>
+            <View style={[styles.dropdownField, ghDropdownOpen && styles.dropdownFieldActive]}>
+              <Ionicons name="search" size={15} color={colors.textMuted} />
+              <TextInput
+                style={styles.dropdownTextInput}
+                value={ghDropdownOpen ? ghSearch : (selectedGreenhouse?.warehouse_name ?? '')}
+                onChangeText={setGhSearch}
+                onFocus={() => {
+                  if (ghBlurTimer.current) clearTimeout(ghBlurTimer.current);
+                  setGhSearch('');
+                  setGhDropdownOpen(true);
+                }}
+                onBlur={() => {
+                  ghBlurTimer.current = setTimeout(() => setGhDropdownOpen(false), 200);
+                }}
+                placeholder="Search greenhouse..."
+                placeholderTextColor={colors.textMuted}
+                autoCorrect={false}
+                autoCapitalize="none"
+              />
+              {selectedGreenhouse && !ghDropdownOpen && (
+                <TouchableOpacity
+                  onPress={() => {
+                    setSelectedGreenhouse(null);
+                    setSelectedSection(null);
+                    setSelectedVariety(null);
+                    setSelectedHarvester('');
+                    setTeamOverrides({});
+                    setGhSearch('');
+                  }}
+                  hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                  activeOpacity={0.7}
+                >
+                  <Ionicons name="close-circle" size={16} color={colors.textMuted} />
+                </TouchableOpacity>
+              )}
+              <TouchableOpacity
+                onPress={() => {
+                  if (ghBlurTimer.current) clearTimeout(ghBlurTimer.current);
+                  if (ghDropdownOpen) {
+                    setGhDropdownOpen(false);
+                  } else {
+                    setGhSearch('');
+                    setGhDropdownOpen(true);
+                  }
+                }}
+                hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                activeOpacity={0.7}
+              >
+                <Ionicons name={ghDropdownOpen ? 'chevron-up' : 'chevron-down'} size={16} color={colors.textMuted} />
+              </TouchableOpacity>
+            </View>
+
+            {ghDropdownOpen && (
+              <View style={styles.dropdownList}>
+                <TouchableOpacity
+                  style={styles.sortRow}
+                  onPress={() => setGhSortAZ(!ghSortAZ)}
+                  activeOpacity={0.7}
+                >
+                  <Ionicons name="swap-vertical" size={12} color={colors.textMuted} />
+                  <Text style={styles.sortRowText}>{ghSortAZ ? 'A → Z' : 'Z → A'}</Text>
+                </TouchableOpacity>
+                <ScrollView style={styles.dropdownScroll} nestedScrollEnabled keyboardShouldPersistTaps="handled">
+                  {filteredGreenhouses.map((item) => {
+                    const isSelected = selectedGreenhouse?.name === item.name;
+                    const secCount = item.custom_sections?.length ?? 0;
+                    const varCount = item.custom_varieties_grown?.length ?? 0;
+                    return (
+                      <TouchableOpacity
+                        key={item.name}
+                        style={[styles.listRow, isSelected && styles.listRowSelected]}
+                        onPress={() => handleSelectGreenhouse(item)}
+                        activeOpacity={0.7}
+                      >
+                        <View style={{ flex: 1 }}>
+                          <Text style={styles.listRowTitle}>{item.warehouse_name}</Text>
+                          <Text style={styles.listRowSub}>
+                            {secCount} sections · {varCount} varieties
+                          </Text>
+                        </View>
+                        {isSelected && <Ionicons name="checkmark" size={18} color={colors.primary} />}
+                      </TouchableOpacity>
+                    );
+                  })}
+                  {filteredGreenhouses.length === 0 && (
+                    <Text style={styles.emptyText}>No greenhouses found</Text>
+                  )}
+                </ScrollView>
+              </View>
+            )}
+          </View>
 
           {/* Manage Team link */}
           {selectedGreenhouse && (
@@ -352,48 +491,158 @@ export default function HarvestScreen() {
             </TouchableOpacity>
           )}
 
-          {/* Section */}
+          {/* ── Section ── */}
           <Text style={styles.label}>Section</Text>
-          <TouchableOpacity
-            style={styles.pickerButton}
-            onPress={() => {
-              if (!selectedGreenhouse) {
-                Alert.alert('Missing', 'Select a greenhouse first.');
-                return;
-              }
-              setSectionPickerOpen(true);
-            }}
-            activeOpacity={0.7}
-          >
-            <Text
-              style={selectedSection ? styles.pickerValue : styles.pickerPlaceholder}
-              numberOfLines={1}
-            >
-              {selectedSection
-                ? selectedSection.section_name
-                : 'Select section...'}
-            </Text>
-            <Ionicons name="chevron-down" size={16} color={colors.textMuted} />
-          </TouchableOpacity>
+          <View style={styles.dropdownWrapper}>
+            <View style={[
+              styles.dropdownField,
+              sectionDropdownOpen && styles.dropdownFieldActive,
+              !selectedGreenhouse && styles.dropdownFieldDisabled,
+            ]}>
+              <Ionicons name="search" size={15} color={colors.textMuted} />
+              <TextInput
+                style={styles.dropdownTextInput}
+                value={sectionDropdownOpen ? sectionSearch : (selectedSection?.section_name ?? '')}
+                onChangeText={setSectionSearch}
+                onFocus={() => {
+                  if (!selectedGreenhouse) {
+                    Alert.alert('Missing', 'Select a greenhouse first.');
+                    return;
+                  }
+                  if (sectionBlurTimer.current) clearTimeout(sectionBlurTimer.current);
+                  setSectionSearch('');
+                  setSectionDropdownOpen(true);
+                }}
+                onBlur={() => {
+                  sectionBlurTimer.current = setTimeout(() => setSectionDropdownOpen(false), 200);
+                }}
+                placeholder="Search section..."
+                placeholderTextColor={colors.textMuted}
+                autoCorrect={false}
+                autoCapitalize="none"
+                editable={!!selectedGreenhouse}
+              />
+              {selectedSection && !sectionDropdownOpen && (
+                <TouchableOpacity
+                  onPress={() => {
+                    setSelectedSection(null);
+                    setSelectedHarvester('');
+                    setSectionSearch('');
+                  }}
+                  hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                  activeOpacity={0.7}
+                >
+                  <Ionicons name="close-circle" size={16} color={colors.textMuted} />
+                </TouchableOpacity>
+              )}
+              <TouchableOpacity
+                onPress={() => {
+                  if (!selectedGreenhouse) {
+                    Alert.alert('Missing', 'Select a greenhouse first.');
+                    return;
+                  }
+                  if (sectionBlurTimer.current) clearTimeout(sectionBlurTimer.current);
+                  if (sectionDropdownOpen) {
+                    setSectionDropdownOpen(false);
+                  } else {
+                    setSectionSearch('');
+                    setSectionDropdownOpen(true);
+                  }
+                }}
+                hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                activeOpacity={0.7}
+              >
+                <Ionicons name={sectionDropdownOpen ? 'chevron-up' : 'chevron-down'} size={16} color={colors.textMuted} />
+              </TouchableOpacity>
+            </View>
 
-          {/* Harvester — auto-filled if single, picker if multiple */}
+            {sectionDropdownOpen && (
+              <View style={styles.dropdownList}>
+                <TouchableOpacity
+                  style={styles.sortRow}
+                  onPress={() => setSectionSortAZ(!sectionSortAZ)}
+                  activeOpacity={0.7}
+                >
+                  <Ionicons name="swap-vertical" size={12} color={colors.textMuted} />
+                  <Text style={styles.sortRowText}>{sectionSortAZ ? 'A → Z' : 'Z → A'}</Text>
+                </TouchableOpacity>
+                <ScrollView style={styles.dropdownScroll} nestedScrollEnabled keyboardShouldPersistTaps="handled">
+                  {filteredSections.map((item) => {
+                    const isSelected = selectedSection?.section_name === item.section_name;
+                    const borrowed = teamOverrides[item.section_name] ?? [];
+                    const names = [item.employee_name, ...borrowed.map(b => b.employee_name)];
+                    return (
+                      <TouchableOpacity
+                        key={item.section_name}
+                        style={[styles.listRow, isSelected && styles.listRowSelected]}
+                        onPress={() => handleSelectSection(item)}
+                        activeOpacity={0.7}
+                      >
+                        <View style={{ flex: 1 }}>
+                          <Text style={styles.listRowTitle}>{item.section_name}</Text>
+                          <Text style={styles.listRowSub}>{names.join(', ')}</Text>
+                        </View>
+                        {isSelected && <Ionicons name="checkmark" size={18} color={colors.primary} />}
+                      </TouchableOpacity>
+                    );
+                  })}
+                  {filteredSections.length === 0 && (
+                    <Text style={styles.emptyText}>
+                      {selectedGreenhouse ? 'No sections found' : 'Select a greenhouse first'}
+                    </Text>
+                  )}
+                </ScrollView>
+              </View>
+            )}
+          </View>
+
+          {/* ── Harvester (auto-filled or inline picker) ── */}
           {selectedSection && (
             sectionHarvesters.length > 1 ? (
               <>
                 <Text style={styles.label}>Harvester</Text>
-                <TouchableOpacity
-                  style={styles.pickerButton}
-                  onPress={() => setHarvesterPickerOpen(true)}
-                  activeOpacity={0.7}
-                >
-                  <Text
-                    style={selectedHarvester ? styles.pickerValue : styles.pickerPlaceholder}
-                    numberOfLines={1}
+                <View style={styles.dropdownWrapper}>
+                  <TouchableOpacity
+                    style={[styles.dropdownField, harvesterDropdownOpen && styles.dropdownFieldActive]}
+                    onPress={() => setHarvesterDropdownOpen(!harvesterDropdownOpen)}
+                    activeOpacity={0.7}
                   >
-                    {selectedHarvester || 'Select harvester...'}
-                  </Text>
-                  <Ionicons name="chevron-down" size={16} color={colors.textMuted} />
-                </TouchableOpacity>
+                    <Text
+                      style={[{ flex: 1 }, selectedHarvester ? styles.dropdownValue : styles.dropdownPlaceholder]}
+                      numberOfLines={1}
+                    >
+                      {selectedHarvester || 'Select harvester...'}
+                    </Text>
+                    <Ionicons name={harvesterDropdownOpen ? 'chevron-up' : 'chevron-down'} size={16} color={colors.textMuted} />
+                  </TouchableOpacity>
+
+                  {harvesterDropdownOpen && (
+                    <View style={styles.dropdownList}>
+                      {sectionHarvesters.map((item, index) => {
+                        const isSelected = selectedHarvester === item.employee_name;
+                        return (
+                          <TouchableOpacity
+                            key={`${item.employee_name}-${index}`}
+                            style={[styles.listRow, isSelected && styles.listRowSelected]}
+                            onPress={() => {
+                              setSelectedHarvester(item.employee_name);
+                              setHarvesterDropdownOpen(false);
+                            }}
+                            activeOpacity={0.7}
+                          >
+                            <View style={{ flex: 1 }}>
+                              <Text style={styles.listRowTitle}>{item.employee_name}</Text>
+                              <Text style={styles.listRowSub}>
+                                {index === 0 ? selectedGreenhouse?.warehouse_name ?? '' : item.greenhouse_name}
+                              </Text>
+                            </View>
+                            {isSelected && <Ionicons name="checkmark" size={18} color={colors.primary} />}
+                          </TouchableOpacity>
+                        );
+                      })}
+                    </View>
+                  )}
+                </View>
               </>
             ) : (
               <View style={styles.harvesterRow}>
@@ -405,37 +654,118 @@ export default function HarvestScreen() {
             )
           )}
 
-          {/* Item / Variety */}
+          {/* ── Item / Variety ── */}
           <Text style={styles.label}>Item</Text>
-          <TouchableOpacity
-            style={styles.pickerButton}
-            onPress={() => {
-              if (!selectedGreenhouse) {
-                Alert.alert('Missing', 'Select a greenhouse first.');
-                return;
-              }
-              setVarietyPickerOpen(true);
-            }}
-            activeOpacity={0.7}
-          >
-            <Text
-              style={selectedVariety ? styles.pickerValue : styles.pickerPlaceholder}
-              numberOfLines={1}
-            >
-              {selectedVariety?.variety ?? 'Select item...'}
-            </Text>
-            <Ionicons name="chevron-down" size={16} color={colors.textMuted} />
-          </TouchableOpacity>
+          <View style={styles.dropdownWrapper}>
+            <View style={[
+              styles.dropdownField,
+              varietyDropdownOpen && styles.dropdownFieldActive,
+              !selectedGreenhouse && styles.dropdownFieldDisabled,
+            ]}>
+              <Ionicons name="search" size={15} color={colors.textMuted} />
+              <TextInput
+                style={styles.dropdownTextInput}
+                value={varietyDropdownOpen ? varietySearch : (selectedVariety?.variety ?? '')}
+                onChangeText={setVarietySearch}
+                onFocus={() => {
+                  if (!selectedGreenhouse) {
+                    Alert.alert('Missing', 'Select a greenhouse first.');
+                    return;
+                  }
+                  if (varietyBlurTimer.current) clearTimeout(varietyBlurTimer.current);
+                  setVarietySearch('');
+                  setVarietyDropdownOpen(true);
+                }}
+                onBlur={() => {
+                  varietyBlurTimer.current = setTimeout(() => setVarietyDropdownOpen(false), 200);
+                }}
+                placeholder="Search item..."
+                placeholderTextColor={colors.textMuted}
+                autoCorrect={false}
+                autoCapitalize="none"
+                editable={!!selectedGreenhouse}
+              />
+              {selectedVariety && !varietyDropdownOpen && (
+                <TouchableOpacity
+                  onPress={() => {
+                    setSelectedVariety(null);
+                    setVarietySearch('');
+                  }}
+                  hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                  activeOpacity={0.7}
+                >
+                  <Ionicons name="close-circle" size={16} color={colors.textMuted} />
+                </TouchableOpacity>
+              )}
+              <TouchableOpacity
+                onPress={() => {
+                  if (!selectedGreenhouse) {
+                    Alert.alert('Missing', 'Select a greenhouse first.');
+                    return;
+                  }
+                  if (varietyBlurTimer.current) clearTimeout(varietyBlurTimer.current);
+                  if (varietyDropdownOpen) {
+                    setVarietyDropdownOpen(false);
+                  } else {
+                    setVarietySearch('');
+                    setVarietyDropdownOpen(true);
+                  }
+                }}
+                hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                activeOpacity={0.7}
+              >
+                <Ionicons name={varietyDropdownOpen ? 'chevron-up' : 'chevron-down'} size={16} color={colors.textMuted} />
+              </TouchableOpacity>
+            </View>
+
+            {varietyDropdownOpen && (
+              <View style={styles.dropdownList}>
+                <TouchableOpacity
+                  style={styles.sortRow}
+                  onPress={() => setVarietySortAZ(!varietySortAZ)}
+                  activeOpacity={0.7}
+                >
+                  <Ionicons name="swap-vertical" size={12} color={colors.textMuted} />
+                  <Text style={styles.sortRowText}>{varietySortAZ ? 'A → Z' : 'Z → A'}</Text>
+                </TouchableOpacity>
+                <ScrollView style={styles.dropdownScroll} nestedScrollEnabled keyboardShouldPersistTaps="handled">
+                  {filteredVarieties.map((item) => {
+                    const isSelected = selectedVariety?.variety === item.variety;
+                    return (
+                      <TouchableOpacity
+                        key={item.variety}
+                        style={[styles.listRow, isSelected && styles.listRowSelected]}
+                        onPress={() => handleSelectVariety(item)}
+                        activeOpacity={0.7}
+                      >
+                        <Text style={[styles.listRowTitle, { flex: 1 }]}>{item.variety}</Text>
+                        {isSelected && <Ionicons name="checkmark" size={18} color={colors.primary} />}
+                      </TouchableOpacity>
+                    );
+                  })}
+                  {filteredVarieties.length === 0 && (
+                    <Text style={styles.emptyText}>
+                      {selectedGreenhouse ? 'No varieties found' : 'Select a greenhouse first'}
+                    </Text>
+                  )}
+                </ScrollView>
+              </View>
+            )}
+          </View>
 
           {/* Quantity */}
           <Text style={styles.label}>Quantity</Text>
           <TextInput
+            ref={quantityRef}
             style={styles.textInput}
             value={quantity}
             onChangeText={setQuantity}
+            onSubmitEditing={() => Keyboard.dismiss()}
             placeholder="Enter quantity"
             placeholderTextColor={colors.textMuted}
             keyboardType="numeric"
+            returnKeyType="done"
+            blurOnSubmit
           />
 
           {/* Bucket scan */}
@@ -447,230 +777,26 @@ export default function HarvestScreen() {
           />
 
           {/* Entries */}
-          {entries.length > 0 && (
-            <Text style={styles.countText}>{entries.length} harvested</Text>
-          )}
-          {entries.map((entry, idx) => (
-            <View key={`${entry.bucket_id}-${idx}`} style={styles.entryRow}>
-              <Ionicons
-                name={
-                  entry.status === 'success'
-                    ? 'checkmark-circle'
-                    : entry.status === 'queued'
-                      ? 'time'
-                      : 'alert-circle'
-                }
-                size={18}
-                color={
-                  entry.status === 'success'
-                    ? colors.success
-                    : entry.status === 'queued'
-                      ? colors.warning
-                      : colors.error
-                }
-              />
-              <View style={styles.entryInfo}>
-                <Text style={styles.entryId}>{entry.bucket_id}</Text>
-                <Text style={styles.entryMeta}>
-                  {entry.quantity} x {entry.item_code} · {entry.time}
-                </Text>
+          <EntriesLog
+            entries={entries}
+            label="bucket"
+            renderEntry={(entry, idx) => (
+              <View key={`${entry.bucket_id}-${idx}`} style={styles.entryRow}>
+                <Ionicons
+                  name={entry.status === 'success' ? 'checkmark-circle' : entry.status === 'queued' ? 'time' : 'alert-circle'}
+                  size={18}
+                  color={entry.status === 'success' ? colors.success : entry.status === 'queued' ? colors.warning : colors.error}
+                />
+                <View style={styles.entryInfo}>
+                  <Text style={styles.entryId}>{entry.bucket_id}</Text>
+                  <Text style={styles.entryMeta}>{entry.quantity} x {entry.item_code} · {entry.time}</Text>
+                </View>
+                {entry.message ? <Text style={styles.entryMsg} numberOfLines={1}>{entry.message}</Text> : null}
               </View>
-              {entry.message ? (
-                <Text style={styles.entryMsg} numberOfLines={1}>{entry.message}</Text>
-              ) : null}
-            </View>
-          ))}
+            )}
+          />
         </ScrollView>
       </KeyboardAvoidingView>
-
-      {/* ── Greenhouse picker ── */}
-      <Modal visible={ghPickerOpen} transparent animationType="slide" onRequestClose={() => setGhPickerOpen(false)}>
-        <View style={styles.modalOverlay}>
-          <View style={styles.modalContent}>
-            <View style={styles.modalHeader}>
-              <Text style={styles.modalTitle}>Select Greenhouse</Text>
-              <TouchableOpacity onPress={() => { setGhPickerOpen(false); setGhSearch(''); }} activeOpacity={0.7}>
-                <Ionicons name="close" size={24} color={colors.text} />
-              </TouchableOpacity>
-            </View>
-            <View style={styles.searchRow}>
-              <Ionicons name="search" size={16} color={colors.textMuted} />
-              <TextInput
-                style={styles.searchInput}
-                value={ghSearch}
-                onChangeText={setGhSearch}
-                placeholder="Search greenhouses..."
-                placeholderTextColor={colors.textMuted}
-                autoCorrect={false}
-              />
-            </View>
-            <FlatList
-              data={filteredGreenhouses}
-              keyExtractor={(item) => item.name}
-              renderItem={({ item }) => {
-                const isSelected = selectedGreenhouse?.name === item.name;
-                const secCount = item.custom_sections?.length ?? 0;
-                const varCount = item.custom_varieties_grown?.length ?? 0;
-                return (
-                  <TouchableOpacity
-                    style={[styles.listRow, isSelected && styles.listRowSelected]}
-                    onPress={() => handleSelectGreenhouse(item)}
-                    activeOpacity={0.7}
-                  >
-                    <View style={{ flex: 1 }}>
-                      <Text style={styles.listRowTitle}>{item.warehouse_name}</Text>
-                      <Text style={styles.listRowSub}>
-                        {secCount} sections · {varCount} varieties
-                      </Text>
-                    </View>
-                    {isSelected && <Ionicons name="checkmark" size={18} color={colors.primary} />}
-                  </TouchableOpacity>
-                );
-              }}
-              ListEmptyComponent={<Text style={styles.emptyText}>No greenhouses found</Text>}
-              keyboardShouldPersistTaps="handled"
-            />
-          </View>
-        </View>
-      </Modal>
-
-      {/* ── Section picker ── */}
-      <Modal visible={sectionPickerOpen} transparent animationType="slide" onRequestClose={() => setSectionPickerOpen(false)}>
-        <View style={styles.modalOverlay}>
-          <View style={styles.modalContent}>
-            <View style={styles.modalHeader}>
-              <Text style={styles.modalTitle}>Select Section</Text>
-              <TouchableOpacity onPress={() => { setSectionPickerOpen(false); setSectionSearch(''); }} activeOpacity={0.7}>
-                <Ionicons name="close" size={24} color={colors.text} />
-              </TouchableOpacity>
-            </View>
-            <View style={styles.searchRow}>
-              <Ionicons name="search" size={16} color={colors.textMuted} />
-              <TextInput
-                style={styles.searchInput}
-                value={sectionSearch}
-                onChangeText={setSectionSearch}
-                placeholder="Search sections..."
-                placeholderTextColor={colors.textMuted}
-                autoCorrect={false}
-              />
-            </View>
-            <FlatList
-              data={filteredSections}
-              keyExtractor={(item) => item.section_name}
-              renderItem={({ item }) => {
-                const isSelected = selectedSection?.section_name === item.section_name;
-                const borrowed = teamOverrides[item.section_name] ?? [];
-                const names = [item.employee_name, ...borrowed.map(b => b.employee_name)];
-                return (
-                  <TouchableOpacity
-                    style={[styles.listRow, isSelected && styles.listRowSelected]}
-                    onPress={() => handleSelectSection(item)}
-                    activeOpacity={0.7}
-                  >
-                    <View style={{ flex: 1 }}>
-                      <Text style={styles.listRowTitle}>{item.section_name}</Text>
-                      <Text style={styles.listRowSub}>{names.join(', ')}</Text>
-                    </View>
-                    {isSelected && <Ionicons name="checkmark" size={18} color={colors.primary} />}
-                  </TouchableOpacity>
-                );
-              }}
-              ListEmptyComponent={
-                <Text style={styles.emptyText}>
-                  {selectedGreenhouse ? 'No sections found' : 'Select a greenhouse first'}
-                </Text>
-              }
-              keyboardShouldPersistTaps="handled"
-            />
-          </View>
-        </View>
-      </Modal>
-
-      {/* ── Harvester picker (when section has multiple) ── */}
-      <Modal visible={harvesterPickerOpen} transparent animationType="slide" onRequestClose={() => setHarvesterPickerOpen(false)}>
-        <View style={styles.modalOverlay}>
-          <View style={styles.modalContent}>
-            <View style={styles.modalHeader}>
-              <Text style={styles.modalTitle}>Select Harvester</Text>
-              <TouchableOpacity onPress={() => setHarvesterPickerOpen(false)} activeOpacity={0.7}>
-                <Ionicons name="close" size={24} color={colors.text} />
-              </TouchableOpacity>
-            </View>
-            <FlatList
-              data={sectionHarvesters}
-              keyExtractor={(item, idx) => `${item.employee_name}-${idx}`}
-              renderItem={({ item, index }) => {
-                const isSelected = selectedHarvester === item.employee_name;
-                return (
-                  <TouchableOpacity
-                    style={[styles.listRow, isSelected && styles.listRowSelected]}
-                    onPress={() => { setSelectedHarvester(item.employee_name); setHarvesterPickerOpen(false); }}
-                    activeOpacity={0.7}
-                  >
-                    <View style={{ flex: 1 }}>
-                      <Text style={styles.listRowTitle}>{item.employee_name}</Text>
-                      <Text style={styles.listRowSub}>
-                        {index === 0 ? selectedGreenhouse?.warehouse_name ?? '' : item.greenhouse_name}
-                      </Text>
-                    </View>
-                    {isSelected && <Ionicons name="checkmark" size={18} color={colors.primary} />}
-                  </TouchableOpacity>
-                );
-              }}
-              keyboardShouldPersistTaps="handled"
-            />
-          </View>
-        </View>
-      </Modal>
-
-      {/* ── Variety picker ── */}
-      <Modal visible={varietyPickerOpen} transparent animationType="slide" onRequestClose={() => setVarietyPickerOpen(false)}>
-        <View style={styles.modalOverlay}>
-          <View style={styles.modalContent}>
-            <View style={styles.modalHeader}>
-              <Text style={styles.modalTitle}>Select Item</Text>
-              <TouchableOpacity onPress={() => { setVarietyPickerOpen(false); setVarietySearch(''); }} activeOpacity={0.7}>
-                <Ionicons name="close" size={24} color={colors.text} />
-              </TouchableOpacity>
-            </View>
-            <View style={styles.searchRow}>
-              <Ionicons name="search" size={16} color={colors.textMuted} />
-              <TextInput
-                style={styles.searchInput}
-                value={varietySearch}
-                onChangeText={setVarietySearch}
-                placeholder="Search varieties..."
-                placeholderTextColor={colors.textMuted}
-                autoCorrect={false}
-              />
-            </View>
-            <FlatList
-              data={filteredVarieties}
-              keyExtractor={(item) => item.variety}
-              renderItem={({ item }) => {
-                const isSelected = selectedVariety?.variety === item.variety;
-                return (
-                  <TouchableOpacity
-                    style={[styles.listRow, isSelected && styles.listRowSelected]}
-                    onPress={() => handleSelectVariety(item)}
-                    activeOpacity={0.7}
-                  >
-                    <Text style={[styles.listRowTitle, { flex: 1 }]}>{item.variety}</Text>
-                    {isSelected && <Ionicons name="checkmark" size={18} color={colors.primary} />}
-                  </TouchableOpacity>
-                );
-              }}
-              ListEmptyComponent={
-                <Text style={styles.emptyText}>
-                  {selectedGreenhouse ? 'No varieties found' : 'Select a greenhouse first'}
-                </Text>
-              }
-              keyboardShouldPersistTaps="handled"
-            />
-          </View>
-        </View>
-      </Modal>
 
       {/* ── Manage Team modal ── */}
       <Modal
@@ -837,28 +963,72 @@ const styles = StyleSheet.create({
     marginBottom: spacing.lg,
   },
 
-  // Picker button
-  pickerButton: {
+  // Inline dropdown
+  dropdownWrapper: {
+    marginBottom: spacing.lg,
+  },
+  dropdownField: {
     flexDirection: 'row',
     alignItems: 'center',
+    gap: spacing.sm,
     backgroundColor: colors.surface,
     borderWidth: 1,
     borderColor: colors.border,
     borderRadius: borderRadius.md,
     paddingHorizontal: spacing.md,
     height: 48,
-    marginBottom: spacing.lg,
   },
-  pickerValue: {
+  dropdownFieldActive: {
+    borderColor: colors.primary,
+    borderBottomLeftRadius: 0,
+    borderBottomRightRadius: 0,
+  },
+  dropdownFieldDisabled: {
+    backgroundColor: colors.surfaceAlt,
+    opacity: 0.6,
+  },
+  dropdownTextInput: {
     flex: 1,
     fontFamily: fontFamily.regular,
     fontSize: fontSize.sm,
     color: colors.text,
+    padding: 0,
   },
-  pickerPlaceholder: {
-    flex: 1,
+  dropdownValue: {
     fontFamily: fontFamily.regular,
     fontSize: fontSize.sm,
+    color: colors.text,
+  },
+  dropdownPlaceholder: {
+    fontFamily: fontFamily.regular,
+    fontSize: fontSize.sm,
+    color: colors.textMuted,
+  },
+  dropdownList: {
+    backgroundColor: colors.surface,
+    borderWidth: 1,
+    borderTopWidth: 0,
+    borderColor: colors.primary,
+    borderBottomLeftRadius: borderRadius.md,
+    borderBottomRightRadius: borderRadius.md,
+    overflow: 'hidden',
+  },
+  dropdownScroll: {
+    maxHeight: 220,
+  },
+  sortRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.xs,
+    paddingHorizontal: spacing.md,
+    paddingVertical: 6,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: colors.border,
+    backgroundColor: colors.surfaceAlt,
+  },
+  sortRowText: {
+    fontFamily: fontFamily.regular,
+    fontSize: fontSize.xs,
     color: colors.textMuted,
   },
 
@@ -948,7 +1118,7 @@ const styles = StyleSheet.create({
     paddingVertical: spacing.xxl,
   },
 
-  // Modal (shared)
+  // Modal (team modal only)
   modalOverlay: {
     flex: 1,
     backgroundColor: colors.overlay,

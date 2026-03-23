@@ -34,3 +34,11 @@ export async function getTodayGradingCount(): Promise<number> {
   );
   return result?.count ?? 0;
 }
+
+export async function getTodayGradingStems(): Promise<number> {
+  const db = await getDatabase();
+  const result = await db.getFirstAsync<{ total: number }>(
+    "SELECT COALESCE(SUM(qty), 0) as total FROM grading_entries WHERE date(date_added) = date('now')"
+  );
+  return result?.total ?? 0;
+}

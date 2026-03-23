@@ -39,3 +39,42 @@ export function parseScannedGradingBucketQR(data: string): string | null {
   if (cleaned.length > 0) return cleaned;
   return null;
 }
+
+export type GradingQRType = 'bunch' | 'grader' | 'bucket' | 'unknown';
+
+/**
+ * Detects which grading slot a scanned QR belongs to by inspecting JSON keys.
+ * Falls back to 'unknown' for raw strings (caller routes to next empty slot).
+ */
+export function detectGradingQRType(data: string): GradingQRType {
+  try {
+    const parsed = JSON.parse(data);
+    if (parsed.bunch_id || parsed.bunch) return 'bunch';
+    if (parsed.grader || parsed.employee) return 'grader';
+    if (parsed.bucket_id || parsed.bucket) return 'bucket';
+  } catch {
+    // Raw string — check common prefixes
+    const upper = data.trim().toUpperCase();
+    if (upper.startsWith('BN-') || upper.startsWith('BUNCH-')) return 'bunch';
+    if (upper.startsWith('GR-') || upper.startsWith('EMP-') || upper.startsWith('GRADER-')) return 'grader';
+    if (upper.startsWith('BK-') || upper.startsWith('BUCKET-')) return 'bucket';
+  }
+  return 'unknown';
+}
+
+/**
+ * Extract the value from a QR regardless of which slot type it is.
+ */
+export function extractGradingQRValue(data: string): string {
+  try {
+    const parsed = JSON.parse(data);
+    return (
+      parsed.bunch_id ?? parsed.bunch ??
+      parsed.grader ?? parsed.employee ??
+      parsed.bucket_id ?? parsed.bucket ??
+      parsed.id ?? data.trim()
+    );
+  } catch {
+    return data.trim();
+  }
+}

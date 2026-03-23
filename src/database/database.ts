@@ -90,8 +90,84 @@ async function runMigrations(database: SQLite.SQLiteDatabase): Promise<void> {
 
     CREATE TABLE IF NOT EXISTS receiving_entries (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
+      bucket_id TEXT NOT NULL DEFAULT '',
+      date_added TEXT NOT NULL DEFAULT (datetime('now')),
+      synced INTEGER NOT NULL DEFAULT 0
+    );
+
+    CREATE TABLE IF NOT EXISTS packing_boxes (
+      box_id TEXT PRIMARY KEY NOT NULL,
+      farm TEXT NOT NULL DEFAULT '',
+      date_created TEXT NOT NULL DEFAULT (datetime('now')),
+      synced INTEGER NOT NULL DEFAULT 0
+    );
+
+    CREATE TABLE IF NOT EXISTS packing_box_items (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      box_id TEXT NOT NULL,
       bunch_id TEXT NOT NULL,
-      receiver TEXT NOT NULL DEFAULT '',
+      date_added TEXT NOT NULL DEFAULT (datetime('now')),
+      synced INTEGER NOT NULL DEFAULT 0,
+      FOREIGN KEY (box_id) REFERENCES packing_boxes(box_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS quality_entries (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      section TEXT NOT NULL DEFAULT '',
+      ref_id TEXT NOT NULL DEFAULT '',
+      quantity INTEGER NOT NULL DEFAULT 0,
+      reason TEXT NOT NULL DEFAULT '',
+      notes TEXT NOT NULL DEFAULT '',
+      farm TEXT NOT NULL DEFAULT '',
+      date_added TEXT NOT NULL DEFAULT (datetime('now')),
+      synced INTEGER NOT NULL DEFAULT 0
+    );
+
+    CREATE TABLE IF NOT EXISTS quarantine_batches (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      batch_id TEXT NOT NULL DEFAULT '',
+      scope TEXT NOT NULL DEFAULT 'buckets',
+      greenhouse TEXT NOT NULL DEFAULT '',
+      bucket_ids TEXT NOT NULL DEFAULT '[]',
+      reason TEXT NOT NULL DEFAULT '',
+      notes TEXT NOT NULL DEFAULT '',
+      status TEXT NOT NULL DEFAULT 'pending',
+      date_added TEXT NOT NULL DEFAULT (datetime('now')),
+      synced INTEGER NOT NULL DEFAULT 0
+    );
+  `);
+
+  // Migration: rename bunch_id → bucket_id if old schema exists
+  try {
+    await database.execAsync(`ALTER TABLE receiving_entries RENAME COLUMN bunch_id TO bucket_id`);
+  } catch {
+    // Column already renamed or doesn't exist — safe to ignore
+  }
+
+  // Migration: add greenhouse/variety/quarantine fields to quality_entries
+  const qualityMigrations = [
+    `ALTER TABLE quality_entries ADD COLUMN greenhouse TEXT NOT NULL DEFAULT ''`,
+    `ALTER TABLE quality_entries ADD COLUMN variety TEXT NOT NULL DEFAULT ''`,
+    `ALTER TABLE quality_entries ADD COLUMN quarantined INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE quality_entries ADD COLUMN quarantine_action TEXT NOT NULL DEFAULT ''`,
+  ];
+  for (const sql of qualityMigrations) {
+    try {
+      await database.execAsync(sql);
+    } catch {
+      // Column already exists — safe to ignore
+    }
+  }
+
+  // Migration: actual harvest entries table
+  await database.execAsync(`
+    CREATE TABLE IF NOT EXISTS actual_harvest_entries (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      greenhouse TEXT NOT NULL DEFAULT '',
+      variety TEXT NOT NULL DEFAULT '',
+      quantity INTEGER NOT NULL DEFAULT 0,
+      harvest_date TEXT NOT NULL DEFAULT (date('now')),
+      notes TEXT NOT NULL DEFAULT '',
       farm TEXT NOT NULL DEFAULT '',
       date_added TEXT NOT NULL DEFAULT (datetime('now')),
       synced INTEGER NOT NULL DEFAULT 0
@@ -108,5 +184,8 @@ export async function resetDatabase(): Promise<void> {
     DELETE FROM grading_entries;
     DELETE FROM harvest_entries;
     DELETE FROM receiving_entries;
+    DELETE FROM packing_box_items;
+    DELETE FROM packing_boxes;
+    DELETE FROM quality_entries;
   `);
 }

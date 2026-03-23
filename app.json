@@ -2,39 +2,52 @@
   "expo": {
     "name": "Upande Harvest",
     "slug": "mona-shelve",
-    "version": "1.0.0",
+    "version": "1.0.3",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
+
     "splash": {
       "image": "./assets/splash-icon.png",
       "resizeMode": "contain",
       "backgroundColor": "#ffffff"
     },
+
+    "updates": {
+      "url": "https://u.expo.dev/4bc52c54-5cfa-44cd-9ecd-cfbf1f298aaa",
+      "fallbackToCacheTimeout": 0
+    },
+
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+
     "ios": {
       "supportsTablet": true
     },
+
     "android": {
+      "package": "com.upande.harvest",
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#ffffff"
-      },
-      "package": "com.upande.harvest"
+      }
     },
+
     "web": {
       "favicon": "./assets/favicon.png"
     },
-    "updates": {
-      "enabled": false
-    },
+
     "plugins": [
       "expo-font"
     ],
+
     "extra": {
       "eas": {
         "projectId": "4bc52c54-5cfa-44cd-9ecd-cfbf1f298aaa"
       }
     },
+
     "owner": "teddy2026"
   }
 }

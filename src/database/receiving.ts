@@ -1,16 +1,14 @@
 import { getDatabase } from './database';
 
 export async function addReceivingEntry(
-  bunchId: string,
-  receiver: string,
-  farm: string,
+  bucketId: string,
   synced: boolean
 ): Promise<number> {
   const db = await getDatabase();
   const result = await db.runAsync(
-    `INSERT INTO receiving_entries (bunch_id, receiver, farm, synced)
-     VALUES (?, ?, ?, ?)`,
-    [bunchId, receiver, farm, synced ? 1 : 0]
+    `INSERT INTO receiving_entries (bucket_id, synced)
+     VALUES (?, ?)`,
+    [bucketId, synced ? 1 : 0]
   );
   return result.lastInsertRowId;
 }

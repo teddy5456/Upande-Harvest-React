@@ -3,7 +3,10 @@
     "allow": [
       "Bash(curl:*)",
       "Bash(npx expo install:*)",
-      "Bash(npm uninstall:*)"
+      "Bash(npm uninstall:*)",
+      "Bash(eas update:*)",
+      "Bash(npx eas:*)",
+      "Bash(npx tsc:*)"
     ]
   }
 }

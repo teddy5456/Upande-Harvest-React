@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   View,
   Text,
@@ -12,16 +12,24 @@ import {
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { useApp } from '../context/AppContext';
-import { loginToServer } from '../services/api';
-import { setSetting } from '../database/settings';
+import { loginToServer, fetchUserRoles } from '../services/api';
+import { setSetting, getApiUrl, getUserEmail, setUserRoles as storeUserRoles } from '../database/settings';
 import { setSid, setFullName as storeFullName, setUserEmail as storeUserEmail } from '../database/settings';
 import { colors, fontFamily, fontSize, spacing, borderRadius, shadow } from '../theme';
 
 export default function LoginScreen() {
-  const { setLoggedIn, setFullName, setUserEmail } = useApp();
+  const { setLoggedIn, setFullName, setUserEmail, setIsXflora, setUserRoles } = useApp();
   const [serverUrl, setServerUrl] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+
+  useEffect(() => {
+    (async () => {
+      const [savedUrl, savedEmail] = await Promise.all([getApiUrl(), getUserEmail()]);
+      if (savedUrl) setServerUrl(savedUrl);
+      if (savedEmail) setEmail(savedEmail);
+    })();
+  }, []);
   const [showPassword, setShowPassword] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -53,9 +61,20 @@ export default function LoginScreen() {
 
       setFullName(response.full_name);
       setUserEmail(response.user);
+      setIsXflora(serverUrl.toLowerCase().includes('xflora'));
+
+      // Fetch and store user roles for role-based dashboard
+      try {
+        const rolesResp = await fetchUserRoles();
+        const roles = rolesResp.roles ?? [];
+        await storeUserRoles(roles);
+        setUserRoles(roles);
+      } catch {
+        // Non-critical — proceed without roles
+      }
+
       setLoggedIn(true);
     } catch (err: any) {
-      console.error('[LoginScreen] Error:', err.message, err);
       setError(err.message || 'Login failed. Please check your credentials.');
     } finally {
       setLoading(false);

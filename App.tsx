@@ -3,7 +3,7 @@ import { StatusBar } from 'expo-status-bar';
 import { ActivityIndicator, View, StyleSheet, Text, TouchableOpacity } from 'react-native';
 import { NavigationContainer } from '@react-navigation/native';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
-import { SafeAreaProvider } from 'react-native-safe-area-context';
+import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import {
   useFonts,
@@ -21,9 +21,15 @@ import HarvestScreen from './src/screens/HarvestScreen';
 import ReceivingScreen from './src/screens/ReceivingScreen';
 import ShelveScreen from './src/screens/ShelveScreen';
 import GradeScreen from './src/screens/GradeScreen';
+import PackingScreen from './src/screens/PackingScreen';
+import QualityScreen from './src/screens/QualityScreen';
 import ShelfMapScreen from './src/screens/ShelfMapScreen';
 import SettingsScreen from './src/screens/SettingsScreen';
+import ActualHarvestScreen from './src/screens/ActualHarvestScreen';
 import DrawerMenu from './src/components/DrawerContent';
+import UpdatePrompt from './src/components/UpdatePrompt';
+import ChangelogModal from './src/components/ChangelogModal';
+import TutorialModal from './src/components/TutorialModal';
 import { colors, fontFamily, fontSize, spacing } from './src/theme';
 
 const Tab = createBottomTabNavigator();
@@ -34,11 +40,17 @@ const TAB_ICONS: Record<string, { outline: keyof typeof Ionicons.glyphMap; fille
   Receive: { outline: 'download-outline', filled: 'download' },
   Shelve: { outline: 'scan-outline', filled: 'scan' },
   Grade: { outline: 'clipboard-outline', filled: 'clipboard' },
+  Pack: { outline: 'cube-outline', filled: 'cube' },
+  Quality: { outline: 'shield-checkmark-outline', filled: 'shield-checkmark' },
+  ActualHarvest: { outline: 'analytics-outline', filled: 'analytics' },
 };
 
 function AppContent() {
-  const { isReady, isLoggedIn } = useApp();
+  const { isReady, isLoggedIn, isXflora } = useApp();
+  const insets = useSafeAreaInsets();
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const [changelogOpen, setChangelogOpen] = useState(false);
+  const [tutorialOpen, setTutorialOpen] = useState(false);
   const navigationRef = React.useRef<any>(null);
 
   const openDrawer = useCallback(() => setDrawerOpen(true), []);
@@ -96,7 +108,8 @@ function AppContent() {
           tabBarStyle: {
             backgroundColor: colors.surface,
             borderTopColor: colors.border,
-            height: 52,
+            height: 52 + insets.bottom,
+            paddingBottom: insets.bottom,
           },
           tabBarIcon: ({ focused, size }) => {
             const icons = TAB_ICONS[route.name];
@@ -112,18 +125,33 @@ function AppContent() {
         })}
       >
         <Tab.Screen name="Dashboard" component={DashboardScreen} options={{ title: 'Dashboard' }} />
-        <Tab.Screen name="Harvest" component={HarvestScreen} options={{ title: 'Harvest' }} />
+        <Tab.Screen name="Harvest" component={HarvestScreen} options={{ title: 'Harvest', tabBarItemStyle: isXflora ? { display: 'none' } : undefined }} />
         <Tab.Screen name="Receive" component={ReceivingScreen} options={{ title: 'Receiving' }} />
         <Tab.Screen name="Shelve" component={ShelveScreen} options={{ title: 'Shelve' }} />
         <Tab.Screen name="Grade" component={GradeScreen} options={{ title: 'Grade' }} />
+        <Tab.Screen name="Pack" component={PackingScreen} options={{ tabBarItemStyle: { display: 'none' }, title: 'Packing' }} />
+        <Tab.Screen name="Quality" component={QualityScreen} options={{ tabBarItemStyle: { display: 'none' }, title: 'Quality' }} />
         <Tab.Screen name="Map" component={ShelfMapScreen} options={{ tabBarItemStyle: { display: 'none' }, title: 'Shelf Map' }} />
         <Tab.Screen name="Settings" component={SettingsScreen} options={{ tabBarItemStyle: { display: 'none' }, title: 'Settings' }} />
+        <Tab.Screen name="ActualHarvest" component={ActualHarvestScreen} options={{ tabBarItemStyle: { display: 'none' }, title: 'Actual Harvest' }} />
       </Tab.Navigator>
 
       <DrawerMenu
         visible={drawerOpen}
         onClose={closeDrawer}
         onNavigate={handleNavigate}
+        onWhatsNew={() => { closeDrawer(); setTimeout(() => setChangelogOpen(true), 250); }}
+        onTutorial={() => { closeDrawer(); setTimeout(() => setTutorialOpen(true), 250); }}
+      />
+
+      <ChangelogModal
+        forceVisible={changelogOpen}
+        onClose={() => setChangelogOpen(false)}
+      />
+
+      <TutorialModal
+        visible={tutorialOpen}
+        onClose={() => setTutorialOpen(false)}
       />
 
       <StatusBar style="dark" />
@@ -145,6 +173,7 @@ export default function App() {
     <SafeAreaProvider>
       <AppProvider>
         <AppContent />
+        <UpdatePrompt />
       </AppProvider>
     </SafeAreaProvider>
   );
