@@ -1,11 +1,20 @@
 import { getDatabase } from './database';
 import { SyncQueueEntry } from '../types';
 
+// Action contract: 'bouquet-grading'
+//   payload: BouquetSubmissionPayload — see src/types/index.ts
+//   handler: the sync runner should call submitBouquetGrading(payload)
+//            and mark the row synced on success.
+
 export async function addToSyncQueue(action: string, payload: object): Promise<number> {
   const db = await getDatabase();
+  const now = new Date();
+  const posting_date = now.toISOString().slice(0, 10);
+  const posting_time = now.toTimeString().slice(0, 8);
+  const enriched = { posting_date, posting_time, ...payload };
   const result = await db.runAsync(
     'INSERT INTO sync_queue (action, payload) VALUES (?, ?)',
-    [action, JSON.stringify(payload)]
+    [action, JSON.stringify(enriched)]
   );
   return result.lastInsertRowId;
 }

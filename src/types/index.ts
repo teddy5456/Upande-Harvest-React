@@ -98,6 +98,7 @@ export interface GradingResponse {
   message: string;
   stock_entry: string;
   variety: string;
+  source_item: string;
   stem_length: string;
   qty: number;
 }
@@ -155,6 +156,7 @@ export interface HarvestSession {
 export interface GreenhouseSection {
   section_name: string;
   employee_name: string;
+  employee?: string; // payroll number
 }
 
 export interface GreenhouseVariety {
@@ -236,6 +238,14 @@ export interface PackingBox {
   farm: string;
   date_created: string;
   synced: number;
+  opl?: string;
+  sales_order?: string;
+  customer?: string;
+  pack_rate?: number;
+  stems_count?: number;
+  status?: 'Open' | 'Closed' | 'Cancelled';
+  box_sequence?: number;
+  total_boxes?: number;
 }
 
 export interface PackingBoxItem {
@@ -244,6 +254,10 @@ export interface PackingBoxItem {
   bunch_id: string;
   date_added: string;
   synced: number;
+  stems?: number;
+  variety?: string;
+  stem_length?: string;
+  bunch_size?: string;
 }
 
 export interface PackingListEntry {
@@ -251,6 +265,8 @@ export interface PackingListEntry {
   time: string;
   status: 'success' | 'error' | 'queued';
   message?: string;
+  stems?: number;
+  variety?: string;
 }
 
 export interface PackingResponse {
@@ -258,15 +274,71 @@ export interface PackingResponse {
   box_id: string;
 }
 
+// Pack Box (server doctype) responses
+export interface PackBoxSummary {
+  name: string;
+  box_id: string;
+  box_sequence: number;
+  total_boxes: number;
+  pack_rate: number;
+  stems_count: number;
+  status: 'Open' | 'Closed' | 'Cancelled';
+}
+
+export interface CreateBoxesForOplResponse {
+  message: string;
+  opl: string;
+  customer: string;
+  farm: string;
+  pack_rate: number;
+  total_stems: number;
+  total_boxes: number;
+  boxes: PackBoxSummary[];
+}
+
+export interface AddBunchResponse {
+  message: string;
+  box_id: string;
+  box_name: string;
+  bunch_id: string;
+  stems: number;
+  stems_count: number;
+  pack_rate: number;
+  remaining: number;
+  full: boolean;
+}
+
+export interface OpenBoxResponse {
+  open_box: PackBoxSummary | null;
+  boxes: PackBoxSummary[];
+  opl: string;
+  customer: string;
+  farm: string;
+  pack_rate: number;
+}
+
+export interface PackableVariety {
+  display: string;      // e.g. "Athena"
+  item_code: string;    // e.g. "Athena 50cm"
+  item_name: string;
+  stock_uom: string;
+}
+
+export interface PackableVarietiesResponse {
+  message: string;
+  varieties: PackableVariety[];
+}
+
 // Quality types
-export type QualitySection = 'field_reject' | 'receiving_reject' | 'grading_reject' | 'packhouse_discard';
+export type QualitySection = 'field_reject' | 'receiving_reject' | 'grading_reject' | 'packhouse_discard' | 'dispatch_reject';
 export type QuarantineAction = 'discard' | 'intake' | '';
 
 export const QUALITY_SECTIONS: { key: QualitySection; label: string; icon: string }[] = [
   { key: 'field_reject', label: 'Field', icon: 'leaf-outline' },
   { key: 'receiving_reject', label: 'Receiving', icon: 'download-outline' },
-  { key: 'grading_reject', label: 'Grading', icon: 'clipboard-outline' },
-  { key: 'packhouse_discard', label: 'Discard', icon: 'trash-outline' },
+  { key: 'grading_reject', label: 'Grading', icon: 'funnel-outline' },
+  { key: 'packhouse_discard', label: 'Packhouse', icon: 'trash-outline' },
+  { key: 'dispatch_reject', label: 'Dispatch', icon: 'send-outline' },
 ];
 
 export const QUALITY_REASONS: Record<QualitySection, string[]> = {
@@ -274,7 +346,42 @@ export const QUALITY_REASONS: Record<QualitySection, string[]> = {
   receiving_reject: ['Botrytis', 'Rust', 'Downy Mildew', 'Thrips Damage', 'Broken Stem', 'Short Stem', 'Drooping', 'Bent Neck', 'Mixed Variety', 'Damaged in Transit', 'Over-aged', 'Other'],
   grading_reject: ['Botrytis', 'Bent Neck', 'Short Stem', 'Broken Stem', 'Thrips Damage', 'Bruised', 'Rust', 'Mixed Variety', 'Tight Cut Stage', 'Advanced Cut Stage', 'Other'],
   packhouse_discard: ['Bent Neck', 'Short Stem', 'Botrytis', 'Thrips', 'Bruised', 'Other'],
+  dispatch_reject: ['Over-aged', 'Bent Neck', 'Botrytis', 'Bruised', 'Dehydrated', 'Broken Stem', 'Other'],
 };
+
+// ---------------------------------------------------------------------------
+// Variety display helpers
+// ---------------------------------------------------------------------------
+// Variety names can carry a trailing stem-length token in several shapes:
+//   "Athena 50cm"    (space + digits + "cm")
+//   "Athena-50CM"    (hyphen + digits + "CM")
+//   "Reflex 60cm"
+// stripStemLength drops the trailing token for display. resolveVarietyToItemCode
+// puts the canonical 50cm suffix back on for server calls that need item_code.
+const STEM_LENGTH_TAIL = /[\s\-]?\d+\s?cm\s*$/i;
+const PACKABLE_STEM_LENGTH = '50cm';
+
+export function stripStemLength(name: string): string {
+  if (!name) return '';
+  return name.replace(STEM_LENGTH_TAIL, '').trim();
+}
+
+/**
+ * Extract the stem-length token (e.g. "50cm", "60CM") from a variety name.
+ * Returns '' if none is present.
+ */
+export function extractStemLength(name: string): string {
+  if (!name) return '';
+  const m = name.match(/(\d+\s?cm)\s*$/i);
+  return m ? m[1].replace(/\s+/g, '').toLowerCase() : '';
+}
+
+export function resolveVarietyToItemCode(display: string): string {
+  if (!display) return '';
+  // Already carries a stem length? keep as-is.
+  if (STEM_LENGTH_TAIL.test(display)) return display;
+  return `${display} ${PACKABLE_STEM_LENGTH}`;
+}
 
 // A single reject line: one reason with a quantity
 export interface RejectLine {
@@ -378,4 +485,39 @@ export interface QuarantineBatchListEntry {
   status: 'pending' | 'discarded' | 'intake';
   date_added: string;
   synced: number;
+}
+
+// Bouquet types
+export interface BouquetVarietyRecipe {
+  item_code: string;
+  item_name: string;
+  stems_per_bunch: number;
+}
+
+export interface BouquetRecipe {
+  is_bouquet: boolean;
+  bouquet_group?: string;
+  sales_order?: string;
+  number_of_bunches?: number;
+  varieties?: BouquetVarietyRecipe[];
+}
+
+export interface BouquetContribution {
+  bucket_id: string;
+  item_code: string;
+  stems: number;
+}
+
+export interface BouquetSubmissionPayload {
+  bunch_id: string;
+  grader: string;
+  bunches_count: number;
+  contributions: BouquetContribution[];
+}
+
+export interface BouquetSubmissionResponse {
+  bouquet_group: string;
+  bunch_id: string;
+  bunches_count: number;
+  created: string[];
 }
