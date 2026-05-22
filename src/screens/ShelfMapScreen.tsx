@@ -15,10 +15,9 @@ import { useFocusEffect } from '@react-navigation/native';
 import { useApp } from '../context/AppContext';
 import { getAllOccupancy, getShelfItems } from '../database/shelves';
 import { fetchShelvesDashboard } from '../services/api';
-import { ShelfOccupancy, ShelfItem, LEVEL_LABELS } from '../types';
+import { ShelfOccupancy, ShelfItem, LEVEL_LABELS, stripStemLength } from '../types';
 import { parseShelfId } from '../utils/shelf-utils';
 import ShelfGrid from '../components/ShelfGrid';
-import SyncBanner from '../components/SyncBanner';
 import { colors, shelfColors, fontFamily, fontSize, spacing, borderRadius, shadow } from '../theme';
 
 interface ERPShelfItem {
@@ -131,10 +130,8 @@ export default function ShelfMapScreen() {
 
   const occ = occupancy.find((o) => o.shelf_id === selectedShelf);
 
-  // Distinct positions found in occupancy (to handle dynamic sizes)
-  const sidesWithData = ['A', 'B'].filter((side) =>
-    occupancy.some((o) => o.side === side)
-  );
+  // Derive sides from occupancy so non-mona instances (e.g. xflora with E-rows) render too.
+  const sidesWithData = Array.from(new Set(occupancy.map((o) => o.side))).sort();
 
   const displayItems = erpShelfItems.length > 0 ? erpShelfItems : null;
   const localDisplayItems = shelfItems;
@@ -142,7 +139,6 @@ export default function ShelfMapScreen() {
 
   return (
     <View style={styles.container}>
-      <SyncBanner />
       {loading ? (
         <View style={styles.loadingContainer}>
           <ActivityIndicator size="large" color={colors.text} />
@@ -188,23 +184,14 @@ export default function ShelfMapScreen() {
             </View>
           ) : (
             <>
-              {sidesWithData.length > 0
-                ? sidesWithData.map((side) => (
-                    <ShelfGrid
-                      key={side}
-                      occupancy={occupancy}
-                      side={side}
-                      onShelfPress={handleShelfPress}
-                    />
-                  ))
-                : ['A', 'B'].map((side) => (
-                    <ShelfGrid
-                      key={side}
-                      occupancy={occupancy}
-                      side={side}
-                      onShelfPress={handleShelfPress}
-                    />
-                  ))}
+              {sidesWithData.map((side) => (
+                <ShelfGrid
+                  key={side}
+                  occupancy={occupancy}
+                  side={side}
+                  onShelfPress={handleShelfPress}
+                />
+              ))}
             </>
           )}
 
@@ -281,7 +268,7 @@ export default function ShelfMapScreen() {
                         )}
                       </View>
                       <View style={styles.itemDetails}>
-                        {item.variety ? <Text style={styles.itemDetail}>{item.variety}</Text> : null}
+                        {item.variety ? <Text style={styles.itemDetail}>{stripStemLength(item.variety)}</Text> : null}
                         {item.stem_qty > 0 ? <Text style={styles.itemDetail}>{item.stem_qty} stems</Text> : null}
                         {item.stem_length ? <Text style={styles.itemDetail}>{item.stem_length}</Text> : null}
                       </View>
@@ -302,7 +289,7 @@ export default function ShelfMapScreen() {
                     <View style={styles.itemMain}>
                       <Text style={styles.itemBucket}>{item.bucket_id}</Text>
                       <View style={styles.itemDetails}>
-                        {item.variety ? <Text style={styles.itemDetail}>{item.variety}</Text> : null}
+                        {item.variety ? <Text style={styles.itemDetail}>{stripStemLength(item.variety)}</Text> : null}
                         {item.stem_qty > 0 ? (
                           <Text style={styles.itemDetail}>{item.stem_qty} stems</Text>
                         ) : null}

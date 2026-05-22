@@ -1,7 +1,7 @@
 import React from 'react';
 import { View, Text, StyleSheet, TouchableOpacity } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
-import { ShelvedBucketEntry } from '../types';
+import { ShelvedBucketEntry, stripStemLength } from '../types';
 import { colors, fontFamily, fontSize, spacing, borderRadius } from '../theme';
 
 interface BucketEntryProps {
@@ -49,7 +49,7 @@ export default function BucketEntry({ entry, index, onGoToReceiving }: BucketEnt
         <Text style={styles.bucketId}>{entry.bucket_id}</Text>
         <View style={styles.details}>
           {entry.variety ? (
-            <Text style={styles.detailText}>{entry.variety}</Text>
+            <Text style={styles.detailText}>{stripStemLength(entry.variety)}</Text>
           ) : null}
           {entry.stems > 0 ? (
             <Text style={styles.detailText}>{entry.stems} stems</Text>

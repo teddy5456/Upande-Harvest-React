@@ -17,7 +17,6 @@ import { submitShelve } from '../services/api';
 import { parseScannedShelfQR, parseScannedBucketQR, formatShelfLocation } from '../utils/shelf-utils';
 import ScanInput from '../components/ScanInput';
 import BucketEntry from '../components/BucketEntry';
-import SyncBanner from '../components/SyncBanner';
 import ScanConfirmation from '../components/ScanConfirmation';
 import EntriesLog from '../components/EntriesLog';
 import { ScanPhase, ShelvedBucketEntry } from '../types';
@@ -147,7 +146,6 @@ export default function ShelveScreen() {
 
   return (
     <View style={styles.container}>
-      <SyncBanner />
       <ScrollView style={styles.scroll} contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
         {phase === 'scan-shelf' ? (
           <View style={styles.inputSection}>

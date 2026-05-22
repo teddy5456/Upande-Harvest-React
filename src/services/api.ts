@@ -20,6 +20,23 @@ import {
   BouquetRecipe,
   BouquetSubmissionPayload,
   BouquetSubmissionResponse,
+  XfloraOplHeader,
+  XfloraPackPayload,
+  XfloraPackResponse,
+  ProductionPlanListEntry,
+  ProductionPlanDay,
+  ProductionPlanTask,
+  ActualHarvestRecord,
+  BedSamplingPayload,
+  BedSamplingListEntry,
+  ProductionTaskRow,
+  CropCycleSummary,
+  CropCycleUprootPayload,
+  CropCycleReplantPayload,
+  SeedlingRequestPayload,
+  SeedlingRequestListEntry,
+  SeedlingDispatchPayload,
+  PropagationBatchSummary,
 } from '../types';
 import { getApiUrl, getSid, getCsrfToken } from '../database/settings';
 import { notifyNetworkError, notifyNetworkSuccess } from '../hooks/useNetworkStatus';
@@ -369,10 +386,19 @@ export async function fetchGradingDashboard(fromDate?: string, toDate?: string):
 }
 
 export async function fetchDashboardData(fromDate?: string, toDate?: string): Promise<any> {
-  return apiPost<any>('get_dashboard_data', {
-    from_date: fromDate,
-    to_date: toDate,
-  });
+  // Use the extended endpoint that also returns per-greenhouse received/rejects/varieties
+  // and actual_harvest. Falls back to the legacy endpoint if not deployed.
+  try {
+    return await apiPost<any>('get_dashboard_data_full', {
+      from_date: fromDate,
+      to_date: toDate,
+    });
+  } catch {
+    return apiPost<any>('get_dashboard_data', {
+      from_date: fromDate,
+      to_date: toDate,
+    });
+  }
 }
 
 export async function fetchShelvesDashboard(): Promise<any> {
@@ -477,9 +503,26 @@ export async function addToPool(
   return apiPost('add_to_pool', { bucket_id: bucketId, variety, farm, grader, stems, bunch_size: bunchSize });
 }
 
+export async function submitIssue(
+  subject: string,
+  description: string
+): Promise<{ message: string; issue: string; subject: string }> {
+  return apiPost('submit_issue', { subject, description });
+}
+
+export async function fetchUnreceivedBuckets(
+  greenhouse: string, variety: string, fromDate?: string, toDate?: string
+): Promise<import('../types').UnreceivedBucketsResponse> {
+  return apiPost('get_unreceived_buckets', {
+    greenhouse, variety,
+    ...(fromDate && { from_date: fromDate }),
+    ...(toDate && { to_date: toDate }),
+  });
+}
+
 export async function getPoolStatus(
   variety: string, farm: string
-): Promise<{ pool: string | null; pooled_stems: number; bunch_size: number; ready_to_grade: boolean }> {
+): Promise<{ pool: string | null; pooled_stems: number; bunch_size: number; ready_to_grade: boolean; variety?: string }> {
   return apiPost('get_pool_status', { variety, farm });
 }
 
@@ -503,4 +546,460 @@ export async function submitBouquetGrading(
     'upande_harvest.api.submit_bouquet_grading',
     payload
   );
+}
+
+// ── Xflora-only packing endpoints ───────────────────────────────────────────
+// Note: "Order Pick LIst" (capital L is intentional — that's the doctype name
+// in upande_harvest, including in the xflora branch).
+// The original upande_harvest doctype name carries a typo ("LIst"), but some
+// deployments may have renamed it to the correctly-spelled "Order Pick List".
+// Probe both so the lookup works either way. We use `frappe.client.get`
+// (returns the whole doc) rather than `get_value` because some Frappe
+// deployments restrict get_value to fields on a curated whitelist; .get only
+// requires the standard read permission on the doctype itself.
+const OPL_DOCTYPE_CANDIDATES = ['Order Pick LIst', 'Order Pick List'];
+
+async function tryGetOplDoc(
+  doctype: string,
+  opl: string
+): Promise<Record<string, any> | null> {
+  try {
+    const res = await apiPost<{ message?: Record<string, any> }>(
+      'frappe.client.get',
+      { doctype, name: opl }
+    );
+    const m = res.message || {};
+    if (!m || !m.name) return null;
+    return m;
+  } catch {
+    // 404 (doctype/name not found) or 403 — try the next candidate
+    return null;
+  }
+}
+
+export async function getXfloraOplHeader(opl: string): Promise<XfloraOplHeader> {
+  let m: Record<string, any> | null = null;
+  for (const dt of OPL_DOCTYPE_CANDIDATES) {
+    m = await tryGetOplDoc(dt, opl);
+    if (m) break;
+  }
+  if (!m) {
+    throw new Error(`OPL ${opl} not found or no read access`);
+  }
+  return {
+    opl: m.name ?? opl,
+    sales_order: m.sales_order ?? '',
+    customer: m.customer ?? '',
+    farm: m.farm_code ?? m.farm ?? '',
+  };
+}
+
+export async function submitXfloraPackList(
+  payload: XfloraPackPayload
+): Promise<XfloraPackResponse> {
+  return apiPost<XfloraPackResponse>('createOrUpdateFarmPackList', payload);
+}
+
+// ── Agriculture — Production Planning ─────────────────────────────────────
+// Production Tracking = the existing Actual Harvest flow (same workflow).
+// Plans are weekly targets per greenhouse per day, optionally per variety.
+
+export interface ProductionPlanInput {
+  company?: string;
+  plan_period: string;
+  greenhouse: string;
+  days: ProductionPlanDay[];
+  tasks?: ProductionPlanTask[];
+}
+
+export async function createProductionPlanForm(
+  payload: ProductionPlanInput
+): Promise<{ name: string }> {
+  const res = await apiPost<{ message?: { name?: string } }>(
+    'frappe.client.insert',
+    {
+      doc: {
+        doctype: 'Production Plan Form',
+        plan_period: payload.plan_period,
+        greenhouse: payload.greenhouse,
+        ...(payload.company && { company: payload.company }),
+        days: payload.days,
+        tasks: payload.tasks ?? [],
+      },
+    }
+  );
+  return { name: res.message?.name ?? '' };
+}
+
+export async function listProductionPlanForms(
+  greenhouse?: string,
+  limit: number = 20
+): Promise<ProductionPlanListEntry[]> {
+  const filters: any[] = [];
+  if (greenhouse) filters.push(['greenhouse', '=', greenhouse]);
+  const res = await apiPost<{ message?: any[] }>('frappe.client.get_list', {
+    doctype: 'Production Plan Form',
+    fields: ['name', 'plan_period', 'greenhouse'],
+    filters,
+    order_by: 'creation desc',
+    limit_page_length: limit,
+  });
+  const rows = Array.isArray(res.message) ? res.message : [];
+  return rows.map((r: any) => ({
+    name: String(r.name ?? ''),
+    plan_period: String(r.plan_period ?? ''),
+    greenhouse: String(r.greenhouse ?? ''),
+  }));
+}
+
+export async function getProductionPlanForm(
+  name: string
+): Promise<{ name: string; plan_period: string; greenhouse: string; days: ProductionPlanDay[]; tasks: ProductionPlanTask[] }> {
+  const res = await apiPost<{ message?: Record<string, any> }>(
+    'frappe.client.get',
+    { doctype: 'Production Plan Form', name }
+  );
+  const m = res.message || {};
+  return {
+    name: String(m.name ?? name),
+    plan_period: String(m.plan_period ?? ''),
+    greenhouse: String(m.greenhouse ?? ''),
+    days: Array.isArray(m.days) ? m.days.map((d: any) => ({
+      plan_date: String(d.plan_date ?? ''),
+      target_stems: Number(d.target_stems ?? 0),
+      variety: d.variety ? String(d.variety) : undefined,
+    })) : [],
+    tasks: Array.isArray(m.tasks) ? m.tasks.map((t: any) => ({
+      task_name: String(t.task_name ?? ''),
+      greenhouse: t.greenhouse ? String(t.greenhouse) : undefined,
+      section: t.section ? String(t.section) : undefined,
+      target: t.target != null ? Number(t.target) : undefined,
+    })) : [],
+  };
+}
+
+export async function createBedSamplingForm(
+  payload: BedSamplingPayload
+): Promise<{ name: string }> {
+  const res = await apiPost<{ message?: { name?: string } }>(
+    'frappe.client.insert',
+    { doc: { doctype: 'Bed Sampling Form', ...payload } }
+  );
+  return { name: res.message?.name ?? '' };
+}
+
+export async function listBedSamplingForms(
+  greenhouse?: string,
+  limit: number = 20
+): Promise<BedSamplingListEntry[]> {
+  const filters: any[] = [];
+  if (greenhouse) filters.push(['greenhouse', '=', greenhouse]);
+  const res = await apiPost<{ message?: any[] }>('frappe.client.get_list', {
+    doctype: 'Bed Sampling Form',
+    fields: [
+      'name', 'greenhouse', 'variety', 'bed_number',
+      'sampling_date', 'total_stems_sampled', 'total_expected_harvest',
+    ],
+    filters,
+    order_by: 'sampling_date desc',
+    limit_page_length: limit,
+  });
+  const rows = Array.isArray(res.message) ? res.message : [];
+  return rows.map((r: any) => ({
+    name: String(r.name ?? ''),
+    greenhouse: String(r.greenhouse ?? ''),
+    variety: r.variety ? String(r.variety) : undefined,
+    bed_number: Number(r.bed_number ?? 0),
+    sampling_date: String(r.sampling_date ?? ''),
+    total_stems_sampled: Number(r.total_stems_sampled ?? 0),
+    total_expected_harvest: Number(r.total_expected_harvest ?? 0),
+  }));
+}
+
+export async function listProductionTasks(
+  planPeriod?: string,
+  assignee?: string,
+  greenhouse?: string
+): Promise<ProductionTaskRow[]> {
+  const planFilters: any[] = [];
+  if (planPeriod) planFilters.push(['plan_period', '=', planPeriod]);
+  if (greenhouse) planFilters.push(['greenhouse', '=', greenhouse]);
+  const planRes = await apiPost<{ message?: any[] }>('frappe.client.get_list', {
+    doctype: 'Production Plan Form',
+    fields: ['name', 'plan_period'],
+    filters: planFilters,
+    limit_page_length: 200,
+  });
+  const planRows = Array.isArray(planRes.message) ? planRes.message : [];
+  if (planRows.length === 0) return [];
+
+  // Frappe restricts direct queries on child doctypes; fetch each parent plan
+  // and pull tasks out of the embedded child array. Done in parallel.
+  const fullPlans = await Promise.all(
+    planRows.map(async (p: any) => {
+      try {
+        const docRes = await apiPost<{ message?: Record<string, any> }>(
+          'frappe.client.get',
+          { doctype: 'Production Plan Form', name: String(p.name) }
+        );
+        return {
+          name: String(p.name),
+          plan_period: String(p.plan_period ?? ''),
+          tasks: Array.isArray(docRes.message?.tasks) ? docRes.message!.tasks : [],
+        };
+      } catch {
+        return { name: String(p.name), plan_period: String(p.plan_period ?? ''), tasks: [] };
+      }
+    })
+  );
+
+  const allTasks: ProductionTaskRow[] = [];
+  const employeeNames = new Set<string>();
+  for (const plan of fullPlans) {
+    for (const t of plan.tasks as any[]) {
+      if (assignee && t.assignee !== assignee) continue;
+      if (greenhouse && t.greenhouse && t.greenhouse !== greenhouse) continue;
+      if (t.assignee) employeeNames.add(String(t.assignee));
+      allTasks.push({
+        name: String(t.name ?? ''),
+        parent: plan.name,
+        task_name: String(t.task_name ?? ''),
+        greenhouse: String(t.greenhouse ?? ''),
+        section: String(t.section ?? ''),
+        target: Number(t.target ?? 0),
+        status: (t.status === 'Done' ? 'Done' : 'Pending') as 'Pending' | 'Done',
+        assignee: String(t.assignee ?? ''),
+        plan_period: plan.plan_period,
+        completed_on: t.completed_on ? String(t.completed_on) : undefined,
+      });
+    }
+  }
+
+  if (employeeNames.size > 0) {
+    try {
+      const empRes = await apiPost<{ message?: any[] }>('frappe.client.get_list', {
+        doctype: 'Employee',
+        fields: ['name', 'employee_name'],
+        filters: [['name', 'in', Array.from(employeeNames)]],
+        limit_page_length: 500,
+      });
+      const emps = Array.isArray(empRes.message) ? empRes.message : [];
+      const employeeMap = new Map(emps.map((e: any) => [String(e.name), String(e.employee_name ?? '')]));
+      for (const t of allTasks) {
+        if (t.assignee) t.assignee_name = employeeMap.get(t.assignee);
+      }
+    } catch {}
+  }
+
+  return allTasks;
+}
+
+export async function setProductionTaskStatus(
+  taskName: string,
+  status: 'Pending' | 'Done'
+): Promise<void> {
+  await apiPost<any>('frappe.client.set_value', {
+    doctype: 'Production Plan Task',
+    name: taskName,
+    fieldname: {
+      status,
+      completed_on: status === 'Done' ? new Date().toISOString().slice(0, 19).replace('T', ' ') : null,
+    },
+  });
+}
+
+export async function getEmployeeForUser(
+  userEmail: string
+): Promise<{ name: string; employee_name: string } | null> {
+  try {
+    const res = await apiPost<{ message?: Record<string, any> }>(
+      'frappe.client.get_value',
+      {
+        doctype: 'Employee',
+        filters: { user_id: userEmail },
+        fieldname: ['name', 'employee_name'],
+      }
+    );
+    const m = res.message || {};
+    if (!m.name) return null;
+    return { name: String(m.name), employee_name: String(m.employee_name ?? '') };
+  } catch {
+    return null;
+  }
+}
+
+// ── Crop Cycle, Uproot, Replant ───────────────────────────────────────────
+
+export async function listActiveCropCycles(
+  greenhouse?: string,
+  limit: number = 100
+): Promise<CropCycleSummary[]> {
+  const filters: any[] = [['cycle_status', 'in', ['Active', 'Planned', 'Replanting', 'Partially Uprooted']]];
+  if (greenhouse) filters.push(['greenhouse', '=', greenhouse]);
+  const res = await apiPost<{ message?: any[] }>('frappe.client.get_list', {
+    doctype: 'Crop Cycle',
+    fields: [
+      'name', 'greenhouse', 'variety', 'cycle_status', 'planting_date',
+      'current_live_plants', 'custom_total_stems_harvested', 'custom_mortality_rate_pct',
+    ],
+    filters,
+    order_by: 'planting_date desc',
+    limit_page_length: limit,
+  });
+  const rows = Array.isArray(res.message) ? res.message : [];
+  return rows.map((r: any) => ({
+    name: String(r.name ?? ''),
+    greenhouse: String(r.greenhouse ?? ''),
+    variety: r.variety ? String(r.variety) : undefined,
+    cycle_status: String(r.cycle_status ?? ''),
+    planting_date: r.planting_date ? String(r.planting_date) : undefined,
+    current_live_plants: Number(r.current_live_plants ?? 0),
+    total_stems_harvested: Number(r.custom_total_stems_harvested ?? 0),
+    mortality_rate_pct: r.custom_mortality_rate_pct != null
+      ? Number(r.custom_mortality_rate_pct)
+      : undefined,
+  }));
+}
+
+export async function createCropCycleUproot(
+  payload: CropCycleUprootPayload
+): Promise<{ name: string }> {
+  const res = await apiPost<{ message?: { name?: string } }>(
+    'frappe.client.insert',
+    { doc: { doctype: 'Crop Cycle Uproot', ...payload } }
+  );
+  return { name: res.message?.name ?? '' };
+}
+
+export async function createCropCycleReplant(
+  payload: CropCycleReplantPayload
+): Promise<{ name: string }> {
+  const res = await apiPost<{ message?: { name?: string } }>(
+    'frappe.client.insert',
+    { doc: { doctype: 'Crop Cycle Replant', ...payload } }
+  );
+  return { name: res.message?.name ?? '' };
+}
+
+// ── Seedlings ─────────────────────────────────────────────────────────────
+
+export async function createSeedlingRequest(
+  payload: SeedlingRequestPayload
+): Promise<{ name: string }> {
+  const res = await apiPost<{ message?: { name?: string } }>(
+    'frappe.client.insert',
+    { doc: { doctype: 'Seedling Request', status: 'Open', ...payload } }
+  );
+  return { name: res.message?.name ?? '' };
+}
+
+export async function listSeedlingRequests(
+  limit: number = 30
+): Promise<SeedlingRequestListEntry[]> {
+  const res = await apiPost<{ message?: any[] }>('frappe.client.get_list', {
+    doctype: 'Seedling Request',
+    fields: [
+      'name', 'variety', 'qty_requested', 'required_by_date',
+      'status', 'total_dispatched',
+    ],
+    order_by: 'creation desc',
+    limit_page_length: limit,
+  });
+  const rows = Array.isArray(res.message) ? res.message : [];
+  return rows.map((r: any) => ({
+    name: String(r.name ?? ''),
+    variety: String(r.variety ?? ''),
+    qty_requested: Number(r.qty_requested ?? 0),
+    required_by_date: r.required_by_date ? String(r.required_by_date) : undefined,
+    status: String(r.status ?? 'Open'),
+    total_dispatched: Number(r.total_dispatched ?? 0),
+  }));
+}
+
+export async function listPropagationBatches(
+  limit: number = 100
+): Promise<PropagationBatchSummary[]> {
+  const res = await apiPost<{ message?: any[] }>('frappe.client.get_list', {
+    doctype: 'Propagation Batch',
+    fields: ['name', 'variety', 'available_qty'],
+    order_by: 'creation desc',
+    limit_page_length: limit,
+  });
+  const rows = Array.isArray(res.message) ? res.message : [];
+  return rows.map((r: any) => ({
+    name: String(r.name ?? ''),
+    variety: r.variety ? String(r.variety) : undefined,
+    available_qty: r.available_qty != null ? Number(r.available_qty) : undefined,
+  }));
+}
+
+export async function createSeedlingDispatch(
+  payload: SeedlingDispatchPayload
+): Promise<{ name: string }> {
+  const res = await apiPost<{ message?: { name?: string } }>(
+    'frappe.client.insert',
+    { doc: { doctype: 'Seedling Dispatch', ...payload } }
+  );
+  const name = res.message?.name ?? '';
+  if (name) {
+    try {
+      await apiPost('frappe.client.submit', {
+        doc: { doctype: 'Seedling Dispatch', name },
+      });
+    } catch {}
+  }
+  return { name };
+}
+
+export async function listActualHarvest(
+  fromDate: string,
+  toDate: string,
+  greenhouse?: string
+): Promise<ActualHarvestRecord[]> {
+  const filters: any[] = [
+    ['harvest_date', '>=', fromDate],
+    ['harvest_date', '<=', toDate],
+  ];
+  if (greenhouse) filters.push(['greenhouse', '=', greenhouse]);
+  const res = await apiPost<{ message?: any[] }>('frappe.client.get_list', {
+    doctype: 'Actual Harvest',
+    fields: ['name', 'greenhouse', 'variety', 'quantity', 'harvest_date'],
+    filters,
+    order_by: 'harvest_date asc',
+    limit_page_length: 1000,
+  });
+  const rows = Array.isArray(res.message) ? res.message : [];
+  return rows.map((r: any) => ({
+    name: String(r.name ?? ''),
+    greenhouse: String(r.greenhouse ?? ''),
+    variety: String(r.variety ?? ''),
+    quantity: Number(r.quantity ?? 0),
+    harvest_date: String(r.harvest_date ?? ''),
+  }));
+}
+
+export async function listXfloraOpls(
+  limit: number = 100
+): Promise<{ name: string; customer: string }[]> {
+  for (const dt of OPL_DOCTYPE_CANDIDATES) {
+    try {
+      const res = await apiPost<{ message?: any[] }>('frappe.client.get_list', {
+        doctype: dt,
+        fields: ['name', 'customer'],
+        filters: [['docstatus', '=', 1]],
+        order_by: 'creation desc',
+        limit_page_length: limit,
+      });
+      const rows = res.message;
+      if (Array.isArray(rows)) {
+        return rows.map((r: any) => ({
+          name: String(r.name ?? ''),
+          customer: String(r.customer ?? ''),
+        })).filter((r) => r.name);
+      }
+    } catch {
+      // try next doctype candidate
+    }
+  }
+  return [];
 }

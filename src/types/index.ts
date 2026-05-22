@@ -308,6 +308,47 @@ export interface AddBunchResponse {
   full: boolean;
 }
 
+// ── Xflora Farm Pack List ───────────────────────────────────────────────────
+// The xflora ERP exposes a single batch endpoint (`update_farm_packlist`)
+// that accepts a whole box's worth of bunches and creates/updates the
+// Farm Pack List + Box Labels in one call.
+export interface XfloraOplHeader {
+  opl: string;
+  sales_order: string;
+  customer: string;
+  farm: string;
+}
+
+export interface XfloraPackItem {
+  item_code: string;
+  bunch_uom: string;
+  bunch_id: string;
+  custom_stem_length: string;
+  box_id: string;
+  bunch_qty: number;
+}
+
+export interface XfloraPackPayload {
+  custom_sales_order: string;
+  custom_customer: string;
+  custom_farm: string;
+  custom_order_pick_list: string;
+  items: XfloraPackItem[];
+}
+
+export interface XfloraPackResponse {
+  data?: {
+    status: 'created' | 'updated';
+    message: string;
+    docname: string;
+    already_packed: { bunch_id: string; item_code: string; stem_length: string; box_id: string }[];
+    newly_packed: number;
+  };
+  // Frappe wraps the response, so the `data` key may also live at top level
+  // depending on serializer behavior — we tolerate both shapes.
+  message?: string;
+}
+
 export interface OpenBoxResponse {
   open_box: PackBoxSummary | null;
   boxes: PackBoxSummary[];
@@ -361,6 +402,9 @@ export const QUALITY_REASONS: Record<QualitySection, string[]> = {
 const STEM_LENGTH_TAIL = /[\s\-]?\d+\s?cm\s*$/i;
 const PACKABLE_STEM_LENGTH = '50cm';
 
+// Cache for packable varieties to enable proper item_code resolution
+let cachedPackableVarieties: PackableVariety[] = [];
+
 export function stripStemLength(name: string): string {
   if (!name) return '';
   return name.replace(STEM_LENGTH_TAIL, '').trim();
@@ -376,10 +420,42 @@ export function extractStemLength(name: string): string {
   return m ? m[1].replace(/\s+/g, '').toLowerCase() : '';
 }
 
+/**
+ * Set the cached packable varieties for better item_code resolution
+ * Call this when you fetch packable varieties from the API
+ */
+export function setPackableVarieties(varieties: PackableVariety[]): void {
+  cachedPackableVarieties = varieties;
+}
+
+/**
+ * Resolve a display variety name to its full item_code.
+ * First tries to find a match in the cached packable varieties,
+ * then falls back to appending " 50cm" if no match is found.
+ */
 export function resolveVarietyToItemCode(display: string): string {
   if (!display) return '';
+  
+  // Try to find matching packable variety
+  const match = cachedPackableVarieties.find(v => 
+    v.display === display || 
+    v.item_name === display ||
+    v.item_name === `${display} ${PACKABLE_STEM_LENGTH}` ||
+    v.item_name === `${display} 50cm` ||
+    v.item_code === display ||
+    v.item_code === display.toUpperCase().replace(/\s+/g, '-')
+  );
+  
+  if (match) {
+    return match.item_code;
+  }
+  
   // Already carries a stem length? keep as-is.
-  if (STEM_LENGTH_TAIL.test(display)) return display;
+  if (STEM_LENGTH_TAIL.test(display)) {
+    return display;
+  }
+  
+  // Fallback: append the default stem length
   return `${display} ${PACKABLE_STEM_LENGTH}`;
 }
 
@@ -434,9 +510,31 @@ export interface ActualHarvestEntry {
 // Dashboard report types
 export interface GreenhouseHarvestRow {
   greenhouse: string;
-  stems: number;
+  stems: number;             // harvested
+  received: number;          // received (transferred to coldstore)
   varieties: string;
+  varietyBreakdown: VarietyBreakdownRow[];
   rejects: number;
+}
+
+export interface VarietyBreakdownRow {
+  variety: string;
+  stems: number;             // harvested
+  received: number;
+  variance: number;          // stems - received (positive = unreceived)
+}
+
+export interface UnreceivedBucketsResponse {
+  greenhouse: string;
+  variety: string;
+  missing_count: number;
+  missing_stems: number;
+  missing_buckets: {
+    bucket_id: string;
+    qty: number;
+    posting_date: string;
+    harvester: string | null;
+  }[];
 }
 
 export interface GradingDashboardData {
@@ -449,12 +547,16 @@ export interface GradingDashboardData {
 export interface BucketBalance {
   bucket_id: string;
   variety: string;
+  item_code?: string;
   stem_length: string;
   bucket_total: number;
   already_graded: number;
   already_rejected: number;
   remaining_stems: number;
   bucket_full: boolean;
+  on_shelf?: boolean;
+  shelf_stem_qty?: number;
+  pre_receive?: boolean;
 }
 
 export interface RejectResponse {
@@ -473,6 +575,9 @@ export interface RejectResponse {
 
 // Quarantine batch types
 export type QuarantineScope = 'buckets' | 'greenhouse';
+
+// (BucketBalance has item_code returned by the backend; keep the existing
+// interface in sync below if any other consumer needs it.)
 
 export interface QuarantineBatchListEntry {
   id: number;
@@ -520,4 +625,140 @@ export interface BouquetSubmissionResponse {
   bunch_id: string;
   bunches_count: number;
   created: string[];
+}
+
+// Agriculture — Production Planning
+export interface ProductionPlanDay {
+  plan_date: string;
+  target_stems: number;
+  variety?: string;
+}
+
+export interface ProductionPlanTask {
+  task_name: string;
+  greenhouse?: string;
+  section?: string;
+  target?: number;
+  status?: 'Pending' | 'Done';
+  assignee?: string;
+  completed_on?: string;
+}
+
+export interface CropCycleSummary {
+  name: string;
+  greenhouse: string;
+  variety?: string;
+  cycle_status: string;
+  planting_date?: string;
+  current_live_plants: number;
+  total_stems_harvested: number;
+  mortality_rate_pct?: number;
+}
+
+export interface CropCycleUprootPayload {
+  crop_cycle: string;
+  bed_number: number;
+  qty: number;
+  uproot_date: string;
+  reason?: string;
+  notes?: string;
+}
+
+export interface CropCycleReplantPayload {
+  crop_cycle: string;
+  bed_number: number;
+  variety?: string;
+  qty: number;
+  replanting_date: string;
+  source?: string;
+  cost_per_plant?: number;
+  notes?: string;
+}
+
+export interface SeedlingRequestPayload {
+  variety: string;
+  qty_requested: number;
+  required_by_date?: string;
+  company?: string;
+  notes?: string;
+}
+
+export interface SeedlingRequestListEntry {
+  name: string;
+  variety: string;
+  qty_requested: number;
+  required_by_date?: string;
+  status: string;
+  total_dispatched: number;
+}
+
+export interface SeedlingDispatchPayload {
+  batch: string;
+  seedling_request?: string;
+  destination_crop_cycle?: string;
+  dispatch_date: string;
+  qty_dispatched: number;
+  company?: string;
+  notes?: string;
+}
+
+export interface PropagationBatchSummary {
+  name: string;
+  variety?: string;
+  available_qty?: number;
+}
+
+export interface ProductionTaskRow {
+  name: string;
+  parent: string;
+  task_name: string;
+  greenhouse: string;
+  section: string;
+  target: number;
+  status: 'Pending' | 'Done';
+  assignee: string;
+  assignee_name?: string;
+  plan_period: string;
+  completed_on?: string;
+}
+
+export interface ProductionPlanListEntry {
+  name: string;
+  plan_period: string;
+  greenhouse: string;
+}
+
+export interface ActualHarvestRecord {
+  name: string;
+  greenhouse: string;
+  variety: string;
+  quantity: number;
+  harvest_date: string;
+}
+
+export interface SamplingStageRow {
+  growth_stage: string;
+  count: number;
+  days_to_harvest?: number;
+}
+
+export interface BedSamplingPayload {
+  greenhouse: string;
+  variety?: string;
+  crop_cycle?: string;
+  bed_number?: number;
+  sampling_date: string;
+  company?: string;
+  notes?: string;
+  stages: SamplingStageRow[];
+}
+
+export interface BedSamplingListEntry {
+  name: string;
+  greenhouse: string;
+  variety?: string;
+  bed_number: number;
+  sampling_date: string;
+  total_stems_sampled: number;
+  total_expected_harvest: number;
 }

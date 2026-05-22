@@ -7,21 +7,21 @@ import {
   TextInput,
   TouchableOpacity,
   Alert,
-  ActivityIndicator,
   KeyboardAvoidingView,
   Keyboard,
   Platform,
   Modal,
   FlatList,
+  Animated,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { useApp } from '../context/AppContext';
 import { addToSyncQueue } from '../database/sync-queue';
-import { getFarm, getSetting, setSetting } from '../database/settings';
+import { getFarm, getSetting, setSetting, getCachedGreenhouses, setCachedGreenhouses } from '../database/settings';
 import { addHarvestEntry } from '../database/harvest';
 import { submitHarvest, fetchGreenhouses } from '../services/api';
-import ScanInput from '../components/ScanInput';
-import SyncBanner from '../components/SyncBanner';
+import ScanInput, { ScanInputHandle } from '../components/ScanInput';
+import { HarvestFormSkeleton } from '../components/Skeleton';
 import ScanConfirmation from '../components/ScanConfirmation';
 import EntriesLog from '../components/EntriesLog';
 import { HarvestListEntry, Greenhouse, GreenhouseSection, GreenhouseVariety } from '../types';
@@ -31,22 +31,31 @@ import { colors, fontFamily, fontSize, spacing, borderRadius } from '../theme';
 
 interface BorrowedHarvester {
   employee_name: string;
+  employee?: string; // payroll number
   greenhouse_name: string;
 }
 
 export default function HarvestScreen() {
   const { isConnected, refreshStats } = useApp();
 
-  // Data from API
+  // Data from API / cache
   const [greenhouses, setGreenhouses] = useState<Greenhouse[]>([]);
   const [dataLoading, setDataLoading] = useState(true);
+  // Shows a subtle "using cached data" badge when offline with stale data
+  const [isStaleCache, setIsStaleCache] = useState(false);
+  const [cacheAge, setCacheAge] = useState('');
 
   // Selections
   const [selectedGreenhouse, setSelectedGreenhouse] = useState<Greenhouse | null>(null);
   const [selectedSection, setSelectedSection] = useState<GreenhouseSection | null>(null);
   const [selectedVariety, setSelectedVariety] = useState<GreenhouseVariety | null>(null);
-  const [selectedHarvester, setSelectedHarvester] = useState('');
+  const [selectedHarvester, setSelectedHarvester] = useState(''); // payroll number sent to API
+  const [selectedHarvesterName, setSelectedHarvesterName] = useState(''); // display name
   const [quantity, setQuantity] = useState('');
+
+  // Inline validation — tracks which fields are empty when a scan is attempted,
+  // so we can highlight them with a red border instead of an Alert popup.
+  const [missingFields, setMissingFields] = useState<Set<string>>(new Set());
 
   // Team overrides: section_name -> borrowed employees
   const [teamOverrides, setTeamOverrides] = useState<Record<string, BorrowedHarvester[]>>({});
@@ -60,18 +69,22 @@ export default function HarvestScreen() {
   const [varietySearch, setVarietySearch] = useState('');
   const [harvesterDropdownOpen, setHarvesterDropdownOpen] = useState(false);
 
-  // Sort order per dropdown (true = A→Z, false = Z→A)
-  const [ghSortAZ, setGhSortAZ] = useState(true);
-  const [sectionSortAZ, setSectionSortAZ] = useState(true);
-  const [varietySortAZ, setVarietySortAZ] = useState(true);
-
   // Blur timers (so list item taps register before dropdown closes)
   const ghBlurTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const sectionBlurTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const varietyBlurTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Quantity input ref for auto-focus after variety selection
+  // Quantity input → focus chain to scan input (skip tapping the scan field)
   const quantityRef = useRef<TextInput>(null);
+  const scanInputRef = useRef<ScanInputHandle>(null);
+
+  // Fade-in when the form becomes ready (skeleton → real content transition)
+  const contentFade = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    if (!dataLoading) {
+      Animated.timing(contentFade, { toValue: 1, duration: 280, useNativeDriver: true }).start();
+    }
+  }, [dataLoading, contentFade]);
 
   // Team modal
   const [teamModalOpen, setTeamModalOpen] = useState(false);
@@ -91,9 +104,9 @@ export default function HarvestScreen() {
   };
 
   // Computed: harvesters for selected section
-  const sectionHarvesters: { employee_name: string; greenhouse_name: string }[] = selectedSection
+  const sectionHarvesters: { employee_name: string; employee?: string; greenhouse_name: string }[] = selectedSection
     ? [
-        { employee_name: selectedSection.employee_name, greenhouse_name: selectedGreenhouse?.warehouse_name ?? '' },
+        { employee_name: selectedSection.employee_name, employee: selectedSection.employee, greenhouse_name: selectedGreenhouse?.warehouse_name ?? '' },
         ...(teamOverrides[selectedSection.section_name] ?? []),
       ]
     : [];
@@ -102,15 +115,28 @@ export default function HarvestScreen() {
   useEffect(() => {
     if (!selectedSection) {
       setSelectedHarvester('');
+      setSelectedHarvesterName('');
       return;
     }
     const borrowed = teamOverrides[selectedSection.section_name] ?? [];
     if (borrowed.length === 0) {
-      setSelectedHarvester(selectedSection.employee_name);
+      setSelectedHarvester(selectedSection.employee ?? selectedSection.employee_name);
+      setSelectedHarvesterName(selectedSection.employee_name);
     } else {
       setSelectedHarvester(prev => {
-        const allNames = [selectedSection.employee_name, ...borrowed.map(b => b.employee_name)];
-        return allNames.includes(prev) ? prev : '';
+        const allPayrolls = [
+          selectedSection.employee ?? selectedSection.employee_name,
+          ...borrowed.map(b => b.employee ?? b.employee_name),
+        ];
+        return allPayrolls.includes(prev) ? prev : '';
+      });
+      setSelectedHarvesterName(prev => {
+        const all = [
+          { payroll: selectedSection.employee ?? selectedSection.employee_name, name: selectedSection.employee_name },
+          ...borrowed.map(b => ({ payroll: b.employee ?? b.employee_name, name: b.employee_name })),
+        ];
+        const current = all.find(h => h.name === prev || h.payroll === prev);
+        return current ? current.name : '';
       });
     }
   }, [selectedSection, teamOverrides]);
@@ -120,16 +146,15 @@ export default function HarvestScreen() {
   }, []);
 
   const loadData = async () => {
-    setDataLoading(true);
-    try {
-      const [res, lastGhName, lastVariety] = await Promise.all([
-        fetchGreenhouses(),
-        getSetting('last_greenhouse'),
-        getSetting('last_variety'),
-      ]);
-      const ghs = res.greenhouses ?? [];
-      setGreenhouses(ghs);
+    const [cached, lastGhName, lastVariety] = await Promise.all([
+      getCachedGreenhouses(),
+      getSetting('last_greenhouse'),
+      getSetting('last_variety'),
+    ]);
 
+    // Helper — apply a greenhouse list and restore the user's previous selections
+    const applyGreenhouses = (ghs: Greenhouse[]) => {
+      setGreenhouses(ghs);
       if (lastGhName) {
         const gh = ghs.find((g) => g.name === lastGhName);
         if (gh) {
@@ -140,8 +165,39 @@ export default function HarvestScreen() {
           }
         }
       }
+    };
+
+    if (cached) {
+      // Render immediately from cache — no spinner shown to the user
+      applyGreenhouses(cached.data as Greenhouse[]);
+      setDataLoading(false);
+
+      // Show a "stale" badge if the cache is older than 5 minutes
+      const ageMins = Math.floor((Date.now() - new Date(cached.cachedAt).getTime()) / 60_000);
+      if (ageMins > 5) {
+        setIsStaleCache(true);
+        setCacheAge(ageMins > 60 ? `${Math.floor(ageMins / 60)}h ago` : `${ageMins}m ago`);
+      }
+    }
+
+    // Always fetch fresh data in the background.
+    // If no cache existed the spinner is still showing during this fetch.
+    try {
+      const res = await fetchGreenhouses();
+      const ghs = res.greenhouses ?? [];
+      await setCachedGreenhouses(ghs);
+      // If we already rendered from cache, just silently update the list
+      // (don't disrupt the user's current dropdown selection).
+      if (cached) {
+        setGreenhouses(ghs);
+      } else {
+        applyGreenhouses(ghs);
+      }
+      setIsStaleCache(false);
+      setCacheAge('');
     } catch {
-      // silently continue — user can retry
+      // Network unavailable — cached data is fine; first-launch without cache
+      // means the dropdowns stay empty until the user is online.
     } finally {
       setDataLoading(false);
     }
@@ -152,6 +208,7 @@ export default function HarvestScreen() {
     setSelectedSection(null);
     setSelectedVariety(null);
     setSelectedHarvester('');
+    setSelectedHarvesterName('');
     setTeamOverrides({});
     setGhDropdownOpen(false);
     setGhSearch('');
@@ -163,9 +220,9 @@ export default function HarvestScreen() {
     setSelectedSection(sec);
     setSectionDropdownOpen(false);
     setSectionSearch('');
-    // Auto-open variety dropdown after section is chosen
-    setTimeout(() => setVarietyDropdownOpen(true), 150);
-  }, []);
+    // Auto-open variety dropdown only if variety not yet selected
+    if (!selectedVariety) setTimeout(() => setVarietyDropdownOpen(true), 150);
+  }, [selectedVariety]);
 
   const handleSelectVariety = useCallback((v: GreenhouseVariety) => {
     setSelectedVariety(v);
@@ -204,33 +261,22 @@ export default function HarvestScreen() {
       const bucketId = parseScannedBucketQR(data);
       if (!bucketId) return;
 
-      if (!selectedGreenhouse) {
-        onScanError();
-        Alert.alert('Missing', 'Select a greenhouse first.');
-        return;
-      }
-      if (!selectedSection) {
-        onScanError();
-        Alert.alert('Missing', 'Select a section first.');
-        return;
-      }
-      if (!selectedHarvester) {
-        onScanError();
-        Alert.alert('Missing', 'Select a harvester.');
-        return;
-      }
-      if (!selectedVariety) {
-        onScanError();
-        Alert.alert('Missing', 'Select an item first.');
-        return;
-      }
-
+      // Collect all missing fields in one pass and highlight them inline
+      // rather than firing a series of Alert popups.
       const qty = parseFloat(quantity);
-      if (!quantity.trim() || isNaN(qty) || qty <= 0) {
+      const missing = new Set<string>();
+      if (!selectedGreenhouse) missing.add('greenhouse');
+      if (!selectedSection)    missing.add('section');
+      if (!selectedHarvester)  missing.add('harvester');
+      if (!selectedVariety)    missing.add('variety');
+      if (!quantity.trim() || isNaN(qty) || qty <= 0) missing.add('quantity');
+
+      if (missing.size > 0) {
         onScanError();
-        Alert.alert('Invalid', 'Enter a valid quantity.');
+        setMissingFields(missing);
         return;
       }
+      setMissingFields(new Set());
 
       const now = new Date().toLocaleTimeString();
       const farm = await getFarm();
@@ -258,6 +304,7 @@ export default function HarvestScreen() {
           onScanSuccess();
           setSelectedSection(null);
           setSelectedHarvester('');
+          setSelectedHarvesterName('');
           showConfirmation('success', bucketId);
         } catch (error: any) {
           await addToSyncQueue('createHarvestEntry', {
@@ -268,15 +315,34 @@ export default function HarvestScreen() {
             await addHarvestEntry(itemCode, qty, section, harvester, bucketId, farm, gh, '', false);
           } catch {}
 
+          // If the API call failed due to a network error (as opposed to a
+          // server-side validation error), treat it the same as offline:
+          // show a calm "saved for sync" message rather than a red error.
+          const isNetworkError =
+            !error.message ||
+            error.message.toLowerCase().includes('network') ||
+            error.message.toLowerCase().includes('fetch') ||
+            error.message.toLowerCase().includes('connect');
+
           setEntries((prev) => [{
             bucket_id: bucketId, item_code: itemCode, quantity: qty,
-            time: now, status: 'error', message: error.message,
+            time: now,
+            status: isNetworkError ? 'queued' : 'error',
+            message: isNetworkError ? 'Saved for sync' : error.message,
           }, ...prev]);
           await refreshStats();
-          onScanError();
+          if (isNetworkError) {
+            onScanSuccess(); // treat as success from the user's perspective
+          } else {
+            onScanError();
+          }
           setSelectedSection(null);
           setSelectedHarvester('');
-          showConfirmation('error', error.message);
+          setSelectedHarvesterName('');
+          showConfirmation(
+            isNetworkError ? 'queued' : 'error',
+            isNetworkError ? 'Saved for sync' : error.message
+          );
         }
       } else {
         await addToSyncQueue('createHarvestEntry', {
@@ -289,23 +355,23 @@ export default function HarvestScreen() {
 
         setEntries((prev) => [{
           bucket_id: bucketId, item_code: itemCode, quantity: qty,
-          time: now, status: 'queued', message: 'Saved offline',
+          time: now, status: 'queued', message: 'Saved for sync',
         }, ...prev]);
         await refreshStats();
         onScanSuccess();
         setSelectedSection(null);
         setSelectedHarvester('');
-        showConfirmation('success', 'Saved offline');
+        setSelectedHarvesterName('');
+        showConfirmation('queued', 'Saved for sync');
       }
     },
     [isConnected, refreshStats, selectedGreenhouse, selectedSection, selectedHarvester, selectedVariety, quantity]
   );
 
-  // Sorted + filtered lists (all items always included, sorted A→Z by default)
+  // Lists are always sorted A→Z — the sort toggle has been removed to keep
+  // the UI simple. Alphabetical is the sensible default for greenhouse names.
   const sortedGreenhouses = [...greenhouses].sort((a, b) =>
-    ghSortAZ
-      ? a.warehouse_name.localeCompare(b.warehouse_name)
-      : b.warehouse_name.localeCompare(a.warehouse_name)
+    a.warehouse_name.localeCompare(b.warehouse_name)
   );
   const filteredGreenhouses = ghSearch
     ? sortedGreenhouses.filter((g) =>
@@ -315,27 +381,21 @@ export default function HarvestScreen() {
     : sortedGreenhouses;
 
   const sections = selectedGreenhouse?.custom_sections ?? [];
-  const sortedSections = [...sections].sort((a, b) =>
-    sectionSortAZ
-      ? a.section_name.localeCompare(b.section_name)
-      : b.section_name.localeCompare(a.section_name)
-  );
   const filteredSections = sectionSearch
-    ? sortedSections.filter((s) =>
-        s.section_name.toLowerCase().includes(sectionSearch.toLowerCase()) ||
-        s.employee_name.toLowerCase().includes(sectionSearch.toLowerCase())
-      )
-    : sortedSections;
+    ? [...sections]
+        .sort((a, b) => a.section_name.localeCompare(b.section_name))
+        .filter((s) =>
+          s.section_name.toLowerCase().includes(sectionSearch.toLowerCase()) ||
+          s.employee_name.toLowerCase().includes(sectionSearch.toLowerCase())
+        )
+    : [...sections].sort((a, b) => a.section_name.localeCompare(b.section_name));
 
   const varieties = selectedGreenhouse?.custom_varieties_grown ?? [];
-  const sortedVarieties = [...varieties].sort((a, b) =>
-    varietySortAZ
-      ? a.variety.localeCompare(b.variety)
-      : b.variety.localeCompare(a.variety)
-  );
   const filteredVarieties = varietySearch
-    ? sortedVarieties.filter((v) => v.variety.toLowerCase().includes(varietySearch.toLowerCase()))
-    : sortedVarieties;
+    ? [...varieties]
+        .sort((a, b) => a.variety.localeCompare(b.variety))
+        .filter((v) => v.variety.toLowerCase().includes(varietySearch.toLowerCase()))
+    : [...varieties].sort((a, b) => a.variety.localeCompare(b.variety));
 
   // Employees from OTHER greenhouses (for borrowing)
   const otherEmployees = greenhouses
@@ -343,6 +403,7 @@ export default function HarvestScreen() {
     .flatMap((gh) =>
       (gh.custom_sections ?? []).map((sec) => ({
         employee_name: sec.employee_name,
+        employee: sec.employee,
         greenhouse_name: gh.warehouse_name,
       }))
     );
@@ -355,34 +416,50 @@ export default function HarvestScreen() {
 
   const totalBorrowed = Object.values(teamOverrides).flat().length;
 
+  // First launch with no cache — show skeleton while greenhouses load.
+  // Once cache exists this block never shows; data renders immediately.
   if (dataLoading) {
     return (
       <View style={styles.container}>
-        <SyncBanner />
-        <View style={styles.loadingWrap}>
-          <ActivityIndicator size="large" color={colors.text} />
-          <Text style={styles.loadingText}>Loading greenhouses...</Text>
-        </View>
+        <HarvestFormSkeleton />
       </View>
     );
   }
 
   return (
     <View style={styles.container}>
-      <SyncBanner />
+      <Animated.View style={{ flex: 1, opacity: contentFade }}>
       <KeyboardAvoidingView
         style={{ flex: 1 }}
-        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+        behavior="padding"
+        keyboardVerticalOffset={Platform.OS === 'android' ? 80 : 0}
       >
         <ScrollView
           style={styles.scroll}
           contentContainerStyle={styles.content}
           keyboardShouldPersistTaps="handled"
         >
+          {/* Offline stale-cache notice — shown when not connected and data
+              is coming from a previous session's cache */}
+          {!isConnected && isStaleCache && (
+            <View style={styles.staleBadge}>
+              <Ionicons name="cloud-offline-outline" size={12} color={colors.warning} />
+              <Text style={styles.staleBadgeText}>
+                Offline · using data from {cacheAge}
+              </Text>
+            </View>
+          )}
+
           {/* ── Greenhouse ── */}
-          <Text style={styles.label}>Greenhouse</Text>
+          <Text style={[styles.label, missingFields.has('greenhouse') && styles.labelError]}>
+            Greenhouse{missingFields.has('greenhouse') ? '  ← required' : ''}
+          </Text>
           <View style={styles.dropdownWrapper}>
-            <View style={[styles.dropdownField, ghDropdownOpen && styles.dropdownFieldActive]}>
+            <View style={[
+              styles.dropdownField,
+              ghDropdownOpen && styles.dropdownFieldActive,
+              missingFields.has('greenhouse') && styles.dropdownFieldError,
+            ]}>
               <Ionicons name="search" size={15} color={colors.textMuted} />
               <TextInput
                 style={styles.dropdownTextInput}
@@ -408,6 +485,7 @@ export default function HarvestScreen() {
                     setSelectedSection(null);
                     setSelectedVariety(null);
                     setSelectedHarvester('');
+                    setSelectedHarvesterName('');
                     setTeamOverrides({});
                     setGhSearch('');
                   }}
@@ -436,14 +514,6 @@ export default function HarvestScreen() {
 
             {ghDropdownOpen && (
               <View style={styles.dropdownList}>
-                <TouchableOpacity
-                  style={styles.sortRow}
-                  onPress={() => setGhSortAZ(!ghSortAZ)}
-                  activeOpacity={0.7}
-                >
-                  <Ionicons name="swap-vertical" size={12} color={colors.textMuted} />
-                  <Text style={styles.sortRowText}>{ghSortAZ ? 'A → Z' : 'Z → A'}</Text>
-                </TouchableOpacity>
                 <ScrollView style={styles.dropdownScroll} nestedScrollEnabled keyboardShouldPersistTaps="handled">
                   {filteredGreenhouses.map((item) => {
                     const isSelected = selectedGreenhouse?.name === item.name;
@@ -492,12 +562,15 @@ export default function HarvestScreen() {
           )}
 
           {/* ── Section ── */}
-          <Text style={styles.label}>Section</Text>
+          <Text style={[styles.label, missingFields.has('section') && styles.labelError]}>
+            Section{missingFields.has('section') ? '  ← required' : ''}
+          </Text>
           <View style={styles.dropdownWrapper}>
             <View style={[
               styles.dropdownField,
               sectionDropdownOpen && styles.dropdownFieldActive,
               !selectedGreenhouse && styles.dropdownFieldDisabled,
+              missingFields.has('section') && styles.dropdownFieldError,
             ]}>
               <Ionicons name="search" size={15} color={colors.textMuted} />
               <TextInput
@@ -527,6 +600,7 @@ export default function HarvestScreen() {
                   onPress={() => {
                     setSelectedSection(null);
                     setSelectedHarvester('');
+                    setSelectedHarvesterName('');
                     setSectionSearch('');
                   }}
                   hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
@@ -558,14 +632,6 @@ export default function HarvestScreen() {
 
             {sectionDropdownOpen && (
               <View style={styles.dropdownList}>
-                <TouchableOpacity
-                  style={styles.sortRow}
-                  onPress={() => setSectionSortAZ(!sectionSortAZ)}
-                  activeOpacity={0.7}
-                >
-                  <Ionicons name="swap-vertical" size={12} color={colors.textMuted} />
-                  <Text style={styles.sortRowText}>{sectionSortAZ ? 'A → Z' : 'Z → A'}</Text>
-                </TouchableOpacity>
                 <ScrollView style={styles.dropdownScroll} nestedScrollEnabled keyboardShouldPersistTaps="handled">
                   {filteredSections.map((item) => {
                     const isSelected = selectedSection?.section_name === item.section_name;
@@ -611,7 +677,7 @@ export default function HarvestScreen() {
                       style={[{ flex: 1 }, selectedHarvester ? styles.dropdownValue : styles.dropdownPlaceholder]}
                       numberOfLines={1}
                     >
-                      {selectedHarvester || 'Select harvester...'}
+                      {selectedHarvesterName || 'Select harvester...'}
                     </Text>
                     <Ionicons name={harvesterDropdownOpen ? 'chevron-up' : 'chevron-down'} size={16} color={colors.textMuted} />
                   </TouchableOpacity>
@@ -619,13 +685,14 @@ export default function HarvestScreen() {
                   {harvesterDropdownOpen && (
                     <View style={styles.dropdownList}>
                       {sectionHarvesters.map((item, index) => {
-                        const isSelected = selectedHarvester === item.employee_name;
+                        const isSelected = selectedHarvester === (item.employee ?? item.employee_name);
                         return (
                           <TouchableOpacity
                             key={`${item.employee_name}-${index}`}
                             style={[styles.listRow, isSelected && styles.listRowSelected]}
                             onPress={() => {
-                              setSelectedHarvester(item.employee_name);
+                              setSelectedHarvester(item.employee ?? item.employee_name);
+                              setSelectedHarvesterName(item.employee_name);
                               setHarvesterDropdownOpen(false);
                             }}
                             activeOpacity={0.7}
@@ -648,19 +715,22 @@ export default function HarvestScreen() {
               <View style={styles.harvesterRow}>
                 <Ionicons name="person" size={14} color={colors.textSecondary} />
                 <Text style={styles.harvesterName}>
-                  Harvester: {selectedHarvester}
+                  Harvester: {selectedHarvesterName}
                 </Text>
               </View>
             )
           )}
 
           {/* ── Item / Variety ── */}
-          <Text style={styles.label}>Item</Text>
+          <Text style={[styles.label, missingFields.has('variety') && styles.labelError]}>
+            Item{missingFields.has('variety') ? '  ← required' : ''}
+          </Text>
           <View style={styles.dropdownWrapper}>
             <View style={[
               styles.dropdownField,
               varietyDropdownOpen && styles.dropdownFieldActive,
               !selectedGreenhouse && styles.dropdownFieldDisabled,
+              missingFields.has('variety') && styles.dropdownFieldError,
             ]}>
               <Ionicons name="search" size={15} color={colors.textMuted} />
               <TextInput
@@ -720,14 +790,6 @@ export default function HarvestScreen() {
 
             {varietyDropdownOpen && (
               <View style={styles.dropdownList}>
-                <TouchableOpacity
-                  style={styles.sortRow}
-                  onPress={() => setVarietySortAZ(!varietySortAZ)}
-                  activeOpacity={0.7}
-                >
-                  <Ionicons name="swap-vertical" size={12} color={colors.textMuted} />
-                  <Text style={styles.sortRowText}>{varietySortAZ ? 'A → Z' : 'Z → A'}</Text>
-                </TouchableOpacity>
                 <ScrollView style={styles.dropdownScroll} nestedScrollEnabled keyboardShouldPersistTaps="handled">
                   {filteredVarieties.map((item) => {
                     const isSelected = selectedVariety?.variety === item.variety;
@@ -754,23 +816,32 @@ export default function HarvestScreen() {
           </View>
 
           {/* Quantity */}
-          <Text style={styles.label}>Quantity</Text>
+          <Text style={[styles.label, missingFields.has('quantity') && styles.labelError]}>
+            Quantity{missingFields.has('quantity') ? '  ← required' : ''}
+          </Text>
           <TextInput
             ref={quantityRef}
-            style={styles.textInput}
+            style={[styles.textInput, missingFields.has('quantity') && styles.textInputError]}
             value={quantity}
-            onChangeText={setQuantity}
-            onSubmitEditing={() => Keyboard.dismiss()}
+            onChangeText={(v) => {
+              setQuantity(v);
+              if (missingFields.has('quantity')) {
+                setMissingFields((prev) => { const n = new Set(prev); n.delete('quantity'); return n; });
+              }
+            }}
+            // "next" moves focus directly into the scan field — one less tap per entry
+            onSubmitEditing={() => scanInputRef.current?.focus()}
             placeholder="Enter quantity"
             placeholderTextColor={colors.textMuted}
             keyboardType="numeric"
-            returnKeyType="done"
-            blurOnSubmit
+            returnKeyType="next"
+            blurOnSubmit={false}
           />
 
           {/* Bucket scan */}
           <Text style={styles.label}>Scan Bucket</Text>
           <ScanInput
+            ref={scanInputRef}
             placeholder="Bucket ID"
             scannerTitle="Scan Bucket QR Code"
             onScan={handleBucketScanned}
@@ -797,6 +868,7 @@ export default function HarvestScreen() {
           />
         </ScrollView>
       </KeyboardAvoidingView>
+      </Animated.View>
 
       {/* ── Manage Team modal ── */}
       <Modal
@@ -950,10 +1022,15 @@ const styles = StyleSheet.create({
     color: colors.text,
     marginBottom: spacing.sm,
   },
+  labelError: {
+    color: colors.error,
+  },
   textInput: {
     backgroundColor: colors.surface,
-    borderWidth: 1,
-    borderColor: colors.border,
+    // Slightly darker border than the default #E5E5E5 so fields
+    // are clearly identifiable as input areas at a glance.
+    borderWidth: 1.5,
+    borderColor: '#C4C4C4',
     borderRadius: borderRadius.md,
     paddingHorizontal: spacing.md,
     height: 48,
@@ -961,6 +1038,29 @@ const styles = StyleSheet.create({
     fontSize: fontSize.sm,
     color: colors.text,
     marginBottom: spacing.lg,
+  },
+  textInputError: {
+    borderColor: colors.error,
+    borderWidth: 2,
+  },
+
+  // Stale-cache notice shown at the top of the form when offline
+  staleBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.xs,
+    backgroundColor: '#FFFBEB',
+    borderRadius: borderRadius.sm,
+    paddingVertical: 6,
+    paddingHorizontal: spacing.md,
+    marginBottom: spacing.lg,
+    borderWidth: 1,
+    borderColor: '#FDE68A',
+  },
+  staleBadgeText: {
+    fontFamily: fontFamily.regular,
+    fontSize: fontSize.xs,
+    color: colors.warning,
   },
 
   // Inline dropdown
@@ -972,8 +1072,8 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: spacing.sm,
     backgroundColor: colors.surface,
-    borderWidth: 1,
-    borderColor: colors.border,
+    borderWidth: 1.5,
+    borderColor: '#C4C4C4',
     borderRadius: borderRadius.md,
     paddingHorizontal: spacing.md,
     height: 48,
@@ -986,6 +1086,10 @@ const styles = StyleSheet.create({
   dropdownFieldDisabled: {
     backgroundColor: colors.surfaceAlt,
     opacity: 0.6,
+  },
+  dropdownFieldError: {
+    borderColor: colors.error,
+    borderWidth: 2,
   },
   dropdownTextInput: {
     flex: 1,
@@ -1016,22 +1120,6 @@ const styles = StyleSheet.create({
   dropdownScroll: {
     maxHeight: 220,
   },
-  sortRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: spacing.xs,
-    paddingHorizontal: spacing.md,
-    paddingVertical: 6,
-    borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: colors.border,
-    backgroundColor: colors.surfaceAlt,
-  },
-  sortRowText: {
-    fontFamily: fontFamily.regular,
-    fontSize: fontSize.xs,
-    color: colors.textMuted,
-  },
-
   // Manage Team link
   manageTeamRow: {
     flexDirection: 'row',

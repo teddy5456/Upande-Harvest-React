@@ -14,7 +14,7 @@ import { useApp } from '../context/AppContext';
 import { addToSyncQueue } from '../database/sync-queue';
 import { getFarm } from '../database/settings';
 import { addGradingEntry } from '../database/grading';
-import { submitGrading, getBucketBalance, submitBucketReject, addToPool, gradeFromPool, getBunchInfo, getBouquetRecipeForBunch, submitBouquetGrading } from '../services/api';
+import { submitGrading, getBucketBalance, submitBucketReject, addToPool, gradeFromPool, getPoolStatus, getBunchInfo, getBouquetRecipeForBunch, submitBouquetGrading } from '../services/api';
 import {
   detectGradingQRType,
   extractGradingQRValue,
@@ -23,7 +23,6 @@ import BouquetRecipeCard, { BouquetVarietyState } from '../components/BouquetRec
 import { BouquetRecipe } from '../types';
 import ScanInput from '../components/ScanInput';
 import GradingEntryComponent from '../components/GradingEntry';
-import SyncBanner from '../components/SyncBanner';
 import ScanConfirmation from '../components/ScanConfirmation';
 import EntriesLog from '../components/EntriesLog';
 import { GradedEntry, BucketBalance, stripStemLength } from '../types';
@@ -188,6 +187,38 @@ export default function GradeScreen() {
     onScanSuccess();
     showConfirmation('success', `${SLOT_META[target].label}: ${value}`);
 
+    // When the BUCKET slot is filled and the bunch is already scanned,
+    // check up-front whether the bucket has enough stems for a full bunch.
+    // If not, prompt to pool the remainder instead of attempting a grading
+    // that we know will fail (or be incomplete).
+    if (target === 'bucket' && newSlots.bunch && newSlots.bucket) {
+      try {
+        const [info, bal] = await Promise.all([
+          getBunchInfo(newSlots.bunch),
+          getBucketBalance(newSlots.bucket),
+        ]);
+        const sizeMatch = (info.bunch_size || '').match(/\d+/);
+        const bunchSize = sizeMatch ? parseInt(sizeMatch[0], 10) : 10;
+        if (bal.remaining_stems > 0 && bal.remaining_stems < bunchSize) {
+          // Send the full variant item_code (e.g. "Athena-50cm") — the
+          // template "Athena" can't hold stock because it has variants.
+          setRemainderModal({
+            visible: true,
+            bucketId: newSlots.bucket,
+            variety: info.item_code || bal.item_code || bal.variety || '',
+            stems: bal.remaining_stems,
+            bunchSize,
+          });
+          resetSlots(locks, newSlots);
+          return;
+        }
+      } catch {
+        // If the lookup fails (offline / network), fall through to the
+        // normal submit path — server will reject if truly insufficient.
+      }
+    }
+
+    // Auto-submit only if all three are filled (including bucket)
     if (newSlots.bunch && newSlots.grader && newSlots.bucket) {
       setSubmitting(true);
       await doSubmit(newSlots.bunch, newSlots.grader, newSlots.bucket);
@@ -227,7 +258,7 @@ export default function GradeScreen() {
     }
   }, [bouquetRecipe, slots, bouquetBunchesCount, bouquetVarieties, isConnected]);
 
-  const doSubmit = async (bunchId: string, graderId: string, bucketId: string) => {
+  const doSubmit = async (bunchId: string, graderId: string, bucketId?: string | null) => {
       const now = new Date().toLocaleTimeString();
       const farm = await getFarm();
 
@@ -251,7 +282,7 @@ export default function GradeScreen() {
       const qty = qtyMatch ? parseInt(qtyMatch[0], 10) : 0;
 
       const payload = {
-        bucket_id: bucketId,
+        bucket_id: bucketId || '',  // Allow empty bucket ID
         bunch_id: bunchId,
         bunch_size: bunchSize,
         farm,
@@ -265,13 +296,14 @@ export default function GradeScreen() {
         try {
           const response = await submitGrading(payload);
 
-          await addGradingEntry(bunchId, graderId, bucketId, farm, response.variety ?? '', response.stem_length ?? '', response.qty ?? 0, true);
-          setEntries((prev) => [{ bunch_id: bunchId, grader: graderId, bucket_id: bucketId, variety: response.variety ?? '', stem_length: response.stem_length ?? '', qty: response.qty ?? 0, time: now, status: 'success', message: `${response.qty} stems` }, ...prev]);
+          await addGradingEntry(bunchId, graderId, bucketId || '', farm, response.variety ?? '', response.stem_length ?? '', response.qty ?? 0, true);
+          setEntries((prev) => [{ bunch_id: bunchId, grader: graderId, bucket_id: bucketId || '', variety: response.variety ?? '', stem_length: response.stem_length ?? '', qty: response.qty ?? 0, time: now, status: 'success', message: `${response.qty} stems` }, ...prev]);
           await refreshStats();
           onScanSuccess();
           showConfirmation('success', `Graded: ${response.qty ?? 0} stems`);
 
-          if (isConnected) {
+          // Only show remainder modal if a bucket was used and there are remaining stems
+          if (isConnected && bucketId) {
             try {
               const balance = await getBucketBalance(bucketId);
               if (balance.remaining_stems > 0) {
@@ -287,21 +319,40 @@ export default function GradeScreen() {
           }
         } catch (error: any) {
           await addToSyncQueue('mobile_grading_entry', payload);
-          await addGradingEntry(bunchId, graderId, bucketId, farm, '', '', 0, false);
-          setEntries((prev) => [{ bunch_id: bunchId, grader: graderId, bucket_id: bucketId, variety: '', stem_length: '', qty: 0, time: now, status: 'error', message: error.message }, ...prev]);
+          await addGradingEntry(bunchId, graderId, bucketId || '', farm, '', '', 0, false);
+          setEntries((prev) => [{ bunch_id: bunchId, grader: graderId, bucket_id: bucketId || '', variety: '', stem_length: '', qty: 0, time: now, status: 'error', message: error.message }, ...prev]);
           await refreshStats();
           onScanError();
           showConfirmation('error', error.message);
         }
       } else {
         await addToSyncQueue('mobile_grading_entry', payload);
-        await addGradingEntry(bunchId, graderId, bucketId, farm, '', '', 0, false);
-        setEntries((prev) => [{ bunch_id: bunchId, grader: graderId, bucket_id: bucketId, variety: '', stem_length: '', qty: 0, time: now, status: 'queued', message: 'Saved offline' }, ...prev]);
+        await addGradingEntry(bunchId, graderId, bucketId || '', farm, '', '', 0, false);
+        setEntries((prev) => [{ bunch_id: bunchId, grader: graderId, bucket_id: bucketId || '', variety: '', stem_length: '', qty: 0, time: now, status: 'queued', message: 'Saved offline' }, ...prev]);
         await refreshStats();
         onScanSuccess();
         showConfirmation('success', 'Saved offline');
       }
     };
+
+  // Manual submit handler for when only bunch and grader are filled
+  const handleManualSubmit = useCallback(async () => {
+    const { bunch, grader } = slots;
+    if (!bunch || !grader) {
+      showConfirmation('error', 'Scan both bunch and grader first');
+      return;
+    }
+    if (submitting) return;
+    
+    setSubmitting(true);
+    await doSubmit(bunch, grader, null); // Pass null for bucket ID
+    setSubmitting(false);
+    resetSlots(locks, slots);
+  }, [slots, locks, submitting, resetSlots]);
+
+  const filledCount = SLOT_ORDER.filter((s) => slots[s]).length;
+  const allFilled = filledCount === 3;
+  const hasBunchAndGrader = slots.bunch && slots.grader && !slots.bucket;
 
   // ── Remainder modal handlers ──────────────────────────────────
   const handleAddToPool = async () => {
@@ -432,12 +483,8 @@ export default function GradeScreen() {
     }
   };
 
-  const filledCount = SLOT_ORDER.filter((s) => slots[s]).length;
-  const allFilled = filledCount === 3;
-
   return (
     <View style={styles.container}>
-      <SyncBanner />
 
       {/* Mode toggle */}
       <View style={styles.modeToggle}>
@@ -459,7 +506,19 @@ export default function GradeScreen() {
         </TouchableOpacity>
         <TouchableOpacity
           style={[styles.modeBtn, mode === 'pool' && styles.modeBtnPool]}
-          onPress={() => setMode('pool')}
+          onPress={async () => {
+            setMode('pool');
+            // Recover any existing pool state from the server so the user
+            // doesn't see "no active pool" just because the app was restarted.
+            try {
+              const farm = await getFarm();
+              const status = await getPoolStatus('', farm);
+              if (status?.pool && status.pooled_stems > 0) {
+                setPoolVariety((status as any).variety ?? null);
+                setPoolBalance(status.pooled_stems);
+              }
+            } catch { /* offline — pool stays whatever it was */ }
+          }}
           activeOpacity={0.7}
         >
           <Ionicons name="layers-outline" size={14} color={mode === 'pool' ? '#fff' : colors.textMuted} />
@@ -538,6 +597,25 @@ export default function GradeScreen() {
               keepFocused
             />
           </View>
+
+          {/* Manual Submit Button - shows when bunch and grader are filled but bucket is not */}
+          {hasBunchAndGrader && (
+            <TouchableOpacity
+              style={[styles.manualSubmitBtn, submitting && styles.submitBtnDisabled]}
+              onPress={handleManualSubmit}
+              disabled={submitting}
+              activeOpacity={0.8}
+            >
+              {submitting ? (
+                <ActivityIndicator size="small" color="#fff" />
+              ) : (
+                <>
+                  <Ionicons name="checkmark-circle-outline" size={18} color="#fff" />
+                  <Text style={styles.submitBtnText}>Submit Grading (No Bucket)</Text>
+                </>
+              )}
+            </TouchableOpacity>
+          )}
 
           {bouquetMode && bouquetRecipe ? (
             <BouquetRecipeCard
@@ -820,9 +898,10 @@ export default function GradeScreen() {
               <Text style={styles.modalTitle}>Remainder Stems</Text>
             </View>
             <Text style={styles.modalBody}>
-              <Text style={styles.modalHighlight}>{remainderModal.stems}</Text> stems remaining in{' '}
-              <Text style={styles.modalHighlight}>{remainderModal.bucketId}</Text>.
-              {'\n'}Add to pool for later grading?
+              Bunch needs <Text style={styles.modalHighlight}>{remainderModal.bunchSize}</Text> stems but{' '}
+              <Text style={styles.modalHighlight}>{remainderModal.bucketId}</Text> only has{' '}
+              <Text style={styles.modalHighlight}>{remainderModal.stems}</Text>.
+              {'\n'}Pool these stems for later grading, or skip to scan a smaller bunch.
             </Text>
             <View style={styles.modalActions}>
               <TouchableOpacity
@@ -1071,6 +1150,16 @@ const styles = StyleSheet.create({
     padding: spacing.md,
     marginTop: spacing.sm,
   },
+  manualSubmitBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: spacing.sm,
+    backgroundColor: colors.primary,
+    borderRadius: borderRadius.md,
+    padding: spacing.md,
+    marginTop: spacing.sm,
+  },
   submitBtnDisabled: {
     opacity: 0.6,
   },
@@ -1191,32 +1280,32 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(0,0,0,0.5)',
     justifyContent: 'center',
     alignItems: 'center',
-    padding: spacing.lg,
+    padding: spacing.md,
   },
   modalCard: {
-    backgroundColor: colors.background,
-    borderRadius: borderRadius.lg,
-    padding: spacing.lg,
+    backgroundColor: colors.surface,
+    borderRadius: borderRadius.md,
+    padding: spacing.md,
     width: '100%',
-    maxWidth: 360,
+    maxWidth: 320,
   },
   modalHeader: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: spacing.sm,
-    marginBottom: spacing.md,
+    gap: spacing.xs,
+    marginBottom: spacing.sm,
   },
   modalTitle: {
     fontFamily: fontFamily.semiBold,
-    fontSize: fontSize.lg,
+    fontSize: fontSize.md,
     color: colors.text,
   },
   modalBody: {
     fontFamily: fontFamily.regular,
-    fontSize: fontSize.md,
+    fontSize: fontSize.sm,
     color: colors.textMuted,
-    lineHeight: 22,
-    marginBottom: spacing.lg,
+    lineHeight: 18,
+    marginBottom: spacing.md,
   },
   modalHighlight: {
     fontFamily: fontFamily.semiBold,
@@ -1224,32 +1313,34 @@ const styles = StyleSheet.create({
   },
   modalActions: {
     flexDirection: 'row',
-    gap: spacing.sm,
+    gap: spacing.xs,
   },
   modalSkip: {
     flex: 1,
-    padding: spacing.md,
-    borderRadius: borderRadius.md,
+    paddingVertical: spacing.sm,
+    paddingHorizontal: spacing.md,
+    borderRadius: borderRadius.sm,
     borderWidth: 1,
     borderColor: colors.border,
     alignItems: 'center',
   },
   modalSkipText: {
     fontFamily: fontFamily.medium,
-    fontSize: fontSize.md,
+    fontSize: fontSize.sm,
     color: colors.textMuted,
   },
   modalPool: {
     flex: 2,
-    padding: spacing.md,
-    borderRadius: borderRadius.md,
-    backgroundColor: '#6366f1',
+    paddingVertical: spacing.sm,
+    paddingHorizontal: spacing.md,
+    borderRadius: borderRadius.sm,
+    backgroundColor: colors.primary,
     alignItems: 'center',
     justifyContent: 'center',
   },
   modalPoolText: {
     fontFamily: fontFamily.semiBold,
-    fontSize: fontSize.md,
-    color: '#fff',
+    fontSize: fontSize.sm,
+    color: colors.textOnPrimary ?? '#fff',
   },
 });

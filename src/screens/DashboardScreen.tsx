@@ -1,4 +1,4 @@
-import React, { useCallback, useState } from 'react';
+import React, { useCallback, useMemo, useState, useRef, useEffect } from 'react';
 import {
   View,
   Text,
@@ -6,6 +6,8 @@ import {
   ScrollView,
   RefreshControl,
   TouchableOpacity,
+  Animated,
+  Modal,
   ActivityIndicator,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
@@ -20,13 +22,18 @@ import {
   getRejectsByGreenhouse,
   getTodayGradingBunches,
   getTodayHarvestStemsByHarvester,
+  getMyHarvestByGreenhouse,
+  getMyHarvestByVariety,
+  getReceivedByGreenhouse,
+  getHarvestVarietiesByGreenhouse,
 } from '../database/reports';
+import { stripStemLength } from '../types';
 import { getTodayReceivingCount } from '../database/receiving';
 import { getTodayActualHarvest } from '../database/actual_harvest';
-import { fetchGradingDashboard, fetchDashboardData, fetchHarvesterStats } from '../services/api';
-import SyncBanner from '../components/SyncBanner';
+import { fetchGradingDashboard, fetchDashboardData, fetchHarvesterStats, fetchUnreceivedBuckets } from '../services/api';
+import { DashboardSkeleton } from '../components/Skeleton';
 import { fontFamily, fontSize, spacing, borderRadius } from '../theme';
-import { GreenhouseHarvestRow } from '../types';
+import { GreenhouseHarvestRow, UnreceivedBucketsResponse } from '../types';
 
 const SECTION_LABEL: Record<string, string> = {
   field_reject: 'Field',
@@ -76,6 +83,17 @@ export default function DashboardScreen() {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
 
+  // Fade-in animation for content — runs every time loading transitions to false
+  // so both the first load and subsequent focus-refreshes feel smooth.
+  const contentFade = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    if (loading) {
+      contentFade.setValue(0);
+    } else {
+      Animated.timing(contentFade, { toValue: 1, duration: 280, useNativeDriver: true }).start();
+    }
+  }, [loading, contentFade]);
+
   const [harvestStems, setHarvestStems] = useState(0);
   const [receivingCount, setReceivingCount] = useState(0);
   const [gradingStems, setGradingStems] = useState(0);
@@ -83,9 +101,33 @@ export default function DashboardScreen() {
   const [rejectsBySection, setRejectsBySection] = useState<{ section: string; total: number }[]>([]);
   const [harvestByGH, setHarvestByGH] = useState<{ greenhouse: string; stems: number; varieties: string }[]>([]);
   const [rejectsByGH, setRejectsByGH] = useState<{ greenhouse: string; total: number }[]>([]);
+  const [receivedByGH, setReceivedByGH] = useState<{ greenhouse: string; stems: number }[]>([]);
+  const [varietiesByGH, setVarietiesByGH] = useState<{ greenhouse: string; variety: string; stems: number }[]>([]);
+  const [varianceByGHVariety, setVarianceByGHVariety] = useState<
+    { greenhouse: string; variety: string; harvested: number; received: number; variance: number }[]
+  >([]);
   const [gradingBunches, setGradingBunches] = useState(0);
   const [actualHarvest, setActualHarvest] = useState<{ greenhouse: string; variety: string; quantity: number }[]>([]);
   const [harvesterStems, setHarvesterStems] = useState(0);
+
+  const [missingModal, setMissingModal] = useState<{
+    visible: boolean;
+    greenhouse: string;
+    variety: string;
+    loading: boolean;
+    data: UnreceivedBucketsResponse | null;
+  }>({ visible: false, greenhouse: '', variety: '', loading: false, data: null });
+
+  const openMissingBuckets = useCallback(async (greenhouse: string, variety: string, _variance: number) => {
+    setMissingModal({ visible: true, greenhouse, variety, loading: true, data: null });
+    try {
+      const today = todayISODate();
+      const data = await fetchUnreceivedBuckets(greenhouse, variety, today, today);
+      setMissingModal((p) => ({ ...p, loading: false, data }));
+    } catch {
+      setMissingModal((p) => ({ ...p, loading: false, data: null }));
+    }
+  }, []);
 
   const firstName = fullName.split(' ')[0] || 'there';
 
@@ -105,7 +147,7 @@ export default function DashboardScreen() {
       return;
     }
 
-    const [hs, rc, rs, rbs, hgh, rgh, gb, ah] = await Promise.all([
+    const [hs, rc, rs, rbs, hgh, rgh, gb, ah, recvGh, varGh] = await Promise.all([
       getTodayHarvestStems(),
       getTodayReceivingCount(),
       getTodayRejectCount(),
@@ -114,18 +156,26 @@ export default function DashboardScreen() {
       getRejectsByGreenhouse(),
       getTodayGradingBunches(),
       getTodayActualHarvest(),
+      getReceivedByGreenhouse(),
+      getHarvestVarietiesByGreenhouse(),
     ]);
 
     let harvestStemsVal = hs;
     let receivingCountVal = rc;
     let gs = await getTodayGradingStems();
     let harvestByGHVal = hgh;
+    let receivedByGHVal = recvGh;
+    let rejectsByGHVal = rgh;
+    let varietiesByGHVal = varGh;
+    let actualHarvestVal = ah;
+    let rejectCountVal = rs;
+    let rejectsBySectionVal = rbs;
 
     if (isConnected) {
       try {
         const erpDash = await fetchDashboardData(today, today);
         harvestStemsVal = erpDash.quantities?.harvesting ?? hs;
-        receivingCountVal = erpDash.counts?.receiving ?? rc;
+        receivingCountVal = erpDash.quantities?.receiving ?? erpDash.counts?.receiving ?? rc;
         if (erpDash.greenhouse_data?.length > 0) {
           harvestByGHVal = erpDash.greenhouse_data.map((g: any) => ({
             greenhouse: g.greenhouse_name || g.greenhouse || 'Unknown',
@@ -133,22 +183,72 @@ export default function DashboardScreen() {
             varieties: String(g.variety_count || 0),
           }));
         }
+        // New per-greenhouse breakdowns from get_dashboard_data_full
+        if (Array.isArray(erpDash.received_by_greenhouse) && erpDash.received_by_greenhouse.length > 0) {
+          receivedByGHVal = erpDash.received_by_greenhouse.map((r: any) => ({
+            greenhouse: String(r.greenhouse ?? ''),
+            stems: Number(r.stems ?? 0),
+          }));
+        }
+        if (Array.isArray(erpDash.rejects_by_greenhouse) && erpDash.rejects_by_greenhouse.length > 0) {
+          rejectsByGHVal = erpDash.rejects_by_greenhouse.map((r: any) => ({
+            greenhouse: String(r.greenhouse ?? ''),
+            total: Number(r.stems ?? 0),
+          }));
+        }
+        if (Array.isArray(erpDash.varieties_by_greenhouse) && erpDash.varieties_by_greenhouse.length > 0) {
+          varietiesByGHVal = erpDash.varieties_by_greenhouse.map((r: any) => ({
+            greenhouse: String(r.greenhouse ?? ''),
+            variety: String(r.variety ?? ''),
+            stems: Number(r.stems ?? 0),
+          }));
+        }
+        // Per-greenhouse-per-variety harvested vs received variance
+        // (single backend query → variance_by_greenhouse_variety)
+        if (Array.isArray(erpDash.variance_by_greenhouse_variety)) {
+          setVarianceByGHVariety(
+            erpDash.variance_by_greenhouse_variety.map((r: any) => ({
+              greenhouse: String(r.greenhouse ?? ''),
+              variety: String(r.variety ?? ''),
+              harvested: Number(r.harvested ?? 0),
+              received: Number(r.received ?? 0),
+              variance: Number(r.variance ?? 0),
+            }))
+          );
+        }
+        if (Array.isArray(erpDash.actual_harvest) && erpDash.actual_harvest.length > 0) {
+          actualHarvestVal = erpDash.actual_harvest.map((r: any) => ({
+            greenhouse: String(r.greenhouse ?? ''),
+            variety: String(r.variety ?? ''),
+            quantity: Number(r.quantity ?? 0),
+          }));
+        }
+        if (typeof erpDash.rejects_total === 'number') rejectCountVal = erpDash.rejects_total;
+        if (Array.isArray(erpDash.rejects_by_section) && erpDash.rejects_by_section.length > 0) {
+          rejectsBySectionVal = erpDash.rejects_by_section.map((r: any) => ({
+            section: String(r.section ?? ''),
+            total: Number(r.total ?? 0),
+          }));
+        }
       } catch {}
       try {
-        const dash = await fetchGradingDashboard();
+        const dash = await fetchGradingDashboard(today, today);
         gs = dash.total_graded ?? gs;
+        if (dash.grading_count != null) setGradingBunches(dash.grading_count);
       } catch {}
     }
 
     setHarvestStems(harvestStemsVal);
     setReceivingCount(receivingCountVal);
     setGradingStems(gs);
-    setRejectCount(rs);
-    setRejectsBySection(rbs);
+    setRejectCount(rejectCountVal);
+    setRejectsBySection(rejectsBySectionVal);
     setHarvestByGH(harvestByGHVal);
-    setRejectsByGH(rgh);
+    setRejectsByGH(rejectsByGHVal);
+    setReceivedByGH(receivedByGHVal);
+    setVarietiesByGH(varietiesByGHVal);
     setGradingBunches(gb);
-    setActualHarvest(ah);
+    setActualHarvest(actualHarvestVal);
   }, [isConnected, isHarvester, userEmail]);
 
   useFocusEffect(
@@ -164,15 +264,44 @@ export default function DashboardScreen() {
     setRefreshing(false);
   };
 
-  // Merge harvest + rejects by greenhouse
+  // Merge harvest + received + rejects + variety breakdown by greenhouse
   const ghRows: GreenhouseHarvestRow[] = (() => {
     const map: Record<string, GreenhouseHarvestRow> = {};
+    const empty = (gh: string): GreenhouseHarvestRow => ({
+      greenhouse: gh, stems: 0, received: 0, varieties: '', varietyBreakdown: [], rejects: 0,
+    });
     for (const r of harvestByGH) {
-      map[r.greenhouse] = { greenhouse: r.greenhouse, stems: r.stems, varieties: r.varieties, rejects: 0 };
+      map[r.greenhouse] = { ...empty(r.greenhouse), stems: r.stems, varieties: r.varieties };
+    }
+    for (const r of receivedByGH) {
+      if (!map[r.greenhouse]) map[r.greenhouse] = empty(r.greenhouse);
+      map[r.greenhouse].received = r.stems;
     }
     for (const r of rejectsByGH) {
-      if (map[r.greenhouse]) map[r.greenhouse].rejects = r.total;
-      else map[r.greenhouse] = { greenhouse: r.greenhouse, stems: 0, varieties: '', rejects: r.total };
+      if (!map[r.greenhouse]) map[r.greenhouse] = empty(r.greenhouse);
+      map[r.greenhouse].rejects = r.total;
+    }
+    // Prefer the variance breakdown (per-variety harvested AND received) when
+    // available — gives us the variance per variety per greenhouse in a single
+    // pass. Falls back to the harvest-only variety list when variance data is
+    // absent (e.g. offline or older server).
+    if (varianceByGHVariety.length > 0) {
+      for (const r of varianceByGHVariety) {
+        if (!map[r.greenhouse]) map[r.greenhouse] = empty(r.greenhouse);
+        map[r.greenhouse].varietyBreakdown.push({
+          variety: r.variety,
+          stems: r.harvested,
+          received: r.received,
+          variance: r.variance,
+        });
+      }
+    } else {
+      for (const r of varietiesByGH) {
+        if (!map[r.greenhouse]) map[r.greenhouse] = empty(r.greenhouse);
+        map[r.greenhouse].varietyBreakdown.push({
+          variety: r.variety, stems: r.stems, received: 0, variance: r.stems,
+        });
+      }
     }
     return Object.values(map).sort((a, b) => b.stems - a.stems);
   })();
@@ -186,6 +315,7 @@ export default function DashboardScreen() {
   const QUICK_ACTIONS = [
     { name: 'Harvest', icon: 'leaf-outline' as const, tab: 'Harvest' },
     { name: 'Receive', icon: 'download-outline' as const, tab: 'Receive' },
+    ...(isXflora ? [{ name: 'Transfer', icon: 'swap-horizontal-outline' as const, tab: 'Transfer' }] : []),
     { name: 'Shelve', icon: 'scan-outline' as const, tab: 'Shelve' },
     { name: 'Grade', icon: 'clipboard-outline' as const, tab: 'Grade' },
     { name: 'Quality', icon: 'shield-checkmark-outline' as const, tab: 'Quality' },
@@ -197,8 +327,8 @@ export default function DashboardScreen() {
   if (!loading && isHarvester) {
     return (
       <View style={s.container}>
-        <SyncBanner />
-        <ScrollView
+        <Animated.ScrollView
+          style={{ flex: 1, opacity: contentFade }}
           contentContainerStyle={s.content}
           refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor="#fff" />}
         >
@@ -216,8 +346,11 @@ export default function DashboardScreen() {
             <ActionChip icon="leaf-outline" label="Harvest" onPress={() => navigation.navigate('Harvest')} />
             <ActionChip icon="settings-outline" label="Settings" onPress={() => navigation.navigate('Settings')} />
           </View>
+
+          <PersonalStatsPanel harvester={userEmail} />
+
           <View style={{ height: spacing.xxl }} />
-        </ScrollView>
+        </Animated.ScrollView>
       </View>
     );
   }
@@ -225,13 +358,11 @@ export default function DashboardScreen() {
   // ── Manager / full dashboard ───────────────────────────────────────────────
   return (
     <View style={s.container}>
-      <SyncBanner />
       {loading ? (
-        <View style={s.center}>
-          <ActivityIndicator size="large" color={C.primary} />
-        </View>
+        <DashboardSkeleton />
       ) : (
-        <ScrollView
+        <Animated.ScrollView
+          style={{ flex: 1, opacity: contentFade }}
           contentContainerStyle={s.content}
           refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={C.primary} />}
         >
@@ -253,7 +384,7 @@ export default function DashboardScreen() {
             <View style={[s.tile, { backgroundColor: C.tileBlue }]}>
               <Text style={s.tileChip}>RECEIVED</Text>
               <Text style={s.tileNumber}>{receivingCount.toLocaleString()}</Text>
-              <Text style={s.tileUnit}>buckets</Text>
+              <Text style={s.tileUnit}>stems</Text>
             </View>
             <View style={[s.tile, { backgroundColor: C.tileStone }]}>
               <Text style={s.tileChip}>GRADED</Text>
@@ -315,37 +446,18 @@ export default function DashboardScreen() {
 
           {/* Greenhouse breakdown */}
           {ghRows.length > 0 && (
-            <View style={s.folderCard}>
-              <View style={s.folderTabRow}>
-                <Text style={s.folderTab}>GREENHOUSES</Text>
-                <Text style={s.folderTabCount}>{ghRows.length}</Text>
+            <View style={s.ghSection}>
+              <View style={s.ghSectionHeader}>
+                <Text style={s.ghSectionLabel}>GREENHOUSES</Text>
+                <Text style={s.ghSectionCount}>{ghRows.length} active</Text>
               </View>
-              {ghRows.map((row, i) => {
-                const rejectRatio = row.stems > 0 ? row.rejects / row.stems : 0;
-                return (
-                  <View key={i} style={[s.ghRow, i === ghRows.length - 1 && s.ghRowLast]}>
-                    <View style={s.ghLeft}>
-                      <Text style={s.ghName} numberOfLines={1}>{row.greenhouse}</Text>
-                      {row.varieties ? (
-                        <Text style={s.ghVariety}>{row.varieties} {Number(row.varieties) === 1 ? 'variety' : 'varieties'}</Text>
-                      ) : null}
-                    </View>
-                    <View style={s.ghRight}>
-                      <Text style={s.ghStems}>{row.stems.toLocaleString()}</Text>
-                      <Text style={s.ghStemsUnit}>stems</Text>
-                    </View>
-                    {row.rejects > 0 ? (
-                      <View style={s.ghRejectBadge}>
-                        <Text style={s.ghRejectText}>{row.rejects} rej</Text>
-                      </View>
-                    ) : (
-                      <View style={[s.ghRejectBadge, s.ghRejectBadgeOk]}>
-                        <Text style={s.ghRejectOkText}>clean</Text>
-                      </View>
-                    )}
-                  </View>
-                );
-              })}
+              {ghRows.map((row) => (
+                <GreenhouseRow
+                  key={row.greenhouse}
+                  row={row}
+                  onLongPressVariety={openMissingBuckets}
+                />
+              ))}
             </View>
           )}
 
@@ -376,8 +488,23 @@ export default function DashboardScreen() {
             </ScrollView>
           </View>
 
+          {!isXflora && userEmail ? (
+            <CollapsibleSection title="My stats today">
+              <PersonalStatsPanel harvester={userEmail} />
+            </CollapsibleSection>
+          ) : null}
+
+          <MissingBucketsModal
+            visible={missingModal.visible}
+            greenhouse={missingModal.greenhouse}
+            variety={missingModal.variety}
+            loading={missingModal.loading}
+            data={missingModal.data}
+            onClose={() => setMissingModal((p) => ({ ...p, visible: false }))}
+          />
+
           <View style={{ height: spacing.xxl }} />
-        </ScrollView>
+        </Animated.ScrollView>
       )}
     </View>
   );
@@ -419,6 +546,108 @@ function Header({
   );
 }
 
+// Compact, scannable greenhouse row. One line: name on the left, paired
+// harvest / received numbers on the right with a thin proportion bar beneath.
+// Tapping expands a per-variety breakdown.
+function GreenhouseRow({
+  row,
+  onLongPressVariety,
+}: {
+  row: GreenhouseHarvestRow;
+  onLongPressVariety?: (greenhouse: string, variety: string, variance: number) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const hasVarieties = row.varietyBreakdown.length > 0;
+  const ratio = row.stems > 0 ? Math.min(1, row.received / row.stems) : 0;
+  const ratioPct = Math.round(ratio * 100);
+  const complete = row.stems > 0 && row.received >= row.stems;
+
+  return (
+    <View style={s.ghRowCard}>
+      <TouchableOpacity
+        onPress={() => hasVarieties && setOpen(!open)}
+        activeOpacity={hasVarieties ? 0.6 : 1}
+        style={s.ghRowMain}
+      >
+        <View style={s.ghRowLeft}>
+          <Text style={s.ghRowName} numberOfLines={1}>{row.greenhouse}</Text>
+          <View style={s.ghRowMetaLine}>
+            {row.varieties ? (
+              <Text style={s.ghRowMeta}>
+                {row.varieties} {Number(row.varieties) === 1 ? 'variety' : 'varieties'}
+              </Text>
+            ) : null}
+            {row.rejects > 0 ? (
+              <View style={s.ghRowRejDot}>
+                <Text style={s.ghRowRejDotText}>·  {row.rejects} rej</Text>
+              </View>
+            ) : null}
+          </View>
+        </View>
+
+        <View style={s.ghRowRight}>
+          <View style={s.ghRowPair}>
+            <Text style={s.ghRowNum}>{row.stems.toLocaleString()}</Text>
+            <Text style={s.ghRowArrow}>→</Text>
+            <Text style={[s.ghRowNum, row.received === 0 && s.ghRowNumMuted, complete && s.ghRowNumGood]}>
+              {row.received.toLocaleString()}
+            </Text>
+          </View>
+          <Text style={s.ghRowRatio}>
+            {row.stems > 0 ? `${ratioPct}% received` : '—'}
+          </Text>
+        </View>
+
+        {hasVarieties && (
+          <Ionicons
+            name={open ? 'chevron-up' : 'chevron-down'}
+            size={14}
+            color={C.textMuted}
+            style={{ marginLeft: 6 }}
+          />
+        )}
+      </TouchableOpacity>
+
+      <View style={s.ghRowBarTrack}>
+        <View style={[s.ghRowBarFill, complete && s.ghRowBarFillFull, { width: `${ratioPct}%` }]} />
+      </View>
+
+      {open && hasVarieties && (
+        <View style={s.ghVarietyList}>
+          {row.varietyBreakdown.map((v) => {
+            const variance = (v as any).variance ?? Math.max(0, v.stems - ((v as any).received ?? 0));
+            const received = (v as any).received ?? 0;
+            return (
+              <TouchableOpacity
+                key={v.variety}
+                style={s.ghVarietyRow}
+                disabled={variance <= 0 || !onLongPressVariety}
+                onLongPress={() => onLongPressVariety?.(row.greenhouse, v.variety, variance)}
+                delayLongPress={400}
+                activeOpacity={variance > 0 ? 0.7 : 1}
+              >
+                <Text style={s.ghVarietyName} numberOfLines={1}>{v.variety}</Text>
+                <View style={{ flexDirection: 'row', alignItems: 'baseline', gap: 4 }}>
+                  <Text style={s.ghVarietyStems}>{v.stems.toLocaleString()}</Text>
+                  <Text style={s.ghVarietyUnit}>→</Text>
+                  <Text style={[s.ghVarietyStems, received === 0 && s.ghRowNumMuted]}>
+                    {received.toLocaleString()}
+                  </Text>
+                  {variance > 0 ? (
+                    <Text style={[s.ghVarietyUnit, { color: '#dc2626' }]}>
+                      ({variance.toLocaleString()})
+                    </Text>
+                  ) : null}
+                </View>
+              </TouchableOpacity>
+            );
+          })}
+        </View>
+      )}
+    </View>
+  );
+}
+
 function ActionChip({ icon, label, onPress }: { icon: any; label: string; onPress: () => void }) {
   return (
     <TouchableOpacity style={s.actionChip} onPress={onPress} activeOpacity={0.75}>
@@ -428,11 +657,154 @@ function ActionChip({ icon, label, onPress }: { icon: any; label: string; onPres
   );
 }
 
+// Lazy-loaded breakdown of the harvester's day: by greenhouse, and by variety
+// in two granularities (with stem-length, and rolled-up by base variety).
+// Loads only when the user expands the panel — keeps the dashboard light.
+function PersonalStatsPanel({ harvester }: { harvester: string }) {
+  const [open, setOpen] = useState(false);
+  const [tab, setTab] = useState<'greenhouse' | 'variety_full' | 'variety_base'>('greenhouse');
+  const [ghRows, setGhRows] = useState<{ greenhouse: string; stems: number }[] | null>(null);
+  const [varRows, setVarRows] = useState<{ variety: string; stems: number }[] | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(async () => {
+    if (!harvester || (ghRows && varRows)) return;
+    setBusy(true);
+    const [g, v] = await Promise.all([
+      getMyHarvestByGreenhouse(harvester),
+      getMyHarvestByVariety(harvester),
+    ]);
+    setGhRows(g);
+    setVarRows(v);
+    setBusy(false);
+  }, [harvester, ghRows, varRows]);
+
+  const onToggle = () => {
+    if (!open) { load(); }
+    setOpen(!open);
+  };
+
+  // Roll up "Andina 50cm" + "Andina 60cm" → "Andina"
+  const baseVarRows = useMemo(() => {
+    if (!varRows) return [];
+    const map: Record<string, number> = {};
+    for (const r of varRows) {
+      const base = stripStemLength(r.variety) || r.variety;
+      map[base] = (map[base] ?? 0) + r.stems;
+    }
+    return Object.entries(map)
+      .map(([variety, stems]) => ({ variety, stems }))
+      .sort((a, b) => b.stems - a.stems);
+  }, [varRows]);
+
+  const rows = tab === 'greenhouse'
+    ? (ghRows ?? []).map(r => ({ key: r.greenhouse, label: r.greenhouse, stems: r.stems }))
+    : tab === 'variety_full'
+      ? (varRows ?? []).map(r => ({ key: r.variety, label: r.variety, stems: r.stems }))
+      : baseVarRows.map(r => ({ key: r.variety, label: r.variety, stems: r.stems }));
+
+  return (
+    <View style={s.panelCard}>
+      <TouchableOpacity onPress={onToggle} activeOpacity={0.7} style={s.panelHeader}>
+        <Ionicons name="bar-chart-outline" size={16} color={C.textSec} />
+        <Text style={s.panelTitle}>All my stats today</Text>
+        <Ionicons name={open ? 'chevron-up' : 'chevron-down'} size={16} color={C.textMuted} />
+      </TouchableOpacity>
+
+      {open && (
+        <View style={s.panelBody}>
+          <View style={s.panelTabs}>
+            {([
+              { id: 'greenhouse', label: 'Greenhouse' },
+              { id: 'variety_base', label: 'Variety' },
+              { id: 'variety_full', label: 'Variety + length' },
+            ] as const).map((t) => (
+              <TouchableOpacity
+                key={t.id}
+                style={[s.panelTab, tab === t.id && s.panelTabActive]}
+                onPress={() => setTab(t.id)}
+                activeOpacity={0.7}
+              >
+                <Text style={[s.panelTabText, tab === t.id && s.panelTabTextActive]}>{t.label}</Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+
+          {busy ? (
+            <Text style={s.panelEmpty}>Loading…</Text>
+          ) : rows.length === 0 ? (
+            <Text style={s.panelEmpty}>No harvest entries today</Text>
+          ) : (
+            <View>
+              {rows.map((r) => (
+                <View key={r.key} style={s.panelRow}>
+                  <Text style={s.panelRowLabel} numberOfLines={1}>{r.label || '—'}</Text>
+                  <Text style={s.panelRowValue}>{r.stems.toLocaleString()}</Text>
+                </View>
+              ))}
+            </View>
+          )}
+        </View>
+      )}
+    </View>
+  );
+}
+
 // ── Styles ─────────────────────────────────────────────────────────────────────
 const s = StyleSheet.create({
   container: { flex: 1, backgroundColor: C.bg },
   center: { flex: 1, alignItems: 'center', justifyContent: 'center' },
   content: { padding: spacing.lg, paddingBottom: spacing.xxl },
+
+  // Personal stats panel
+  panelCard: {
+    backgroundColor: C.surface,
+    borderRadius: borderRadius.md,
+    borderWidth: 1,
+    borderColor: C.border,
+    marginTop: spacing.lg,
+    overflow: 'hidden',
+  },
+  panelHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.sm,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.md,
+  },
+  panelTitle: { flex: 1, fontFamily: fontFamily.semiBold, fontSize: fontSize.sm, color: C.text },
+  panelBody: {
+    paddingHorizontal: spacing.md,
+    paddingBottom: spacing.md,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: C.border,
+  },
+  panelTabs: { flexDirection: 'row', gap: spacing.xs, marginVertical: spacing.sm },
+  panelTab: {
+    flex: 1,
+    paddingVertical: spacing.xs,
+    paddingHorizontal: spacing.sm,
+    borderRadius: borderRadius.sm,
+    backgroundColor: C.bg,
+    alignItems: 'center',
+  },
+  panelTabActive: { backgroundColor: C.text },
+  panelTabText: { fontFamily: fontFamily.medium, fontSize: fontSize.xs, color: C.textSec },
+  panelTabTextActive: { color: '#fff' },
+  panelEmpty: {
+    fontFamily: fontFamily.regular, fontSize: fontSize.xs, color: C.textMuted,
+    paddingVertical: spacing.md, textAlign: 'center',
+  },
+  panelRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingVertical: spacing.sm,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: C.border,
+  },
+  panelRowLabel: { flex: 1, fontFamily: fontFamily.regular, fontSize: fontSize.sm, color: C.text, paddingRight: spacing.sm },
+  panelRowValue: { fontFamily: fontFamily.semiBold, fontSize: fontSize.sm, color: C.text },
 
   // Header
   header: {
@@ -651,13 +1023,216 @@ const s = StyleSheet.create({
     color: C.textMuted,
   },
 
+  // Compact greenhouse rows
+  ghRowCard: {
+    backgroundColor: C.surface,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: C.border,
+    paddingHorizontal: spacing.md,
+    paddingTop: spacing.sm + 2,
+    paddingBottom: 0,
+    marginBottom: spacing.xs + 2,
+    overflow: 'hidden',
+  },
+  ghRowMain: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingBottom: spacing.sm,
+  },
+  ghRowLeft: { flex: 1, paddingRight: spacing.sm },
+  ghRowName: {
+    fontFamily: fontFamily.semiBold,
+    fontSize: fontSize.sm,
+    color: C.text,
+  },
+  ghRowMetaLine: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginTop: 1,
+  },
+  ghRowMeta: {
+    fontFamily: fontFamily.regular,
+    fontSize: 10,
+    color: C.textMuted,
+  },
+  ghRowRejDot: { marginLeft: 0 },
+  ghRowRejDotText: {
+    fontFamily: fontFamily.medium,
+    fontSize: 10,
+    color: '#DC2626',
+  },
+  ghRowRight: { alignItems: 'flex-end' },
+  ghRowPair: { flexDirection: 'row', alignItems: 'baseline' },
+  ghRowNum: {
+    fontFamily: fontFamily.bold,
+    fontSize: 17,
+    color: C.text,
+    minWidth: 36,
+    textAlign: 'right',
+  },
+  ghRowNumMuted: { color: C.textMuted, fontFamily: fontFamily.regular },
+  ghRowNumGood: { color: '#15803D' },
+  ghRowArrow: {
+    fontFamily: fontFamily.regular,
+    fontSize: 12,
+    color: C.textMuted,
+    marginHorizontal: 6,
+  },
+  ghRowRatio: {
+    fontFamily: fontFamily.medium,
+    fontSize: 9,
+    color: C.textMuted,
+    letterSpacing: 0.6,
+    marginTop: 1,
+    textTransform: 'uppercase',
+  },
+  ghRowBarTrack: {
+    height: 3,
+    backgroundColor: C.bg,
+    marginHorizontal: -spacing.md,
+  },
+  ghRowBarFill: {
+    height: '100%',
+    backgroundColor: '#22C55E',
+  },
+  ghRowBarFillFull: { backgroundColor: '#15803D' },
+
+  ghSection: { marginTop: spacing.md, marginBottom: spacing.sm },
+  ghSectionHeader: {
+    flexDirection: 'row',
+    alignItems: 'baseline',
+    justifyContent: 'space-between',
+    marginBottom: spacing.sm,
+    paddingHorizontal: 2,
+  },
+  ghSectionLabel: {
+    fontFamily: fontFamily.semiBold,
+    fontSize: 10,
+    color: C.textMuted,
+    letterSpacing: 1.4,
+  },
+  ghSectionCount: {
+    fontFamily: fontFamily.medium,
+    fontSize: 10,
+    color: C.textMuted,
+    letterSpacing: 0.6,
+  },
+  ghCard: {
+    backgroundColor: C.surface,
+    borderRadius: 16,
+    borderWidth: 1,
+    borderColor: C.border,
+    paddingTop: spacing.md,
+    paddingBottom: spacing.md,
+    paddingHorizontal: spacing.lg,
+    marginBottom: spacing.sm,
+    overflow: 'hidden',
+  },
+  ghCardTop: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: spacing.md,
+  },
+  ghCardName: {
+    fontFamily: fontFamily.semiBold,
+    fontSize: fontSize.md,
+    color: C.text,
+  },
+  ghCardSub: {
+    fontFamily: fontFamily.regular,
+    fontSize: fontSize.xs,
+    color: C.textMuted,
+    marginTop: 2,
+  },
+  ghRejBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    paddingHorizontal: spacing.sm,
+    paddingVertical: 3,
+    borderRadius: borderRadius.full,
+    backgroundColor: '#FEE2E2',
+  },
+  ghRejBadgeText: {
+    fontFamily: fontFamily.semiBold,
+    fontSize: 11,
+    color: '#DC2626',
+  },
+  ghMetricsRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: spacing.sm,
+  },
+  ghMetricBlock: { flex: 1 },
+  ghMetricLabel: {
+    fontFamily: fontFamily.medium,
+    fontSize: 9,
+    color: C.textMuted,
+    letterSpacing: 1,
+    marginBottom: 2,
+  },
+  ghMetricBig: {
+    fontFamily: fontFamily.bold,
+    fontSize: 26,
+    color: C.text,
+    lineHeight: 30,
+  },
+  ghMetricBigMuted: { color: C.textMuted },
+  ghMetricUnit: {
+    fontFamily: fontFamily.regular,
+    fontSize: 10,
+    color: C.textMuted,
+    marginTop: 1,
+  },
+  ghMetricDivider: {
+    width: 1,
+    height: 44,
+    backgroundColor: C.border,
+    marginHorizontal: spacing.md,
+  },
+  ghProgressTrack: {
+    height: 4,
+    borderRadius: 4,
+    backgroundColor: C.bg,
+    overflow: 'hidden',
+  },
+  ghProgressFill: {
+    height: '100%',
+    backgroundColor: '#16A34A',
+    borderRadius: 4,
+  },
+
+  // Legacy (kept for older references, no longer used)
+  ghHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: spacing.lg,
+    paddingVertical: spacing.xs,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: C.border,
+    backgroundColor: C.bg,
+    gap: spacing.sm,
+  },
+  ghHeaderText: {
+    fontFamily: fontFamily.medium,
+    fontSize: 10,
+    color: C.textMuted,
+    letterSpacing: 0.6,
+    textTransform: 'uppercase',
+  },
+  ghHeaderMetric: { width: 52, textAlign: 'right' },
+  ghHeaderBadgeCol: { width: 36, textAlign: 'center' },
+  ghHeaderChevron: { width: 16 },
+  ghRowWrap: {
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: C.border,
+  },
   ghRow: {
     flexDirection: 'row',
     alignItems: 'center',
     paddingHorizontal: spacing.lg,
     paddingVertical: spacing.md,
-    borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: C.border,
     gap: spacing.sm,
   },
   ghRowLast: {},
@@ -673,22 +1248,23 @@ const s = StyleSheet.create({
     color: C.textMuted,
     marginTop: 1,
   },
-  ghRight: { alignItems: 'flex-end', marginRight: spacing.sm },
-  ghStems: {
+  ghMetric: { width: 52, alignItems: 'flex-end' },
+  ghMetricNum: {
     fontFamily: fontFamily.bold,
-    fontSize: fontSize.lg,
+    fontSize: fontSize.md,
     color: C.text,
   },
-  ghStemsUnit: {
-    fontFamily: fontFamily.regular,
-    fontSize: fontSize.xs,
-    color: C.textMuted,
-  },
+  ghMetricMuted: { color: C.textMuted, fontFamily: fontFamily.regular },
+  ghReceivedNum: { color: '#0F2744' },
+  ghBadgeCol: { width: 36, alignItems: 'center' },
+  ghChevron: { width: 16, alignItems: 'center' },
   ghRejectBadge: {
-    paddingHorizontal: spacing.sm,
+    minWidth: 28,
+    paddingHorizontal: spacing.xs,
     paddingVertical: 3,
     borderRadius: borderRadius.full,
     backgroundColor: '#FEE2E2',
+    alignItems: 'center',
   },
   ghRejectBadgeOk: { backgroundColor: '#DCFCE7' },
   ghRejectText: {
@@ -700,6 +1276,33 @@ const s = StyleSheet.create({
     fontFamily: fontFamily.medium,
     fontSize: fontSize.xs,
     color: '#16A34A',
+  },
+  ghVarietyList: {
+    backgroundColor: C.bg,
+    paddingVertical: spacing.xs,
+  },
+  ghVarietyRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: spacing.lg + spacing.sm,
+    paddingVertical: 6,
+    gap: spacing.sm,
+  },
+  ghVarietyName: {
+    flex: 1,
+    fontFamily: fontFamily.regular,
+    fontSize: fontSize.xs,
+    color: C.textSec,
+  },
+  ghVarietyStems: {
+    fontFamily: fontFamily.semiBold,
+    fontSize: fontSize.xs,
+    color: C.text,
+  },
+  ghVarietyUnit: {
+    fontFamily: fontFamily.regular,
+    fontSize: 10,
+    color: C.textMuted,
   },
 
   // Mini tiles inside folder
@@ -749,4 +1352,179 @@ const s = StyleSheet.create({
   },
 
   // Removed unused accordion / table styles — data now displayed in bento cards
+
+  // Collapsible section
+  collapseCard: {
+    marginTop: spacing.md,
+    backgroundColor: C.surface,
+    borderRadius: borderRadius.md,
+    borderWidth: 1,
+    borderColor: C.border,
+    overflow: 'hidden',
+  },
+  collapseHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
+  },
+  collapseTitle: {
+    fontFamily: fontFamily.semiBold,
+    fontSize: fontSize.sm,
+    color: C.text,
+  },
+  collapseBody: {
+    paddingTop: 0,
+    paddingBottom: spacing.sm,
+  },
+
+  // Missing buckets modal
+  mbOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.5)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: spacing.md,
+  },
+  mbCard: {
+    backgroundColor: C.surface,
+    borderRadius: borderRadius.md,
+    padding: spacing.md,
+    width: '100%',
+    maxWidth: 360,
+    maxHeight: '80%',
+  },
+  mbHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: spacing.sm,
+  },
+  mbTitle: {
+    fontFamily: fontFamily.semiBold,
+    fontSize: fontSize.md,
+    color: C.text,
+  },
+  mbSubtitle: {
+    fontFamily: fontFamily.regular,
+    fontSize: fontSize.sm,
+    color: C.textMuted,
+    marginBottom: spacing.sm,
+  },
+  mbRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingVertical: spacing.xs,
+    borderBottomWidth: 1,
+    borderBottomColor: C.border,
+  },
+  mbBucket: {
+    fontFamily: fontFamily.medium,
+    fontSize: fontSize.sm,
+    color: C.text,
+  },
+  mbMeta: {
+    fontFamily: fontFamily.regular,
+    fontSize: fontSize.xs,
+    color: C.textMuted,
+  },
+  mbQty: {
+    fontFamily: fontFamily.semiBold,
+    fontSize: fontSize.sm,
+    color: '#dc2626',
+  },
+  mbEmpty: {
+    fontFamily: fontFamily.regular,
+    fontSize: fontSize.sm,
+    color: C.textMuted,
+    textAlign: 'center',
+    paddingVertical: spacing.md,
+  },
 });
+
+function CollapsibleSection({
+  title,
+  children,
+  defaultOpen = false,
+}: {
+  title: string;
+  children: React.ReactNode;
+  defaultOpen?: boolean;
+}) {
+  const [open, setOpen] = useState(defaultOpen);
+  return (
+    <View style={s.collapseCard}>
+      <TouchableOpacity
+        style={s.collapseHeader}
+        onPress={() => setOpen(!open)}
+        activeOpacity={0.7}
+      >
+        <Text style={s.collapseTitle}>{title}</Text>
+        <Ionicons
+          name={open ? 'chevron-up' : 'chevron-down'}
+          size={14}
+          color={C.textMuted}
+        />
+      </TouchableOpacity>
+      {open ? <View style={s.collapseBody}>{children}</View> : null}
+    </View>
+  );
+}
+
+function MissingBucketsModal({
+  visible,
+  greenhouse,
+  variety,
+  loading,
+  data,
+  onClose,
+}: {
+  visible: boolean;
+  greenhouse: string;
+  variety: string;
+  loading: boolean;
+  data: UnreceivedBucketsResponse | null;
+  onClose: () => void;
+}) {
+  return (
+    <Modal visible={visible} transparent animationType="fade">
+      <View style={s.mbOverlay}>
+        <View style={s.mbCard}>
+          <View style={s.mbHeader}>
+            <Text style={s.mbTitle}>Missing Buckets</Text>
+            <TouchableOpacity onPress={onClose}>
+              <Ionicons name="close" size={20} color={C.textMuted} />
+            </TouchableOpacity>
+          </View>
+          <Text style={s.mbSubtitle}>
+            {greenhouse} · {variety}
+            {data ? `  ·  ${data.missing_count} buckets, ${data.missing_stems} stems` : ''}
+          </Text>
+          {loading ? (
+            <View style={{ paddingVertical: spacing.md }}>
+              <ActivityIndicator size="small" color={C.textMuted} />
+            </View>
+          ) : !data || data.missing_buckets.length === 0 ? (
+            <Text style={s.mbEmpty}>No missing buckets — all received.</Text>
+          ) : (
+            <ScrollView style={{ maxHeight: 360 }}>
+              {data.missing_buckets.map((b) => (
+                <View key={b.bucket_id} style={s.mbRow}>
+                  <View style={{ flex: 1 }}>
+                    <Text style={s.mbBucket}>{b.bucket_id}</Text>
+                    <Text style={s.mbMeta}>
+                      {b.posting_date}{b.harvester ? `  ·  ${b.harvester}` : ''}
+                    </Text>
+                  </View>
+                  <Text style={s.mbQty}>{b.qty}</Text>
+                </View>
+              ))}
+            </ScrollView>
+          )}
+        </View>
+      </View>
+    </Modal>
+  );
+}

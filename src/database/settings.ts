@@ -45,9 +45,17 @@ export async function setSid(sid: string): Promise<void> {
   await setSetting('sid', sid);
 }
 
+export async function getCsrfToken(): Promise<string | null> {
+  return getSetting('csrf_token');
+}
+
+export async function setCsrfToken(token: string): Promise<void> {
+  await setSetting('csrf_token', token);
+}
+
 export async function clearAuth(): Promise<void> {
   const db = await getDatabase();
-  await db.runAsync("DELETE FROM settings WHERE key IN ('api_key', 'api_secret', 'sid', 'full_name', 'user_email')");
+  await db.runAsync("DELETE FROM settings WHERE key IN ('api_key', 'api_secret', 'sid', 'csrf_token', 'full_name', 'user_email')");
 }
 
 export async function getFullName(): Promise<string> {
@@ -64,6 +72,31 @@ export async function getUserEmail(): Promise<string> {
 
 export async function setUserEmail(email: string): Promise<void> {
   await setSetting('user_email', email);
+}
+
+// ─── Greenhouse cache ─────────────────────────────────────────────────────────
+// Stores the full greenhouse list so the Harvest screen can render instantly
+// even when the device is offline. The cache is refreshed in the background
+// every time a successful fetchGreenhouses() call completes.
+
+export async function getCachedGreenhouses(): Promise<{ data: any[]; cachedAt: string } | null> {
+  const [raw, at] = await Promise.all([
+    getSetting('cached_greenhouses'),
+    getSetting('cached_greenhouses_at'),
+  ]);
+  if (!raw || !at) return null;
+  try {
+    return { data: JSON.parse(raw), cachedAt: at };
+  } catch {
+    return null;
+  }
+}
+
+export async function setCachedGreenhouses(greenhouses: any[]): Promise<void> {
+  await Promise.all([
+    setSetting('cached_greenhouses', JSON.stringify(greenhouses)),
+    setSetting('cached_greenhouses_at', new Date().toISOString()),
+  ]);
 }
 
 export async function getUserRoles(): Promise<string[]> {

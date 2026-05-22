@@ -30,7 +30,10 @@ export async function unloadSounds(): Promise<void> {
 }
 
 export async function onScanSuccess(): Promise<void> {
-  Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+  // Two-tap ascending pattern (light then medium, 80 ms apart) — feels like
+  // a satisfying "ding-ding" rather than a single blunt buzz.
+  Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+  setTimeout(() => Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium), 80);
   try {
     await scanSuccessSound?.setPositionAsync(0);
     await scanSuccessSound?.playAsync();
@@ -47,4 +50,17 @@ export async function onScanError(): Promise<void> {
 
 export function lightHaptic(): void {
   Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+}
+
+export function lockHaptic(locking: boolean): void {
+  if (locking) {
+    // Lock: two heavy thuds — feels like a bolt sliding home
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
+    setTimeout(() => Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy), 90);
+  } else {
+    // Unlock: light-medium-light — feels like a release
+    Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    setTimeout(() => Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium), 70);
+    setTimeout(() => Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light), 140);
+  }
 }

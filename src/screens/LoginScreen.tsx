@@ -14,7 +14,7 @@ import { Ionicons } from '@expo/vector-icons';
 import { useApp } from '../context/AppContext';
 import { loginToServer, fetchUserRoles } from '../services/api';
 import { setSetting, getApiUrl, getUserEmail, setUserRoles as storeUserRoles } from '../database/settings';
-import { setSid, setFullName as storeFullName, setUserEmail as storeUserEmail } from '../database/settings';
+import { setSid, setCsrfToken, setFullName as storeFullName, setUserEmail as storeUserEmail } from '../database/settings';
 import { colors, fontFamily, fontSize, spacing, borderRadius, shadow } from '../theme';
 
 export default function LoginScreen() {
@@ -56,6 +56,7 @@ export default function LoginScreen() {
 
       await setSetting('api_url', serverUrl.trim().replace(/\/+$/, ''));
       await setSid(response.sid);
+      if (response.csrf_token) await setCsrfToken(response.csrf_token);
       await storeFullName(response.full_name);
       await storeUserEmail(response.user);
 

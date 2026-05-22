@@ -3,6 +3,7 @@ import { StatusBar } from 'expo-status-bar';
 import { ActivityIndicator, View, StyleSheet, Text, TouchableOpacity } from 'react-native';
 import { NavigationContainer } from '@react-navigation/native';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
+import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
 import {
@@ -22,10 +23,19 @@ import ReceivingScreen from './src/screens/ReceivingScreen';
 import ShelveScreen from './src/screens/ShelveScreen';
 import GradeScreen from './src/screens/GradeScreen';
 import PackingScreen from './src/screens/PackingScreen';
+import XfloraPackingScreen from './src/screens/XfloraPackingScreen';
+import TransferScreen from './src/screens/TransferScreen';
 import QualityScreen from './src/screens/QualityScreen';
 import ShelfMapScreen from './src/screens/ShelfMapScreen';
 import SettingsScreen from './src/screens/SettingsScreen';
 import ActualHarvestScreen from './src/screens/ActualHarvestScreen';
+import AgricultureScreen from './src/screens/AgricultureScreen';
+import ProductionPlanScreen from './src/screens/agriculture/ProductionPlanScreen';
+import BedSamplingScreen from './src/screens/agriculture/BedSamplingScreen';
+import TasksScreen from './src/screens/agriculture/TasksScreen';
+import UprootReplantScreen from './src/screens/agriculture/UprootReplantScreen';
+import SeedlingsScreen from './src/screens/agriculture/SeedlingsScreen';
+import CropCycleViewScreen from './src/screens/agriculture/CropCycleViewScreen';
 import DrawerMenu from './src/components/DrawerContent';
 import UpdatePrompt from './src/components/UpdatePrompt';
 import ChangelogModal from './src/components/ChangelogModal';
@@ -33,16 +43,68 @@ import TutorialModal from './src/components/TutorialModal';
 import { colors, fontFamily, fontSize, spacing } from './src/theme';
 
 const Tab = createBottomTabNavigator();
+const AgricultureStack = createNativeStackNavigator();
+
+function AgricultureNavigator() {
+  return (
+    <AgricultureStack.Navigator
+      screenOptions={{
+        headerStyle: { backgroundColor: colors.surface },
+        headerTintColor: colors.text,
+        headerTitleStyle: { fontFamily: fontFamily.semiBold, fontSize: fontSize.lg },
+        headerShadowVisible: false,
+      }}
+    >
+      <AgricultureStack.Screen
+        name="AgricultureHome"
+        component={AgricultureScreen}
+        options={{ headerShown: false }}
+      />
+      <AgricultureStack.Screen
+        name="ProductionPlan"
+        component={ProductionPlanScreen}
+        options={{ title: 'Production Plan' }}
+      />
+      <AgricultureStack.Screen
+        name="BedSampling"
+        component={BedSamplingScreen}
+        options={{ title: 'Bed Sampling' }}
+      />
+      <AgricultureStack.Screen
+        name="Tasks"
+        component={TasksScreen}
+        options={{ title: 'Tasks' }}
+      />
+      <AgricultureStack.Screen
+        name="UprootReplant"
+        component={UprootReplantScreen}
+        options={{ title: 'Uproot / Replant' }}
+      />
+      <AgricultureStack.Screen
+        name="Seedlings"
+        component={SeedlingsScreen}
+        options={{ title: 'Seedlings' }}
+      />
+      <AgricultureStack.Screen
+        name="CropCycleView"
+        component={CropCycleViewScreen}
+        options={{ title: 'Crop Cycles' }}
+      />
+    </AgricultureStack.Navigator>
+  );
+}
 
 const TAB_ICONS: Record<string, { outline: keyof typeof Ionicons.glyphMap; filled: keyof typeof Ionicons.glyphMap }> = {
   Dashboard: { outline: 'home-outline', filled: 'home' },
   Harvest: { outline: 'leaf-outline', filled: 'leaf' },
   Receive: { outline: 'download-outline', filled: 'download' },
+  Transfer: { outline: 'swap-horizontal-outline', filled: 'swap-horizontal' },
   Shelve: { outline: 'scan-outline', filled: 'scan' },
   Grade: { outline: 'clipboard-outline', filled: 'clipboard' },
   Pack: { outline: 'cube-outline', filled: 'cube' },
   Quality: { outline: 'shield-checkmark-outline', filled: 'shield-checkmark' },
   ActualHarvest: { outline: 'analytics-outline', filled: 'analytics' },
+  Agriculture: { outline: 'flower-outline', filled: 'flower' },
 };
 
 function AppContent() {
@@ -127,13 +189,23 @@ function AppContent() {
         <Tab.Screen name="Dashboard" component={DashboardScreen} options={{ title: 'Dashboard' }} />
         <Tab.Screen name="Harvest" component={HarvestScreen} options={{ title: 'Harvest', tabBarItemStyle: isXflora ? { display: 'none' } : undefined }} />
         <Tab.Screen name="Receive" component={ReceivingScreen} options={{ title: 'Receiving' }} />
+        <Tab.Screen name="Transfer" component={TransferScreen} options={{ tabBarItemStyle: isXflora ? undefined : { display: 'none' }, title: 'Transfer' }} />
         <Tab.Screen name="Shelve" component={ShelveScreen} options={{ title: 'Shelve' }} />
         <Tab.Screen name="Grade" component={GradeScreen} options={{ title: 'Grade' }} />
-        <Tab.Screen name="Pack" component={PackingScreen} options={{ tabBarItemStyle: { display: 'none' }, title: 'Packing' }} />
+        <Tab.Screen name="Pack" component={isXflora ? XfloraPackingScreen : PackingScreen} options={{ tabBarItemStyle: { display: 'none' }, title: 'Packing' }} />
         <Tab.Screen name="Quality" component={QualityScreen} options={{ tabBarItemStyle: { display: 'none' }, title: 'Quality' }} />
         <Tab.Screen name="Map" component={ShelfMapScreen} options={{ tabBarItemStyle: { display: 'none' }, title: 'Shelf Map' }} />
         <Tab.Screen name="Settings" component={SettingsScreen} options={{ tabBarItemStyle: { display: 'none' }, title: 'Settings' }} />
         <Tab.Screen name="ActualHarvest" component={ActualHarvestScreen} options={{ tabBarItemStyle: { display: 'none' }, title: 'Actual Harvest' }} />
+        <Tab.Screen
+          name="Agriculture"
+          component={AgricultureNavigator}
+          options={{
+            tabBarItemStyle: isXflora ? { display: 'none' } : undefined,
+            headerShown: false,
+            title: 'Agriculture',
+          }}
+        />
       </Tab.Navigator>
 
       <DrawerMenu

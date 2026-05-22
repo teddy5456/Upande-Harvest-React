@@ -55,8 +55,24 @@ export default function UpdatePrompt() {
     setError(null);
     try {
       await Updates.fetchUpdateAsync();
-      await Updates.reloadAsync();
-    } catch (e: any) {
+
+      // reloadAsync() restarts the app — it should never return.
+      // If we're still alive after 10 s, something silently failed.
+      const stuckTimer = setTimeout(() => {
+        setDownloading(false);
+        setError('Update downloaded. Close and reopen the app to finish installing.');
+      }, 10_000);
+
+      try {
+        await Updates.reloadAsync();
+        // Should not reach here under normal circumstances
+        clearTimeout(stuckTimer);
+      } catch {
+        clearTimeout(stuckTimer);
+        setDownloading(false);
+        setError('Update downloaded. Close and reopen the app to finish installing.');
+      }
+    } catch {
       setError('Failed to download update. Try again later.');
       setDownloading(false);
     }

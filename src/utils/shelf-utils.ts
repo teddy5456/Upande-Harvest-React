@@ -1,21 +1,27 @@
 import { LEVEL_LABELS } from '../types';
 
+// Shelf IDs follow the pattern {side-letters}{position-digits}{optional-level}.
+// Server side (Shelf doctype) accepts any Data value, so different instances use
+// different conventions: mona uses A/B sides with levels T/M/B (A1T..A100B);
+// xflora uses any row letter, larger position numbers, and either T/M/B or 1/2/3
+// levels (e.g. E1000M, C250T, A51 where 1 is the level). Keep the parser loose
+// enough to cover both while still rejecting non-shelf scans.
 export function parseShelfId(shelfId: string): {
   side: string;
   position: number;
   level: string;
 } | null {
-  if (!shelfId || shelfId.length < 3) return null;
+  if (!shelfId) return null;
+  const trimmed = shelfId.trim().toUpperCase();
+  if (!trimmed) return null;
 
-  const side = shelfId[0].toUpperCase();
-  if (side !== 'A' && side !== 'B') return null;
+  // {letters}{digits}{optional trailing letter or digit as level}
+  const match = trimmed.match(/^([A-Z]+)(\d+)([A-Z0-9]?)$/);
+  if (!match) return null;
 
-  const rest = shelfId.slice(1);
-  const position = parseInt(rest.slice(0, rest.length - 1), 10);
-  const level = rest[rest.length - 1].toUpperCase();
-
-  if (isNaN(position) || position < 1 || position > 99) return null;
-  if (!LEVEL_LABELS[level]) return null;
+  const [, side, posStr, level] = match;
+  const position = parseInt(posStr, 10);
+  if (isNaN(position) || position < 1) return null;
 
   return { side, position, level };
 }
@@ -23,7 +29,9 @@ export function parseShelfId(shelfId: string): {
 export function formatShelfLocation(shelfId: string): string {
   const parsed = parseShelfId(shelfId);
   if (!parsed) return shelfId;
-  return `Side ${parsed.side}  |  Shelf ${parsed.position}  |  ${LEVEL_LABELS[parsed.level]}`;
+  const parts = [`Side ${parsed.side}`, `Shelf ${parsed.position}`];
+  if (parsed.level) parts.push(LEVEL_LABELS[parsed.level] ?? parsed.level);
+  return parts.join('  |  ');
 }
 
 export function generateAllShelfIds(): string[] {

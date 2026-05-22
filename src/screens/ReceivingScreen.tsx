@@ -16,19 +16,17 @@ import { addToSyncQueue } from '../database/sync-queue';
 import { addReceivingEntry } from '../database/receiving';
 import { addQualityEntry } from '../database/quality';
 import { addQuarantineBatch } from '../database/quarantine';
-import { submitReceiving, submitBucketTransfer, submitQualityEntry, createQuarantineBatch } from '../services/api';
+import { submitReceiving, submitQualityEntry, createQuarantineBatch, getBucketBalance } from '../services/api';
 import { parseScannedBucketQR } from '../utils/shelf-utils';
 import { getFarm } from '../database/settings';
 import ScanInput from '../components/ScanInput';
-import SyncBanner from '../components/SyncBanner';
 import ScanConfirmation from '../components/ScanConfirmation';
 import EntriesLog from '../components/EntriesLog';
-import { ReceivingListEntry, RejectLine, QUALITY_REASONS } from '../types';
+import { ReceivingListEntry, RejectLine, QUALITY_REASONS, stripStemLength } from '../types';
 import { onScanSuccess, onScanError } from '../utils/feedback';
 import { colors, fontFamily, fontSize, spacing, borderRadius } from '../theme';
 
 type ReceivingRouteParams = { prefillBucketId?: string };
-type XfloraPhase = 'scan-harvest' | 'scan-coldroom';
 
 const RECEIVING_REJECT_REASONS = QUALITY_REASONS.receiving_reject;
 
@@ -47,14 +45,9 @@ export default function ReceivingScreen() {
     visible: boolean; type: 'success' | 'error'; message: string;
   }>({ visible: false, type: 'success', message: '' });
 
-  // xflora two-phase state
-  const [xfloraPhase, setXfloraPhase] = useState<XfloraPhase>('scan-harvest');
-  const [harvestBucketId, setHarvestBucketId] = useState<string | null>(null);
-  const [harvestDetail, setHarvestDetail] = useState<{ variety?: string; greenhouse?: string; qty?: number } | null>(null);
-
-  // Inline quality check after scan
+  // Inline quality check — appears BEFORE receiving
   const [pendingQuality, setPendingQuality] = useState<{
-    bucketId: string; variety?: string; greenhouse?: string;
+    bucketId: string; variety?: string; greenhouse?: string; qty?: number;
   } | null>(null);
   const [qualityLines, setQualityLines] = useState<RejectLine[]>([]);
   const [qualityNotes, setQualityNotes] = useState('');
@@ -90,46 +83,82 @@ export default function ReceivingScreen() {
     );
   };
 
-  const handleQualitySubmit = async () => {
-    if (!pendingQuality || qualityLines.length === 0) {
-      clearQualityCheck();
-      return;
-    }
-    setSubmittingQuality(true);
+  // Core submit logic — explicit params so it can be called from button OR auto-advance
+  const doReceive = async (
+    bucketId: string,
+    variety: string,
+    gh: string,
+    lines: RejectLine[],
+    notes: string,
+  ) => {
     const farm = await getFarm();
-    const gh = pendingQuality.greenhouse ?? '';
-    const variety = pendingQuality.variety ?? '';
-    const bucketId = pendingQuality.bucketId;
+    const now = new Date().toLocaleTimeString();
 
-    for (const line of qualityLines) {
+    // Step 1: record any rejects
+    for (const line of lines) {
       const payload = {
-        section: 'receiving_reject',
-        ref_id: bucketId,
-        quantity: line.quantity,
-        reason: line.reason,
-        notes: qualityNotes,
-        farm,
-        greenhouse: gh,
-        variety,
-        quarantined: 0,
-        quarantine_action: '',
+        section: 'receiving_reject', ref_id: bucketId, quantity: line.quantity,
+        reason: line.reason, notes, farm, greenhouse: gh, variety,
+        quarantined: 0, quarantine_action: '',
       };
       if (isConnected) {
         try {
-          await submitQualityEntry('receiving_reject', bucketId, line.quantity, line.reason, qualityNotes, farm, gh, variety, false, '');
-          await addQualityEntry('receiving_reject', bucketId, line.quantity, line.reason, qualityNotes, farm, true, gh, variety, false, '');
+          await submitQualityEntry('receiving_reject', bucketId, line.quantity, line.reason, notes, farm, gh, variety, false, '');
+          await addQualityEntry('receiving_reject', bucketId, line.quantity, line.reason, notes, farm, true, gh, variety, false, '');
         } catch {
           await addToSyncQueue('create_quality_entry', payload);
-          await addQualityEntry('receiving_reject', bucketId, line.quantity, line.reason, qualityNotes, farm, false, gh, variety, false, '');
+          await addQualityEntry('receiving_reject', bucketId, line.quantity, line.reason, notes, farm, false, gh, variety, false, '');
         }
       } else {
         await addToSyncQueue('create_quality_entry', payload);
-        await addQualityEntry('receiving_reject', bucketId, line.quantity, line.reason, qualityNotes, farm, false, gh, variety, false, '');
+        await addQualityEntry('receiving_reject', bucketId, line.quantity, line.reason, notes, farm, false, gh, variety, false, '');
       }
     }
 
-    const totalRejects = qualityLines.reduce((s, l) => s + l.quantity, 0);
-    showConfirmation('success', `${totalRejects} reject${totalRejects !== 1 ? 's' : ''} recorded for ${bucketId}`);
+    // Step 2: submit receiving entry
+    const totalRejects = lines.reduce((s, l) => s + l.quantity, 0);
+    if (isConnected) {
+      try {
+        const response = await submitReceiving(bucketId);
+        await addReceivingEntry(bucketId, true);
+        setEntries((prev) => [{
+          bucket_id: bucketId,
+          variety: response.variety ?? variety,
+          greenhouse: response.greenhouse ?? gh,
+          qty: response.qty,
+          time: now,
+          status: 'success',
+          message: totalRejects > 0 ? `${totalRejects} rejected` : 'Synced',
+        }, ...prev]);
+        await refreshStats();
+        showConfirmation('success', totalRejects > 0 ? `Received — ${totalRejects} reject${totalRejects !== 1 ? 's' : ''} logged` : bucketId);
+      } catch (error: any) {
+        await addToSyncQueue('receiving_entry', { bucket_id: bucketId });
+        await addReceivingEntry(bucketId, false);
+        setEntries((prev) => [{ bucket_id: bucketId, time: now, status: 'error', message: error.message }, ...prev]);
+        await refreshStats();
+        showConfirmation('error', error.message);
+      }
+    } else {
+      await addToSyncQueue('receiving_entry', { bucket_id: bucketId });
+      await addReceivingEntry(bucketId, false);
+      setEntries((prev) => [{ bucket_id: bucketId, time: now, status: 'queued', message: 'Saved offline' }, ...prev]);
+      await refreshStats();
+      showConfirmation('success', 'Saved offline');
+    }
+  };
+
+  // Submit rejects (if any) then do the actual receiving — called by submit button
+  const handleQualitySubmit = async () => {
+    if (!pendingQuality) return;
+    setSubmittingQuality(true);
+    await doReceive(
+      pendingQuality.bucketId,
+      pendingQuality.variety ?? '',
+      pendingQuality.greenhouse ?? '',
+      qualityLines,
+      qualityNotes,
+    );
     clearQualityCheck();
     setSubmittingQuality(false);
   };
@@ -140,145 +169,82 @@ export default function ReceivingScreen() {
     setQualityNotes('');
   };
 
-  // ── mona: single scan ──────────────────────────────────────────────────────
+  // ── mona: single scan — fetch bucket info first, show quality panel before receiving ──
   const handleScanMona = useCallback(
     async (data: string) => {
       const bucketId = parseScannedBucketQR(data);
       if (!bucketId) { onScanError(); return; }
-      const now = new Date().toLocaleTimeString();
+      onScanSuccess();
 
+      // Auto-submit the previously pending bucket with no defects
+      if (pendingQuality && pendingQuality.bucketId !== bucketId) {
+        await doReceive(
+          pendingQuality.bucketId,
+          pendingQuality.variety ?? '',
+          pendingQuality.greenhouse ?? '',
+          [],   // no defects assumed
+          '',
+        );
+        setQualityLines([]);
+        setQualityNotes('');
+      }
+
+      // Look up bucket info (variety/greenhouse/qty) from harvest entry pre-receive
+      let variety: string | undefined;
+      let greenhouse: string | undefined;
+      let qty: number | undefined;
       if (isConnected) {
         try {
-          const response = await submitReceiving(bucketId);
-          await addReceivingEntry(bucketId, true);
-          setEntries((prev) => [
-            { bucket_id: bucketId, time: now, status: 'success', message: 'Synced' },
-            ...prev,
-          ]);
-          await refreshStats();
-          onScanSuccess();
-          showConfirmation('success', bucketId);
-          // Trigger quality check with context from response
-          setPendingQuality({ bucketId, variety: response.variety, greenhouse: response.greenhouse });
-          if (batchMode) setBatchBuckets((prev) => prev.includes(bucketId) ? prev : [...prev, bucketId]);
-        } catch (error: any) {
-          await addToSyncQueue('receiving_entry', { bucket_id: bucketId });
-          await addReceivingEntry(bucketId, false);
-          setEntries((prev) => [
-            { bucket_id: bucketId, time: now, status: 'error', message: error.message },
-            ...prev,
-          ]);
-          await refreshStats();
-          onScanError();
-          showConfirmation('error', error.message);
-        }
-      } else {
-        await addToSyncQueue('receiving_entry', { bucket_id: bucketId });
-        await addReceivingEntry(bucketId, false);
-        setEntries((prev) => [
-          { bucket_id: bucketId, time: now, status: 'queued', message: 'Saved offline' },
-          ...prev,
-        ]);
-        await refreshStats();
-        onScanSuccess();
-        showConfirmation('success', 'Saved offline');
-        setPendingQuality({ bucketId });
-        if (batchMode) setBatchBuckets((prev) => prev.includes(bucketId) ? prev : [...prev, bucketId]);
+          const info = await getBucketBalance(bucketId);
+          variety = info.variety;
+          greenhouse = info.greenhouse;
+          qty = info.bucket_total;
+        } catch {}
       }
+      setPendingQuality({ bucketId, variety, greenhouse, qty });
+      if (batchMode) setBatchBuckets((prev) => prev.includes(bucketId) ? prev : [...prev, bucketId]);
     },
-    [isConnected, refreshStats, batchMode]
+    [isConnected, batchMode, pendingQuality, doReceive]
   );
 
-  // ── xflora phase 1 ────────────────────────────────────────────────────────
-  const handleScanHarvest = useCallback(
+  // ── xflora: single-scan receiving (transfer is on its own screen) ────────
+  const handleScanXflora = useCallback(
     async (data: string) => {
       const bucketId = parseScannedBucketQR(data);
       if (!bucketId) { onScanError(); return; }
+      const now = new Date().toLocaleTimeString();
 
       if (isConnected) {
         try {
           const response = await submitReceiving(bucketId);
           await addReceivingEntry(bucketId, true);
-          setHarvestBucketId(bucketId);
-          setHarvestDetail({ variety: response.variety, greenhouse: response.greenhouse, qty: response.qty });
-          setXfloraPhase('scan-coldroom');
+          setEntries((prev) => [{
+            bucket_id: bucketId,
+            variety: response.variety,
+            greenhouse: response.greenhouse,
+            qty: response.qty,
+            time: now,
+            status: 'success',
+            message: 'Received',
+          }, ...prev]);
+          await refreshStats();
           onScanSuccess();
           showConfirmation('success', bucketId);
         } catch (error: any) {
           onScanError();
+          setEntries((prev) => [{ bucket_id: bucketId, time: now, status: 'error', message: error.message }, ...prev]);
           showConfirmation('error', error.message);
         }
       } else {
         await addToSyncQueue('receiving_entry', { bucket_id: bucketId });
         await addReceivingEntry(bucketId, false);
-        setHarvestBucketId(bucketId);
-        setHarvestDetail(null);
-        setXfloraPhase('scan-coldroom');
-        onScanSuccess();
-        showConfirmation('success', 'Saved offline — scan coldroom bucket');
-      }
-    },
-    [isConnected]
-  );
-
-  // ── xflora phase 2 ────────────────────────────────────────────────────────
-  const handleScanColdroom = useCallback(
-    async (data: string) => {
-      const coldroomId = parseScannedBucketQR(data);
-      if (!coldroomId || !harvestBucketId) { onScanError(); return; }
-      const now = new Date().toLocaleTimeString();
-
-      if (isConnected) {
-        try {
-          const response = await submitBucketTransfer(harvestBucketId, coldroomId);
-          setEntries((prev) => [
-            {
-              bucket_id: harvestBucketId,
-              coldroom_bucket_id: coldroomId,
-              variety: response.variety ?? harvestDetail?.variety,
-              greenhouse: response.greenhouse ?? harvestDetail?.greenhouse,
-              qty: harvestDetail?.qty,
-              time: now,
-              status: 'success',
-              message: `→ ${coldroomId}`,
-            },
-            ...prev,
-          ]);
-          await refreshStats();
-          onScanSuccess();
-          showConfirmation('success', coldroomId);
-        } catch (error: any) {
-          await addToSyncQueue('bucket_transfer', {
-            source_bucket_id: harvestBucketId,
-            destination_bucket_id: coldroomId,
-          });
-          setEntries((prev) => [
-            { bucket_id: harvestBucketId, coldroom_bucket_id: coldroomId, time: now, status: 'error', message: error.message },
-            ...prev,
-          ]);
-          await refreshStats();
-          onScanError();
-          showConfirmation('error', error.message);
-        }
-      } else {
-        await addToSyncQueue('bucket_transfer', {
-          source_bucket_id: harvestBucketId,
-          destination_bucket_id: coldroomId,
-        });
-        setEntries((prev) => [
-          { bucket_id: harvestBucketId, coldroom_bucket_id: coldroomId, time: now, status: 'queued', message: 'Saved offline' },
-          ...prev,
-        ]);
+        setEntries((prev) => [{ bucket_id: bucketId, time: now, status: 'queued', message: 'Saved offline' }, ...prev]);
         await refreshStats();
         onScanSuccess();
         showConfirmation('success', 'Saved offline');
       }
-
-      setHarvestBucketId(null);
-      setHarvestDetail(null);
-      setXfloraPhase('scan-harvest');
     },
-    [harvestBucketId, harvestDetail, isConnected, refreshStats]
+    [isConnected, refreshStats]
   );
 
   useEffect(() => { handleScanRef.current = handleScanMona; }, [handleScanMona]);
@@ -328,7 +294,6 @@ export default function ReceivingScreen() {
 
   return (
     <View style={styles.container}>
-      <SyncBanner />
 
       {/* ── Batch mode disclosure ── */}
       <View style={styles.batchDisclosure}>
@@ -405,53 +370,10 @@ export default function ReceivingScreen() {
         ) : null}
 
         {isXflora ? (
-          <>
-            <View style={styles.inputSection}>
-              <View style={styles.stepRow}>
-                <View style={[styles.stepBadge, xfloraPhase === 'scan-coldroom' ? styles.stepDone : styles.stepActive]}>
-                  <Text style={styles.stepNum}>1</Text>
-                </View>
-                <Text style={styles.label}>Scan field bucket</Text>
-              </View>
-
-              {xfloraPhase === 'scan-coldroom' ? (
-                <View style={styles.scannedRow}>
-                  <Ionicons name="checkmark-circle" size={18} color={colors.success} />
-                  <View style={styles.scannedInfo}>
-                    <Text style={styles.scannedId}>{harvestBucketId}</Text>
-                    {harvestDetail?.variety ? (
-                      <Text style={styles.scannedDetail}>
-                        {harvestDetail.variety}
-                        {harvestDetail.greenhouse ? `  ·  ${harvestDetail.greenhouse}` : ''}
-                        {harvestDetail.qty ? `  ·  ${harvestDetail.qty} stems` : ''}
-                      </Text>
-                    ) : null}
-                  </View>
-                  <Text style={styles.rescanLabel} onPress={() => {
-                    setHarvestBucketId(null);
-                    setHarvestDetail(null);
-                    setXfloraPhase('scan-harvest');
-                  }}>
-                    Re-scan
-                  </Text>
-                </View>
-              ) : (
-                <ScanInput placeholder="Field bucket ID" scannerTitle="Scan Field Bucket" onScan={handleScanHarvest} />
-              )}
-            </View>
-
-            {xfloraPhase === 'scan-coldroom' ? (
-              <View style={styles.inputSection}>
-                <View style={styles.stepRow}>
-                  <View style={[styles.stepBadge, styles.stepActive]}>
-                    <Text style={styles.stepNum}>2</Text>
-                  </View>
-                  <Text style={styles.label}>Scan coldroom bucket</Text>
-                </View>
-                <ScanInput placeholder="Coldroom bucket ID" scannerTitle="Scan Coldroom Bucket" onScan={handleScanColdroom} />
-              </View>
-            ) : null}
-          </>
+          <View style={styles.inputSection}>
+            <Text style={styles.label}>Scan field bucket to receive</Text>
+            <ScanInput placeholder="Field bucket ID" scannerTitle="Scan Field Bucket" onScan={handleScanXflora} />
+          </View>
         ) : (
           <View style={styles.inputSection}>
             <Text style={styles.label}>Scan bucket to receive</Text>
@@ -465,10 +387,10 @@ export default function ReceivingScreen() {
             <View style={styles.qualityCardHeader}>
               <Ionicons name="shield-checkmark-outline" size={16} color={colors.warning} />
               <View style={{ flex: 1 }}>
-                <Text style={styles.qualityCardTitle}>Quality Check — {pendingQuality.bucketId}</Text>
-                {(pendingQuality.variety || pendingQuality.greenhouse) ? (
+                <Text style={styles.qualityCardTitle}>Intake Check — {pendingQuality.bucketId}</Text>
+                {(pendingQuality.variety || pendingQuality.greenhouse || pendingQuality.qty) ? (
                   <Text style={styles.qualityCardSub}>
-                    {[pendingQuality.variety, pendingQuality.greenhouse].filter(Boolean).join('  ·  ')}
+                    {[stripStemLength(pendingQuality.variety || ''), pendingQuality.greenhouse, pendingQuality.qty ? `${pendingQuality.qty} stems` : ''].filter(Boolean).join('  ·  ')}
                   </Text>
                 ) : null}
               </View>
@@ -531,8 +453,15 @@ export default function ReceivingScreen() {
             />
 
             <View style={styles.qualityActions}>
-              <TouchableOpacity style={styles.skipBtn} onPress={clearQualityCheck} activeOpacity={0.7}>
-                <Text style={styles.skipBtnText}>No Defects</Text>
+              <TouchableOpacity
+                style={[styles.skipBtn, submittingQuality && styles.recordBtnDisabled]}
+                onPress={handleQualitySubmit}
+                disabled={submittingQuality}
+                activeOpacity={0.7}
+              >
+                <Text style={styles.skipBtnText}>
+                  {submittingQuality ? 'Processing…' : 'Receive (No Rejects)'}
+                </Text>
               </TouchableOpacity>
               <TouchableOpacity
                 style={[styles.recordBtn, (submittingQuality || qualityLines.length === 0) && styles.recordBtnDisabled]}
@@ -540,9 +469,9 @@ export default function ReceivingScreen() {
                 disabled={submittingQuality || qualityLines.length === 0}
                 activeOpacity={0.8}
               >
-                <Ionicons name="save-outline" size={14} color={colors.textOnPrimary} />
+                <Ionicons name="arrow-down-circle-outline" size={14} color={colors.textOnPrimary} />
                 <Text style={styles.recordBtnText}>
-                  {submittingQuality ? 'Saving…' : qualityLines.length > 0 ? `Record ${totalQualityRejects} Reject${totalQualityRejects !== 1 ? 's' : ''}` : 'Record Rejects'}
+                  {submittingQuality ? 'Processing…' : qualityLines.length > 0 ? `Reject ${totalQualityRejects} & Receive` : 'Record & Receive'}
                 </Text>
               </TouchableOpacity>
             </View>
@@ -552,7 +481,7 @@ export default function ReceivingScreen() {
         {entries.length === 0 && !pendingQuality && (
           <Text style={styles.emptyText}>
             {isXflora
-              ? 'Scan field bucket, then scan the coldroom bucket it transfers into'
+              ? 'Scan a field bucket to record receiving (transfer to coldroom is on its own screen)'
               : 'Scan buckets arriving at the packhouse'}
           </Text>
         )}
@@ -580,7 +509,7 @@ export default function ReceivingScreen() {
                 {entry.coldroom_bucket_id ? <Text style={styles.coldroomId}>→ {entry.coldroom_bucket_id}</Text> : null}
                 {(entry.variety || entry.greenhouse) ? (
                   <Text style={styles.entryDetail}>
-                    {[entry.variety, entry.greenhouse, entry.qty ? `${entry.qty} stems` : ''].filter(Boolean).join('  ·  ')}
+                    {[stripStemLength(entry.variety || ''), entry.greenhouse, entry.qty ? `${entry.qty} stems` : ''].filter(Boolean).join('  ·  ')}
                   </Text>
                 ) : null}
                 <Text style={styles.entryTime}>{entry.time}</Text>

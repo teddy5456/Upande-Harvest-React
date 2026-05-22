@@ -14,7 +14,7 @@ import { Ionicons } from '@expo/vector-icons';
 import { getSetting, setSetting } from '../database/settings';
 import { colors, fontFamily, fontSize, spacing, borderRadius, shadow } from '../theme';
 
-const CHANGELOG_VERSION = '1.2';
+const CHANGELOG_VERSION = '1.3';
 const { width: SW } = Dimensions.get('window');
 
 // ─── Changelog entries ────────────────────────────────────────────────────────
@@ -62,6 +62,28 @@ const ENTRIES = [
     title: 'Cleaner Logs',
     body: 'Entry logs now stay out of your way — only errors show by default. Tap "Show all" to see every scan in a session.',
     illustration: 'nav',
+  },
+  {
+    id: 'harvest-ux',
+    bg: '#0D1F12',
+    accent: '#4ADE80',
+    accentSoft: '#14532D',
+    tag: 'Improved',
+    tagColor: '#4ADE80',
+    title: 'Harvest, Faster',
+    body: 'Greenhouse data now loads instantly — even offline. Fields light up red when something is missing instead of showing a popup. Press "Next" after quantity to jump straight to the scan field.',
+    illustration: 'harvest',
+  },
+  {
+    id: 'offline-ux',
+    bg: '#12101E',
+    accent: '#A78BFA',
+    accentSoft: '#1E1B4B',
+    tag: 'Improved',
+    tagColor: '#A78BFA',
+    title: 'Smarter Offline',
+    body: 'The app now detects lost signal almost instantly instead of waiting up to 30 seconds. Entries saved while offline show a cloud icon — not a red error. When back online they sync automatically.',
+    illustration: 'offline',
   },
 ];
 
@@ -211,11 +233,81 @@ function IllustrationNav({ accent, accentSoft }: { accent: string; accentSoft: s
   );
 }
 
+function IllustrationHarvest({ accent, accentSoft }: { accent: string; accentSoft: string }) {
+  return (
+    <View style={il.root}>
+      <View style={[il.blob, { width: 220, height: 220, borderRadius: 110, backgroundColor: accentSoft, top: -10, alignSelf: 'center' }]} />
+
+      {/* Form card */}
+      <View style={[il.card, { width: 180, height: 160, borderColor: accent + '44', gap: 10, paddingVertical: 16, paddingHorizontal: 14 }]}>
+        {/* Field rows — first two normal, third highlighted red (missing) */}
+        {[accent + '33', accent + '33', '#EF444455'].map((bg, i) => (
+          <View key={i} style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+            <View style={{ width: 52, height: 9, borderRadius: 4, backgroundColor: accent + '44' }} />
+            <View style={{ flex: 1, height: 24, borderRadius: 6, backgroundColor: bg, borderWidth: i === 2 ? 1.5 : 0, borderColor: i === 2 ? '#EF4444' : 'transparent' }} />
+          </View>
+        ))}
+        {/* "← required" label on last field */}
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4, marginTop: -4 }}>
+          <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: '#EF4444' }} />
+          <View style={{ width: 70, height: 8, borderRadius: 3, backgroundColor: '#EF444466' }} />
+        </View>
+      </View>
+
+      {/* Green tick badge — "it worked" */}
+      <View style={[il.checkBadge, { backgroundColor: accent, right: SW * 0.14, bottom: 28 }]}>
+        <Ionicons name="checkmark" size={18} color="#fff" />
+      </View>
+    </View>
+  );
+}
+
+function IllustrationOffline({ accent, accentSoft }: { accent: string; accentSoft: string }) {
+  return (
+    <View style={il.root}>
+      <View style={[il.blob, { width: 220, height: 220, borderRadius: 110, backgroundColor: accentSoft, top: -10, alignSelf: 'center' }]} />
+
+      {/* Cloud upload icon — central hero */}
+      <View style={[il.centerIcon, { backgroundColor: accent, width: 88, height: 88, borderRadius: 44 }]}>
+        <Ionicons name="cloud-upload-outline" size={42} color="#fff" />
+      </View>
+
+      {/* "Saved for sync" pill */}
+      <View style={[il.pill, { backgroundColor: accentSoft, borderColor: accent + '66', bottom: 52 }]}>
+        <Ionicons name="time-outline" size={12} color={accent} />
+        <Text style={[il.pillText, { color: accent }]}>Saved for sync</Text>
+      </View>
+
+      {/* Two entry rows suggesting a queue */}
+      {[0, 1].map((i) => (
+        <View key={i} style={{
+          position: 'absolute',
+          bottom: 14 + i * 28,
+          left: SW * 0.06,
+          right: SW * 0.06,
+          height: 20,
+          borderRadius: 6,
+          backgroundColor: accent + (i === 0 ? '22' : '11'),
+          flexDirection: 'row',
+          alignItems: 'center',
+          paddingHorizontal: 8,
+          gap: 6,
+        }}>
+          <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: accent + (i === 0 ? 'CC' : '66') }} />
+          <View style={{ flex: 1, height: 6, borderRadius: 3, backgroundColor: accent + (i === 0 ? '55' : '33') }} />
+        </View>
+      ))}
+    </View>
+  );
+}
+
 const ILLUSTRATIONS: Record<string, React.ComponentType<any>> = {
   qr: IllustrationQR,
   action: IllustrationAction,
   update: IllustrationUpdate,
   nav: IllustrationNav,
+  harvest: IllustrationHarvest,
+  offline: IllustrationOffline,
 };
 
 // ─── Main component ────────────────────────────────────────────────────────────
@@ -306,7 +398,11 @@ export default function ChangelogModal({ forceVisible = false, onClose }: Change
             </View>
 
             <Text style={styles.title}>{entry.title}</Text>
-            <Text style={styles.body}>{entry.body}</Text>
+            {/* Body wrapped in flex:1 View so the Text always renders
+                regardless of how the sheet height resolves */}
+            <View style={{ flex: 1, justifyContent: 'flex-start', paddingTop: spacing.xs }}>
+              <Text style={styles.body}>{entry.body}</Text>
+            </View>
 
             {/* Dots */}
             <View style={styles.dots}>
@@ -574,9 +670,8 @@ const styles = StyleSheet.create({
   body: {
     fontFamily: fontFamily.regular,
     fontSize: fontSize.sm,
-    color: '#ffffffaa',
-    lineHeight: 20,
-    flex: 1,
+    color: '#ffffffcc',
+    lineHeight: 22,
   },
   dots: {
     flexDirection: 'row',

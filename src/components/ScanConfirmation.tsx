@@ -5,7 +5,8 @@ import { colors, fontFamily, fontSize, spacing } from '../theme';
 
 interface ScanConfirmationProps {
   visible: boolean;
-  type: 'success' | 'error';
+  /** success = green tick · error = red alert · queued = amber cloud (saved offline) */
+  type: 'success' | 'error' | 'queued';
   message?: string;
   onDismiss: () => void;
 }
@@ -13,8 +14,9 @@ interface ScanConfirmationProps {
 const DISPLAY_MS = 1200;
 
 const ICON_MAP = {
-  success: { name: 'checkmark-circle' as const, color: colors.success },
-  error: { name: 'alert-circle' as const, color: colors.error },
+  success: { name: 'checkmark-circle'   as const, color: colors.success },
+  error:   { name: 'alert-circle'       as const, color: colors.error   },
+  queued:  { name: 'cloud-upload-outline' as const, color: colors.warning },
 };
 
 export default function ScanConfirmation({ visible, type, message, onDismiss }: ScanConfirmationProps) {

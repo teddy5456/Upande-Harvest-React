@@ -159,6 +159,28 @@ async function runMigrations(database: SQLite.SQLiteDatabase): Promise<void> {
     }
   }
 
+  // Migration: add packing box / item columns for OPL-driven pack flow
+  const packingMigrations = [
+    `ALTER TABLE packing_boxes ADD COLUMN opl TEXT`,
+    `ALTER TABLE packing_boxes ADD COLUMN sales_order TEXT`,
+    `ALTER TABLE packing_boxes ADD COLUMN customer TEXT`,
+    `ALTER TABLE packing_boxes ADD COLUMN pack_rate INTEGER`,
+    `ALTER TABLE packing_boxes ADD COLUMN status TEXT`,
+    `ALTER TABLE packing_boxes ADD COLUMN box_sequence INTEGER`,
+    `ALTER TABLE packing_boxes ADD COLUMN total_boxes INTEGER`,
+    `ALTER TABLE packing_box_items ADD COLUMN stems INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE packing_box_items ADD COLUMN variety TEXT NOT NULL DEFAULT ''`,
+    `ALTER TABLE packing_box_items ADD COLUMN stem_length TEXT NOT NULL DEFAULT ''`,
+    `ALTER TABLE packing_box_items ADD COLUMN bunch_size TEXT NOT NULL DEFAULT ''`,
+  ];
+  for (const sql of packingMigrations) {
+    try {
+      await database.execAsync(sql);
+    } catch {
+      // Column already exists — safe to ignore
+    }
+  }
+
   // Migration: actual harvest entries table
   await database.execAsync(`
     CREATE TABLE IF NOT EXISTS actual_harvest_entries (

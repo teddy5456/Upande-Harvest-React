@@ -1,7 +1,7 @@
 import React from 'react';
 import { View, Text, StyleSheet } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
-import { GradedEntry } from '../types';
+import { GradedEntry, stripStemLength } from '../types';
 import { colors, fontFamily, fontSize, spacing } from '../theme';
 
 interface GradingEntryProps {
@@ -33,7 +33,7 @@ export default function GradingEntry({ entry, index }: GradingEntryProps) {
         <Text style={styles.bunchId}>{entry.bunch_id}</Text>
         <View style={styles.details}>
           {entry.variety ? (
-            <Text style={styles.detailText}>{entry.variety}</Text>
+            <Text style={styles.detailText}>{stripStemLength(entry.variety)}</Text>
           ) : null}
           {entry.qty > 0 ? (
             <Text style={styles.detailText}>{entry.qty} stems</Text>

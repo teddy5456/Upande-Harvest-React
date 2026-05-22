@@ -14,11 +14,10 @@ import { useApp } from '../context/AppContext';
 import { getFarm } from '../database/settings';
 import { addActualHarvest, getTodayActualHarvest } from '../database/actual_harvest';
 import { submitActualHarvest } from '../services/api';
-import SyncBanner from '../components/SyncBanner';
 import Dropdown, { DropdownOption } from '../components/Dropdown';
 import { getCachedGreenhouses } from '../utils/greenhouse-cache';
 import { colors, fontFamily, fontSize, spacing, borderRadius, shadow } from '../theme';
-import { Greenhouse } from '../types';
+import { Greenhouse, stripStemLength, extractStemLength, resolveVarietyToItemCode } from '../types';
 
 function todayISODate(): string {
   const now = new Date();
@@ -92,12 +91,22 @@ export default function ActualHarvestScreen() {
   }));
 
   const selectedGH = greenhouses.find((gh) => gh.name === greenhouse);
-  const varietyOptions: DropdownOption[] = selectedGH
-    ? (selectedGH.custom_varieties_grown ?? []).map((v) => ({
-        label: v.variety,
-        value: v.variety,
-      }))
-    : [];
+  // Actual-harvest tracks 50cm stock only — show one entry per base variety,
+  // stripped for display, resolved to "{base} 50cm" as the stored value.
+  const varietyOptions: DropdownOption[] = (() => {
+    if (!selectedGH) return [];
+    const seen = new Set<string>();
+    const options: DropdownOption[] = [];
+    for (const v of selectedGH.custom_varieties_grown ?? []) {
+      const len = extractStemLength(v.variety);
+      if (len && len !== '50cm') continue;
+      const base = stripStemLength(v.variety);
+      if (!base || seen.has(base.toLowerCase())) continue;
+      seen.add(base.toLowerCase());
+      options.push({ label: base, value: resolveVarietyToItemCode(base) });
+    }
+    return options.sort((a, b) => a.label.localeCompare(b.label));
+  })();
 
   const handleGreenhouseSelect = (val: string) => {
     setGreenhouse(val);
@@ -164,7 +173,6 @@ export default function ActualHarvestScreen() {
 
   return (
     <View style={styles.container}>
-      <SyncBanner />
       <ScrollView
         style={styles.scroll}
         contentContainerStyle={styles.content}
@@ -354,7 +362,7 @@ export default function ActualHarvestScreen() {
               <View key={i} style={styles.entryRow}>
                 <View style={styles.entryLeft}>
                   <Text style={styles.entryGH} numberOfLines={1}>{entry.greenhouse}</Text>
-                  <Text style={styles.entryVariety} numberOfLines={1}>{entry.variety}</Text>
+                  <Text style={styles.entryVariety} numberOfLines={1}>{stripStemLength(entry.variety)}</Text>
                 </View>
                 <View style={styles.entryRight}>
                   <Text style={styles.entryQty}>{entry.quantity.toLocaleString()}</Text>

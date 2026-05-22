@@ -1,4 +1,4 @@
-import React, { useRef, useEffect, useCallback, useState } from 'react';
+import React, { useRef, useEffect, useCallback, useState, forwardRef, useImperativeHandle } from 'react';
 import {
   View,
   TextInput,
@@ -17,16 +17,24 @@ interface ScanInputProps {
   onScan: (data: string) => void;
   autoFocus?: boolean;
   disabled?: boolean;
+  keepFocused?: boolean;
 }
 
-export default function ScanInput({
-  placeholder,
-  scannerTitle,
-  onScan,
-  autoFocus = true,
-  disabled = false,
-}: ScanInputProps) {
+/** Ref handle — lets parent screens call scanInputRef.current?.focus() */
+export interface ScanInputHandle {
+  focus: () => void;
+}
+
+const ScanInput = forwardRef<ScanInputHandle, ScanInputProps>(function ScanInput(
+  { placeholder, scannerTitle, onScan, autoFocus = true, disabled = false, keepFocused = false },
+  ref
+) {
   const inputRef = useRef<TextInput>(null);
+
+  // Expose focus() so parent can chain keyboard focus from the quantity field
+  useImperativeHandle(ref, () => ({
+    focus: () => { inputRef.current?.focus(); },
+  }));
   const [value, setValue] = useState('');
   const [cameraOpen, setCameraOpen] = useState(false);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -91,6 +99,7 @@ export default function ScanInput({
           value={value}
           onChangeText={handleChangeText}
           onSubmitEditing={handleSubmit}
+          onBlur={() => { if (keepFocused && !disabled) setTimeout(() => inputRef.current?.focus(), 100); }}
           placeholder={placeholder}
           placeholderTextColor={colors.textMuted}
           autoCapitalize="none"
@@ -119,7 +128,9 @@ export default function ScanInput({
       />
     </>
   );
-}
+});
+
+export default ScanInput;
 
 const styles = StyleSheet.create({
   container: {

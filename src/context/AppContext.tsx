@@ -6,6 +6,7 @@ import { syncPendingEntries, SyncResult } from '../services/sync';
 import { useNetworkStatus } from '../hooks/useNetworkStatus';
 import { getDatabase } from '../database/database';
 import { getSid, getApiUrl, clearAuth as clearAuthStorage, getFullName as getStoredFullName, getUserEmail as getStoredUserEmail, getUserRoles as getStoredUserRoles } from '../database/settings';
+import { registerAuthFailureHandler } from '../services/api';
 import { preloadSounds, unloadSounds } from '../utils/feedback';
 import { clearFarmCache } from '../utils/farm-cache';
 
@@ -32,7 +33,7 @@ interface AppContextType {
   lastSyncResult: SyncResult | null;
   logs: SyncLog[];
   refreshStats: () => Promise<void>;
-  triggerSync: () => Promise<void>;
+  triggerSync: (onProgress?: (done: number, total: number) => void) => Promise<void>;
   retryConnection: () => Promise<void>;
   pushLog: (type: SyncLog['type'], message: string) => void;
   setLoggedIn: (value: boolean) => void;
@@ -149,12 +150,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     } catch {}
   }, []);
 
-  const triggerSync = useCallback(async () => {
+  const triggerSync = useCallback(async (onProgress?: (done: number, total: number) => void) => {
     if (syncInProgress.current) return;
     syncInProgress.current = true;
     setIsSyncing(true);
     try {
-      const result = await syncPendingEntries();
+      const result = await syncPendingEntries(onProgress);
       setLastSyncResult(result);
       if (result.synced > 0) {
         pushLog('success', `Synced ${result.synced} entr${result.synced === 1 ? 'y' : 'ies'}`);
@@ -187,6 +188,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     if (isReady && isLoggedIn) refreshStats();
   }, [isReady, isLoggedIn, refreshStats]);
+
+  // Wire up the API layer so any 401 response triggers an automatic logout.
+  // This handles server URL migrations where the stored session is no longer
+  // valid on the new instance.
+  useEffect(() => {
+    registerAuthFailureHandler(() => logout());
+  }, [logout]);
 
   // Auto-sync when connectivity returns
   useEffect(() => {

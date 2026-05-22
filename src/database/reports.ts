@@ -60,6 +60,47 @@ export async function getHarvestByGreenhouse(): Promise<
   return rows ?? [];
 }
 
+// Stems received today, grouped by the greenhouse the bucket came from.
+// receiving_entries doesn't carry a greenhouse, so we join harvest_entries on
+// bucket_id to recover that. A bucket with no matching harvest row (e.g. only
+// the receive happened on this device) is dropped — we can't attribute it.
+export async function getReceivedByGreenhouse(): Promise<{ greenhouse: string; stems: number }[]> {
+  const db = await getDatabase();
+  const rows = await db.getAllAsync<{ greenhouse: string; stems: number }>(
+    `SELECT
+       h.greenhouse,
+       COALESCE(SUM(h.quantity), 0) as stems
+     FROM receiving_entries r
+     JOIN harvest_entries h ON h.bucket_id = r.bucket_id
+     WHERE date(r.date_added) = date('now')
+       AND h.greenhouse != ''
+     GROUP BY h.greenhouse
+     ORDER BY stems DESC`
+  );
+  return rows ?? [];
+}
+
+// Per-greenhouse variety breakdown for today's harvest. Used to populate the
+// dropdown next to each greenhouse row on the dashboard.
+export async function getHarvestVarietiesByGreenhouse(): Promise<
+  { greenhouse: string; variety: string; stems: number }[]
+> {
+  const db = await getDatabase();
+  const rows = await db.getAllAsync<{ greenhouse: string; variety: string; stems: number }>(
+    `SELECT
+       greenhouse,
+       item_code as variety,
+       COALESCE(SUM(quantity), 0) as stems
+     FROM harvest_entries
+     WHERE date(date_added) = date('now')
+       AND greenhouse != ''
+       AND item_code != ''
+     GROUP BY greenhouse, item_code
+     ORDER BY greenhouse, stems DESC`
+  );
+  return rows ?? [];
+}
+
 export async function getRejectsByGreenhouse(): Promise<{ greenhouse: string; total: number }[]> {
   const db = await getDatabase();
   const rows = await db.getAllAsync<{ greenhouse: string; total: number }>(
@@ -84,6 +125,48 @@ export async function getTodayHarvestStemsByHarvester(harvester: string): Promis
     [harvester]
   );
   return result?.total ?? 0;
+}
+
+// ── Personal harvester stats (today) ─────────────────────────────────────────
+// Pulled straight from the local SQLite — instant, offline-capable, no
+// dashboard-blocking server call.
+export async function getMyHarvestByGreenhouse(
+  harvester: string
+): Promise<{ greenhouse: string; stems: number }[]> {
+  const db = await getDatabase();
+  const rows = await db.getAllAsync<{ greenhouse: string; stems: number }>(
+    `SELECT
+       greenhouse,
+       COALESCE(SUM(quantity), 0) AS stems
+     FROM harvest_entries
+     WHERE date(date_added) = date('now')
+       AND harvester = ?
+       AND greenhouse != ''
+     GROUP BY greenhouse
+     ORDER BY stems DESC`,
+    [harvester]
+  );
+  return rows ?? [];
+}
+
+// Variety with the stem-length suffix preserved (e.g. "Andina 50cm").
+export async function getMyHarvestByVariety(
+  harvester: string
+): Promise<{ variety: string; stems: number }[]> {
+  const db = await getDatabase();
+  const rows = await db.getAllAsync<{ variety: string; stems: number }>(
+    `SELECT
+       item_code AS variety,
+       COALESCE(SUM(quantity), 0) AS stems
+     FROM harvest_entries
+     WHERE date(date_added) = date('now')
+       AND harvester = ?
+       AND item_code != ''
+     GROUP BY item_code
+     ORDER BY stems DESC`,
+    [harvester]
+  );
+  return rows ?? [];
 }
 
 export async function getTodayGradingBunches(): Promise<number> {

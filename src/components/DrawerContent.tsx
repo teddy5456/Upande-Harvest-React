@@ -20,6 +20,7 @@ const NAV_ITEMS = [
   { label: 'Dashboard', icon: 'home-outline' as const, tab: 'Dashboard' },
   { label: 'Harvest', icon: 'leaf-outline' as const, tab: 'Harvest' },
   { label: 'Receiving', icon: 'download-outline' as const, tab: 'Receive' },
+  { label: 'Transfer', icon: 'swap-horizontal-outline' as const, tab: 'Transfer', xfloraOnly: true },
   { label: 'Shelve', icon: 'scan-outline' as const, tab: 'Shelve' },
   { label: 'Grade', icon: 'clipboard-outline' as const, tab: 'Grade' },
   { label: 'Packing', icon: 'cube-outline' as const, tab: 'Pack' },
@@ -126,7 +127,10 @@ export default function DrawerMenu({ visible, onClose, onNavigate, onWhatsNew, o
 
             {/* Nav items */}
             <View style={styles.nav}>
-              {NAV_ITEMS.filter(item => !(isXflora && item.tab === 'Harvest')).map((item) => (
+              {NAV_ITEMS
+                .filter(item => !(isXflora && item.tab === 'Harvest'))
+                .filter(item => !(item.xfloraOnly && !isXflora))
+                .map((item) => (
                 <TouchableOpacity
                   key={item.tab}
                   style={styles.navItem}

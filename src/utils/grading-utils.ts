@@ -68,12 +68,19 @@ export function detectGradingQRType(data: string): GradingQRType {
 export function extractGradingQRValue(data: string): string {
   try {
     const parsed = JSON.parse(data);
-    return (
-      parsed.bunch_id ?? parsed.bunch ??
-      parsed.grader ?? parsed.employee ??
-      parsed.bucket_id ?? parsed.bucket ??
-      parsed.id ?? data.trim()
-    );
+    // Bunch
+    if (parsed.bunch_id !== undefined || parsed.bunch !== undefined) {
+      return parsed.bunch_id ?? parsed.bunch ?? data.trim();
+    }
+    // Grader — prefer employee/payroll ID over display name
+    if (parsed.employee !== undefined || parsed.grader !== undefined || parsed.employee_id !== undefined) {
+      return parsed.employee_id ?? parsed.employee ?? parsed.grader ?? data.trim();
+    }
+    // Bucket
+    if (parsed.bucket_id !== undefined || parsed.bucket !== undefined) {
+      return parsed.bucket_id ?? parsed.bucket ?? data.trim();
+    }
+    return parsed.id ?? data.trim();
   } catch {
     return data.trim();
   }
