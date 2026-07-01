@@ -31,6 +31,8 @@ export function parseScannedGradingBucketQR(data: string): string | null {
     const parsed = JSON.parse(data);
     if (parsed.bucket_id) return parsed.bucket_id;
     if (parsed.bucket) return parsed.bucket;
+    // STG-* long-storage labels: the server resolves them to source_bucket.
+    if (parsed.box_id) return parsed.box_id;
     if (parsed.id) return parsed.id;
   } catch {
     // Not JSON — treat as raw bucket ID
@@ -51,13 +53,15 @@ export function detectGradingQRType(data: string): GradingQRType {
     const parsed = JSON.parse(data);
     if (parsed.bunch_id || parsed.bunch) return 'bunch';
     if (parsed.grader || parsed.employee) return 'grader';
-    if (parsed.bucket_id || parsed.bucket) return 'bucket';
+    // STG long-storage labels route to the bucket slot — server resolves
+    // to the bound source_bucket.
+    if (parsed.bucket_id || parsed.bucket || parsed.box_id) return 'bucket';
   } catch {
     // Raw string — check common prefixes
     const upper = data.trim().toUpperCase();
     if (upper.startsWith('BN-') || upper.startsWith('BUNCH-')) return 'bunch';
     if (upper.startsWith('GR-') || upper.startsWith('EMP-') || upper.startsWith('GRADER-')) return 'grader';
-    if (upper.startsWith('BK-') || upper.startsWith('BUCKET-')) return 'bucket';
+    if (upper.startsWith('BK-') || upper.startsWith('BUCKET-') || upper.startsWith('STG-')) return 'bucket';
   }
   return 'unknown';
 }

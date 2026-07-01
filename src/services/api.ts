@@ -16,7 +16,12 @@ import {
   CreateBoxesForOplResponse,
   AddBunchResponse,
   OpenBoxResponse,
+  ListOpenOplsResponse,
+  PackBunchToOplResponse,
   PackableVarietiesResponse,
+  StorageBoxSealResponse,
+  LongStorageData,
+  ScanResolveResponse,
   BouquetRecipe,
   BouquetSubmissionPayload,
   BouquetSubmissionResponse,
@@ -28,6 +33,9 @@ import {
   ProductionPlanTask,
   ActualHarvestRecord,
   BedSamplingPayload,
+  DiscardColdstore,
+  DiscardRequestSummary,
+  DiscardConsumeResponse,
   BedSamplingListEntry,
   ProductionTaskRow,
   CropCycleSummary,
@@ -38,7 +46,32 @@ import {
   SeedlingDispatchPayload,
   PropagationBatchSummary,
 } from '../types';
-import { getApiUrl, getSid, getCsrfToken } from '../database/settings';
+import { getApiUrl, getSid, getCsrfToken, setSid, setCsrfToken } from '../database/settings';
+import { cachedCredentials } from './auth';
+
+// ── Diagnostics ring buffer ─────────────────────────────────────────────────
+// Records the last N API calls for the Support modal. Tamper-proof: lives in
+// process memory, not user-editable.
+
+export interface ApiCallTrace {
+  ts: string;
+  method: string;
+  status: number;
+  durationMs: number;
+  error?: string;
+}
+
+const TRACE_CAP = 15;
+const apiTraces: ApiCallTrace[] = [];
+
+function pushTrace(trace: ApiCallTrace) {
+  apiTraces.push(trace);
+  if (apiTraces.length > TRACE_CAP) apiTraces.shift();
+}
+
+export function getApiTraces(): ApiCallTrace[] {
+  return apiTraces.slice();
+}
 import { notifyNetworkError, notifyNetworkSuccess } from '../hooks/useNetworkStatus';
 
 // Module-level bridge — AppContext registers a logout callback here so that
@@ -88,7 +121,7 @@ function extractFrappeError(body: any): string {
   return '';
 }
 
-async function apiPost<T>(endpoint: string, payload: object): Promise<T> {
+async function apiPost<T>(endpoint: string, payload: object, _retry = false): Promise<T> {
   let baseUrl = await getApiUrl();
   if (!baseUrl) throw new Error('Server URL not configured — go to Settings');
 
@@ -114,6 +147,7 @@ async function apiPost<T>(endpoint: string, payload: object): Promise<T> {
     headers['X-Frappe-CSRF-Token'] = csrfToken;
   }
 
+  const startedAt = Date.now();
   let res: Response;
   try {
     res = await fetch(url, {
@@ -131,24 +165,94 @@ async function apiPost<T>(endpoint: string, payload: object): Promise<T> {
     // After 2 consecutive failures the app switches to offline mode without
     // waiting for the next poll, even if Android still reports isConnected=true.
     notifyNetworkError();
+    pushTrace({
+      ts: new Date().toISOString(),
+      method: endpoint,
+      status: 0,
+      durationMs: Date.now() - startedAt,
+      error: err?.message || 'network failure',
+    });
     throw err;
   }
 
   const body = await res.json().catch(() => ({}));
 
   // 401 means the session has expired or the server changed and the stored sid
-  // is no longer valid. Trigger auto-logout so the user lands on the login screen
-  // rather than seeing silent failures on every screen.
+  // is no longer valid. Try a silent re-login using stored credentials before
+  // giving up — the user should not see a sign-in screen mid-shift.
   if (res.status === 401) {
+    if (!_retry) {
+      const reloggedIn = await trySilentRelogin();
+      if (reloggedIn) {
+        pushTrace({
+          ts: new Date().toISOString(),
+          method: endpoint,
+          status: 401,
+          durationMs: Date.now() - startedAt,
+          error: 'session expired → silently re-logged in, retrying',
+        });
+        return apiPost<T>(endpoint, payload, true);
+      }
+    }
+    pushTrace({
+      ts: new Date().toISOString(),
+      method: endpoint,
+      status: 401,
+      durationMs: Date.now() - startedAt,
+      error: 'session expired (silent re-login failed)',
+    });
     _onAuthFailure?.();
     throw new Error('Session expired — please log in again');
   }
+
+  pushTrace({
+    ts: new Date().toISOString(),
+    method: endpoint,
+    status: res.status,
+    durationMs: Date.now() - startedAt,
+    error: res.ok ? undefined : extractFrappeError(body) || `HTTP ${res.status}`,
+  });
 
   if (!res.ok) {
     throw new Error(extractFrappeError(body) || `Request failed: ${res.status}`);
   }
 
   return body as T;
+}
+
+/**
+ * Silent re-login: when a 401 lands mid-session, see if we have cached
+ * credentials in memory (set on the last successful biometric unlock) and
+ * call /api/method/login again to refresh the SID + CSRF.
+ *
+ * Returns true on success — the caller then retries the original request.
+ * Never prompts the user. If no cached creds (or the call fails), returns
+ * false and the caller surfaces the original 401 to the auth-failure handler.
+ *
+ * Guarded against concurrent calls: if a 401 storm hits, only one re-login
+ * attempt runs at a time, the rest await its outcome.
+ */
+let _reloginInFlight: Promise<boolean> | null = null;
+
+async function trySilentRelogin(): Promise<boolean> {
+  if (_reloginInFlight) return _reloginInFlight;
+
+  _reloginInFlight = (async () => {
+    try {
+      const creds = cachedCredentials();
+      if (!creds) return false;
+      const resp = await loginToServer(creds.serverUrl, creds.email, creds.password);
+      await setSid(resp.sid);
+      if (resp.csrf_token) await setCsrfToken(resp.csrf_token);
+      return true;
+    } catch {
+      return false;
+    } finally {
+      // Clear after a tick so concurrent calls awaiting this promise see the result
+      setTimeout(() => { _reloginInFlight = null; }, 0);
+    }
+  })();
+  return _reloginInFlight;
 }
 
 export async function loginToServer(
@@ -246,6 +350,50 @@ export async function submitShelve(
   });
 }
 
+// ── Shelf Transfer (mobile ShelveScreen → Transfer tab) ────────────────────
+// Moves a bucket between two physical shelves without touching stock; the
+// server preserves variety/stem_length/qty/greenhouse/warehouse/date_added.
+
+export interface BucketShelfLookup {
+  bucket_id: string;
+  shelf_id: string | null;
+  variety?: string | null;
+  stem_qty?: number;
+}
+
+export interface ShelfTransferResponse {
+  status: 'ok' | 'noop';
+  bucket_id: string;
+  from_shelf: string | null;
+  to_shelf: string;
+  variety?: string | null;
+  stem_qty?: number;
+  message?: string;
+}
+
+export async function getBucketCurrentShelf(bucketId: string): Promise<BucketShelfLookup> {
+  const res = await apiPost<any>('upande_harvest.api.get_bucket_current_shelf', { bucket_id: bucketId });
+  const m: any = (res as any).message ?? res;
+  return {
+    bucket_id: m?.bucket_id ?? bucketId,
+    shelf_id:  m?.shelf_id ?? null,
+    variety:   m?.variety ?? null,
+    stem_qty:  Number(m?.stem_qty ?? 0),
+  };
+}
+
+export async function transferBucketBetweenShelves(
+  bucketId: string,
+  toShelf: string,
+): Promise<ShelfTransferResponse> {
+  const res = await apiPost<any>('upande_harvest.api.transfer_bucket_between_shelves', {
+    bucket_id: bucketId,
+    to_shelf:  toShelf,
+  });
+  const m: any = (res as any).message ?? res;
+  return m as ShelfTransferResponse;
+}
+
 export async function submitGrading(
   gradingData: {
     bunch_id: string;
@@ -260,7 +408,9 @@ export async function submitGrading(
     posting_time?: string;
   }
 ): Promise<GradingResponse> {
-  return apiPost<GradingResponse>('mobile_grading_entry', gradingData);
+  return serializedByKey('grading', () =>
+    apiPost<GradingResponse>('mobile_grading_entry', gradingData)
+  );
 }
 
 // Reads bunch_size and stem_length straight off the Bunch QR Code record
@@ -284,6 +434,29 @@ export async function getBunchInfo(
   };
 }
 
+// ── Per-key serialization for scan-driven submissions ──────────────────────
+// Slow networks + rapid scanning can let request N+1 land at the server
+// before request N's ACK arrives. For Stock-Entry writes (harvest, receiving,
+// grading) that can corrupt bucket state. We serialize by key — same-key
+// calls queue and run one at a time, so the next scan only fires after the
+// previous one has been acknowledged (or failed). Different keys run in
+// parallel as before.
+const __inflight = new Map<string, Promise<unknown>>();
+
+async function serializedByKey<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const prev = __inflight.get(key);
+  if (prev) {
+    try { await prev; } catch { /* swallow — we still want to try our own call */ }
+  }
+  const cur = fn();
+  __inflight.set(key, cur);
+  try {
+    return await cur;
+  } finally {
+    if (__inflight.get(key) === cur) __inflight.delete(key);
+  }
+}
+
 export async function submitHarvest(
   itemCode: string,
   quantity: number,
@@ -295,17 +468,22 @@ export async function submitHarvest(
   postingDate?: string,
   postingTime?: string
 ): Promise<HarvestResponse> {
-  return apiPost<HarvestResponse>('createHarvestEntry', {
-    item_code: itemCode,
-    quantity,
-    section,
-    harvester,
-    bucket_id: bucketId,
-    farm,
-    greenhouse,
-    ...(postingDate && { posting_date: postingDate }),
-    ...(postingTime && { posting_time: postingTime }),
-  });
+  // Serialize all harvest submissions: each scan waits for the previous
+  // ACK before the next goes out. Prevents reorder-on-slow-network without
+  // surfacing concurrency to the screen.
+  return serializedByKey('harvest', () =>
+    apiPost<HarvestResponse>('createHarvestEntry', {
+      item_code: itemCode,
+      quantity,
+      section,
+      harvester,
+      bucket_id: bucketId,
+      farm,
+      greenhouse,
+      ...(postingDate && { posting_date: postingDate }),
+      ...(postingTime && { posting_time: postingTime }),
+    })
+  );
 }
 
 export async function submitReceiving(
@@ -313,11 +491,22 @@ export async function submitReceiving(
   postingDate?: string,
   postingTime?: string
 ): Promise<ReceivingResponse> {
-  return apiPost<ReceivingResponse>('receiving_entry', {
-    bucket_id: bucketId,
-    ...(postingDate && { posting_date: postingDate }),
-    ...(postingTime && { posting_time: postingTime }),
-  });
+  return serializedByKey('receiving', () =>
+    apiPost<ReceivingResponse>('receiving_entry', {
+      bucket_id: bucketId,
+      ...(postingDate && { posting_date: postingDate }),
+      ...(postingTime && { posting_time: postingTime }),
+    })
+  );
+}
+
+export async function cancelHarvestEntry(stockEntry: string): Promise<{
+  stock_entry: string;
+  bucket_id?: string;
+  bucket_status?: string;
+  message: string;
+}> {
+  return apiPost('cancel_harvest_entry', { stock_entry: stockEntry });
 }
 
 export async function submitBucketTransfer(
@@ -359,8 +548,112 @@ export async function getOpenBoxForOpl(opl: string): Promise<OpenBoxResponse> {
   return apiPost<OpenBoxResponse>('get_open_box_for_opl', { opl });
 }
 
+export async function listOpenOplsForPacking(params?: {
+  from_date?: string;
+  to_date?: string;
+}): Promise<ListOpenOplsResponse> {
+  return apiPost<ListOpenOplsResponse>('list_open_opls_for_packing', params || {});
+}
+
+export async function packBunchToOpl(params: {
+  opl: string;
+  bunch_id: string;
+}): Promise<PackBunchToOplResponse> {
+  return apiPost<PackBunchToOplResponse>('pack_bunch_to_opl', params);
+}
+
 export async function fetchPackableVarieties(): Promise<PackableVarietiesResponse> {
   return apiPost<PackableVarietiesResponse>('get_packable_varieties', {});
+}
+
+// ── Long Storage ────────────────────────────────────────────────────────────
+export async function scanBucketIntoStorageBox(params: {
+  box_id: string;
+  bucket_id: string;
+  farm?: string;
+  warehouse?: string;
+}): Promise<StorageBoxSealResponse> {
+  return apiPost<StorageBoxSealResponse>('scan_bucket_into_storage_box', params);
+}
+
+export async function getLongStorageData(farm?: string): Promise<LongStorageData> {
+  return apiPost<LongStorageData>('get_long_storage_data', farm ? { farm } : {});
+}
+
+export async function resolveScanSource(scan: string): Promise<ScanResolveResponse> {
+  return apiPost<ScanResolveResponse>('resolve_scan_source', { scan });
+}
+
+export interface MixRecipeItem {
+  item_code: string;
+  item_name: string;
+  target_stems: number;
+  packed_stems: number;
+  remaining: number;
+  done: boolean;
+}
+
+export interface PackBoxRecipe {
+  pack_box: string;
+  box_id: string;
+  box_type: string | null;
+  pack_rate: number;
+  sales_order: string | null;
+  customer: string | null;
+  is_mix_box: boolean;
+  recipe: MixRecipeItem[];
+  total_packed: number;
+}
+
+export async function getPackBoxRecipe(packBox: string): Promise<PackBoxRecipe> {
+  return apiPost<PackBoxRecipe>(
+    'upande_harvest.upande_harvest.doctype.pack_box.pack_box.get_pack_box_recipe',
+    { pack_box: packBox },
+  );
+}
+
+// ── Dispatch ────────────────────────────────────────────────────────────────
+
+export interface FplPreviewItem {
+  item_code: string;
+  qty: number;
+  boxes: number;
+}
+
+export interface FplPreview {
+  fpl: string;
+  sales_order: string | null;
+  customer: string | null;
+  company: string | null;
+  delivery_point: string;
+  shipping_address_display: string;
+  already_dispatched: boolean;
+  existing_dn: string;
+  items: FplPreviewItem[];
+  total_stems: number;
+  total_boxes: number;
+}
+
+export interface DispatchResult {
+  delivery_note: string;
+  fpl: string;
+  sales_order: string;
+  customer: string;
+  total_qty: number;
+  line_count: number;
+}
+
+export async function getFplPreview(fpl: string): Promise<FplPreview> {
+  return apiPost<FplPreview>('upande_harvest.api.get_fpl_preview', { fpl });
+}
+
+export async function createDeliveryNoteFromFpl(params: {
+  fpl: string;
+  driver_name: string;
+  truck_reg: string;
+  posting_date?: string;
+}): Promise<DispatchResult> {
+  return apiPost<DispatchResult>('upande_harvest.api.create_delivery_note_from_fpl', params);
 }
 
 export async function submitActualHarvest(
@@ -427,6 +720,291 @@ export async function submitBucketReject(
     farm,
     reason,
   });
+}
+
+export type StorageMode = 'Shelving' | 'Zoning' | 'Direct-to-Grader';
+
+export interface ReceivingOutResponse {
+  message: string;
+  receiving_out?: string;
+  bucket_id?: string;
+  variety?: string;
+  remaining_qty?: number;
+  http_status_code?: number;
+  // Set when the grader already holds a different open bucket. The mobile UI
+  // must prompt the operator to either close-and-replace ('reject') or
+  // abort the new scan ('cancel') and re-submit with `confirm` set.
+  needs_confirmation?: boolean;
+  prior_receiving_out?: string;
+  prior_bucket_id?: string;
+  prior_variety?: string;
+  prior_remaining_qty?: number;
+  requested_bucket_id?: string;
+  cancelled?: boolean;
+  // Same grader scans the SAME bucket they already hold — no-op, neutral feedback.
+  already_open?: boolean;
+  // Set when the RO was opened by scanning a Long Storage (STG-*) label —
+  // the server resolved the box's source_bucket and stamped from_storage_box
+  // on the RO. Mobile uses this for a "From: STG-*" indicator.
+  from_storage_box?: string | null;
+}
+
+// ── Issuing ────────────────────────────────────────────────────────────────
+// Pickers pull buckets off cold-store shelves against today's OPLs. Variety
+// list at the top, drill into a variety, scan each pre-assigned bucket.
+// Each scan clears the Shelf Item rows for that bucket and marks the matching
+// Pick List Item picked. See upande_harvest.api.{get_issuing_varieties,
+// get_issuing_buckets, issue_bucket}.
+
+export interface IssuingVariety {
+  variety: string;
+  stems_owed: number;
+  bucket_count: number;
+  opl_count: number;
+}
+
+export interface IssuingBucket {
+  pli_name: string;
+  opl_name: string;
+  bucket_id: string;
+  stem_length: string | null;
+  qty: number;
+  picked_qty: number;
+  customer: string | null;
+  customer_name: string | null;
+  shelf_id: string | null;
+}
+
+export interface IssuingOpl {
+  customer: string | null;
+  customer_name: string | null;
+  opl_names: string[];
+  opl_count: number;
+  opl_name: string | null;   // first OPL in the group, for back-compat
+  stems_owed: number;
+  bucket_count: number;
+}
+
+export interface SkipBucketResponse {
+  status: 'ok' | 'no_replacement';
+  skipped_bucket: string;
+  pli: string;
+  opl: string;
+  variety: string;
+  customer?: string | null;
+  message?: string;
+  replacement?: IssuingBucket;
+}
+
+export interface IssueBucketResponse {
+  status: 'ok';
+  bucket_id: string;
+  pli: string;
+  opl: string;
+  variety: string;
+  qty: number;
+  customer: string | null;
+  shelves_cleared: number;
+}
+
+export async function getIssuingVarieties(): Promise<{ varieties: IssuingVariety[] }> {
+  const res = await apiPost<{ message?: { varieties?: IssuingVariety[] } } & {
+    varieties?: IssuingVariety[];
+  }>('upande_harvest.api.get_issuing_varieties', {});
+  const m: any = (res as any).message ?? res;
+  return { varieties: m?.varieties ?? [] };
+}
+
+export async function getIssuingBuckets(
+  variety: string,
+  opl?: string,
+  customer?: string,
+): Promise<{ variety: string; opl: string | null; customer: string | null; buckets: IssuingBucket[] }> {
+  const args: any = { variety };
+  if (opl) args.opl = opl;
+  else if (customer) args.customer = customer;
+  const res = await apiPost<any>('upande_harvest.api.get_issuing_buckets', args);
+  const m: any = (res as any).message ?? res;
+  return {
+    variety:  m?.variety ?? variety,
+    opl:      m?.opl ?? null,
+    customer: m?.customer ?? null,
+    buckets:  m?.buckets ?? [],
+  };
+}
+
+export async function getIssuingOpls(variety: string): Promise<{ variety: string; opls: IssuingOpl[] }> {
+  const res = await apiPost<any>('upande_harvest.api.get_issuing_opls', { variety });
+  const m: any = (res as any).message ?? res;
+  return { variety: m?.variety ?? variety, opls: m?.opls ?? [] };
+}
+
+export async function issueBucket(bucketId: string): Promise<IssueBucketResponse> {
+  return serializedByKey('issuing', async () => {
+    const res = await apiPost<any>('upande_harvest.api.issue_bucket', { bucket_id: bucketId });
+    const m: any = (res as any).message ?? res;
+    return m as IssueBucketResponse;
+  });
+}
+
+export async function skipBucket(bucketId: string, reason?: string): Promise<SkipBucketResponse> {
+  return serializedByKey('issuing', async () => {
+    const res = await apiPost<any>('upande_harvest.api.skip_bucket', {
+      bucket_id: bucketId,
+      ...(reason ? { reason } : {}),
+    });
+    const m: any = (res as any).message ?? res;
+    return m as SkipBucketResponse;
+  });
+}
+
+// Reads storage_mode via a public whitelisted helper. We can't use
+// frappe.client.get_value here because Upande Harvest Config is
+// System-Manager-read-only — grader/scanner users would get 403 and the
+// app would silently fall back to "Shelving", hiding Direct-to-Grader.
+export async function getStorageMode(): Promise<StorageMode> {
+  const res = await apiPost<{ message?: { storage_mode?: string } | string }>(
+    'upande_harvest.api.get_storage_mode',
+    {}
+  );
+  const m = (res as any).message ?? {};
+  const v = typeof m === 'string' ? m : (m.storage_mode ?? 'Shelving');
+  return (v || 'Shelving') as StorageMode;
+}
+
+export async function submitReceivingOut(
+  bucketId: string,
+  grader: string,
+  farm: string,
+  confirm?: 'reject' | 'cancel'
+): Promise<ReceivingOutResponse> {
+  return serializedByKey('receiving_out', () =>
+    apiPost<ReceivingOutResponse>('receiving_out_entry', {
+      bucket_id: bucketId,
+      grader,
+      farm,
+      ...(confirm ? { confirm } : {}),
+    })
+  );
+}
+
+export interface GraderOpenBucket {
+  open: boolean;
+  receiving_out?: string;
+  bucket_id?: string;
+  variety?: string;
+  initial_qty?: number;
+  remaining_qty?: number;
+  opened_at?: string;
+}
+
+/**
+ * Direct-to-Grader: resolve which bucket a given grader is currently holding.
+ * Returns { open: false } when the grader has no open Receiving Out — caller
+ * decides whether that's an error (grading flow) or a no-op (display).
+ */
+export async function getGraderOpenBucket(grader: string): Promise<GraderOpenBucket> {
+  const res = await apiPost<{ message?: GraderOpenBucket } | GraderOpenBucket>(
+    'upande_harvest.api.get_grader_open_bucket',
+    { grader }
+  );
+  const m: any = (res as any).message ?? res;
+  return {
+    open:           Boolean(m?.open),
+    receiving_out:  m?.receiving_out,
+    bucket_id:      m?.bucket_id,
+    variety:        m?.variety,
+    initial_qty:    m?.initial_qty,
+    remaining_qty:  m?.remaining_qty,
+    opened_at:      m?.opened_at,
+  };
+}
+
+export interface ReceivingOutEntry {
+  name: string;
+  bucket_id: string;
+  grader: string;
+  grader_name?: string;
+  variety?: string;
+  initial_qty?: number;
+  remaining_qty?: number;
+  leftover_qty?: number;
+  opened_at?: string;
+  closed_at?: string | null;
+  closed_reason?: string | null;
+}
+
+export async function listRecentReceivingOuts(
+  grader?: string,
+  limit = 10,
+): Promise<ReceivingOutEntry[]> {
+  const res = await apiPost<any>('upande_harvest.api.list_recent_receiving_outs', {
+    ...(grader ? { grader } : {}),
+    limit,
+  });
+  const m: any = (res as any).message ?? res;
+  return (m?.entries ?? []) as ReceivingOutEntry[];
+}
+
+export async function reopenReceivingOut(receivingOut: string): Promise<{
+  ok: boolean;
+  receiving_out: string;
+  bucket_id: string;
+  grader: string;
+  variety?: string;
+  remaining_qty: number;
+}> {
+  const res = await apiPost<any>('upande_harvest.api.reopen_receiving_out', {
+    receiving_out: receivingOut,
+  });
+  return ((res as any).message ?? res) as any;
+}
+
+export async function returnBucket(receivingOut: string): Promise<{
+  ok: boolean; receiving_out: string; leftover_qty: number;
+}> {
+  const res = await apiPost<any>('upande_harvest.api.return_bucket', {
+    receiving_out: receivingOut,
+  });
+  return ((res as any).message ?? res) as any;
+}
+
+export async function finishBucket(receivingOut: string): Promise<{
+  ok: boolean; receiving_out: string;
+}> {
+  const res = await apiPost<any>('upande_harvest.api.finish_bucket', {
+    receiving_out: receivingOut,
+  });
+  return ((res as any).message ?? res) as any;
+}
+
+export async function transferBucket(
+  receivingOut: string,
+  newGrader: string,
+): Promise<{
+  ok: boolean;
+  prior_ro: string;
+  receiving_out: string;
+  bucket_id: string;
+  grader: string;
+  remaining_qty: number;
+}> {
+  const res = await apiPost<any>('upande_harvest.api.transfer_bucket', {
+    receiving_out: receivingOut,
+    new_grader:    newGrader,
+  });
+  return ((res as any).message ?? res) as any;
+}
+
+export async function addReceivingOutNote(
+  receivingOut: string,
+  note: string,
+): Promise<{ ok: boolean; receiving_out: string; notes: string }> {
+  const res = await apiPost<any>('upande_harvest.api.add_receiving_out_note', {
+    receiving_out: receivingOut,
+    note,
+  });
+  return ((res as any).message ?? res) as any;
 }
 
 export async function fetchUserRoles(): Promise<{ roles: string[] }> {
@@ -508,6 +1086,58 @@ export async function submitIssue(
   description: string
 ): Promise<{ message: string; issue: string; subject: string }> {
   return apiPost('submit_issue', { subject, description });
+}
+
+/**
+ * Upload a local file (e.g. a screenshot captured on-device) and attach it
+ * to a Frappe document — used to attach the support screenshot to the Issue
+ * record after it's been created.
+ *
+ * Uses /api/method/upload_file (Frappe's standard endpoint) so it inherits
+ * the session auth headers we already use elsewhere.
+ */
+export async function uploadAttachment(params: {
+  fileUri: string;
+  fileName: string;
+  attachedTo: { doctype: string; name: string; field?: string };
+  isPrivate?: boolean;
+}): Promise<{ file_url: string; file_name: string } | null> {
+  let baseUrl = await getApiUrl();
+  if (!baseUrl) return null;
+  if (!baseUrl.startsWith('http://') && !baseUrl.startsWith('https://')) {
+    baseUrl = `https://${baseUrl}`;
+  }
+  baseUrl = baseUrl.replace(/\/+$/, '');
+  const url = `${baseUrl}/api/method/upload_file`;
+
+  const [sid, csrfToken] = await Promise.all([getSid(), getCsrfToken()]);
+
+  // React Native FormData — Frappe expects the binary under "file"
+  const form = new FormData();
+  form.append('file', {
+    uri: params.fileUri,
+    name: params.fileName,
+    type: 'image/png',
+  } as any);
+  form.append('doctype', params.attachedTo.doctype);
+  form.append('docname', params.attachedTo.name);
+  if (params.attachedTo.field) form.append('fieldname', params.attachedTo.field);
+  form.append('is_private', params.isPrivate === false ? '0' : '1');
+
+  const headers: Record<string, string> = {
+    Accept: 'application/json',
+  };
+  if (sid) headers['Cookie'] = `sid=${sid}`;
+  if (csrfToken) headers['X-Frappe-CSRF-Token'] = csrfToken;
+
+  try {
+    const res = await fetch(url, { method: 'POST', headers, body: form });
+    if (!res.ok) return null;
+    const body = await res.json().catch(() => ({}));
+    return body?.message || null;
+  } catch {
+    return null;
+  }
 }
 
 export async function fetchUnreceivedBuckets(
@@ -1002,4 +1632,105 @@ export async function listXfloraOpls(
     }
   }
   return [];
+}
+
+// ── Support chat ───────────────────────────────────────────────────────────
+
+export interface SupportContact {
+  name: string;
+  full_name: string;
+  enabled: number;
+  mobile_no?: string | null;
+  phone?: string | null;
+}
+
+export interface SupportThread {
+  name: string;
+  participant_a: string;
+  participant_b: string;
+  last_message_at: string | null;
+  last_message_preview: string | null;
+  other_user: string;
+  other_full_name: string;
+  other_mobile_no?: string | null;
+  other_phone?: string | null;
+  unread_count: number;
+}
+
+export interface SupportMessage {
+  name: string;
+  sender: string;
+  sent_at: string;
+  text: string;
+  read_by_recipient: number;
+}
+
+// Whitelisted Python functions in upande_harvest.api wrap their return value
+// in `{ message: ... }` — apiPost returns the raw body, so we need to unwrap
+// `.message` ourselves. This helper does that defensively: if a response is
+// already flat (no `.message`), it passes through unchanged.
+function unwrapFrappeMessage<T>(resp: any): T {
+  if (resp && typeof resp === 'object' && 'message' in resp && resp.message !== undefined) {
+    return resp.message as T;
+  }
+  return resp as T;
+}
+
+export async function listSupportContacts(): Promise<{ contacts: SupportContact[] }> {
+  const resp = await apiPost<any>('upande_harvest.api.list_support_contacts', {});
+  return unwrapFrappeMessage<{ contacts: SupportContact[] }>(resp);
+}
+
+export async function openSupportThread(with_user: string): Promise<{
+  thread: string;
+  participant_a: string;
+  participant_b: string;
+  last_message_at: string | null;
+}> {
+  const resp = await apiPost<any>('upande_harvest.api.open_thread', { with_user });
+  return unwrapFrappeMessage(resp);
+}
+
+export async function sendSupportMessage(thread: string, text: string): Promise<{
+  name: string;
+  sent_at: string;
+}> {
+  const resp = await apiPost<any>('upande_harvest.api.send_message', { thread, text });
+  return unwrapFrappeMessage(resp);
+}
+
+export async function pollSupportMessages(thread: string, since?: string): Promise<{
+  messages: SupportMessage[];
+}> {
+  const resp = await apiPost<any>('upande_harvest.api.poll_messages',
+    since ? { thread, since } : { thread });
+  return unwrapFrappeMessage<{ messages: SupportMessage[] }>(resp);
+}
+
+export async function getMySupportThreads(): Promise<{ threads: SupportThread[] }> {
+  const resp = await apiPost<any>('upande_harvest.api.get_my_threads', {});
+  return unwrapFrappeMessage<{ threads: SupportThread[] }>(resp);
+}
+
+// ── Discard Request ─────────────────────────────────────────────────────────
+// Approved-and-incomplete requests power the picker; consumeDiscardRequest
+// applies one scan against the chosen request. Both calls live in
+// upande_harvest.discard_api.
+
+export async function getOpenDiscardRequests(
+  coldstore: DiscardColdstore,
+): Promise<{ coldstore: DiscardColdstore; requests: DiscardRequestSummary[] }> {
+  const resp = await apiPost<any>('upande_harvest.discard_api.get_open_discard_requests', { coldstore });
+  return unwrapFrappeMessage(resp);
+}
+
+export async function consumeDiscardRequest(
+  requestName: string,
+  scanId: string,
+): Promise<DiscardConsumeResponse> {
+  const resp = await apiPost<any>('upande_harvest.discard_api.consume_discard_request', {
+    request_name: requestName,
+    scan_id:      scanId,
+  });
+  return unwrapFrappeMessage<DiscardConsumeResponse>(resp);
 }

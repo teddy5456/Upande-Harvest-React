@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useEffect, useRef } from 'react';
+import React, { useState, useCallback, useEffect, useRef, useMemo } from 'react';
 import {
   View,
   Text,
@@ -19,7 +19,7 @@ import { useApp } from '../context/AppContext';
 import { addToSyncQueue } from '../database/sync-queue';
 import { getFarm, getSetting, setSetting, getCachedGreenhouses, setCachedGreenhouses } from '../database/settings';
 import { addHarvestEntry } from '../database/harvest';
-import { submitHarvest, fetchGreenhouses } from '../services/api';
+import { submitHarvest, fetchGreenhouses, cancelHarvestEntry } from '../services/api';
 import ScanInput, { ScanInputHandle } from '../components/ScanInput';
 import { HarvestFormSkeleton } from '../components/Skeleton';
 import ScanConfirmation from '../components/ScanConfirmation';
@@ -98,6 +98,13 @@ export default function HarvestScreen() {
     type: 'success' | 'error';
     message: string;
   }>({ visible: false, type: 'success', message: '' });
+
+  // Last-scans quick actions (edit qty / cancel SE) — capped at last 4
+  // successful entries to keep the panel tight on a 5" handset.
+  const [editingEntry, setEditingEntry] = useState<HarvestListEntry | null>(null);
+  const [editQty, setEditQty] = useState('');
+  const [editing, setEditing] = useState(false);
+  const [deletingEntry, setDeletingEntry] = useState<string | null>(null); // stock_entry being cancelled
 
   const showConfirmation = (type: 'success' | 'error', message: string) => {
     setConfirmation({ visible: true, type, message });
@@ -259,7 +266,11 @@ export default function HarvestScreen() {
   const handleBucketScanned = useCallback(
     async (data: string) => {
       const bucketId = parseScannedBucketQR(data);
-      if (!bucketId) return;
+      if (!bucketId) {
+        onScanError();
+        showConfirmation('error', 'Scan a Bucket QR — that QR is not a bucket.');
+        return;
+      }
 
       // Collect all missing fields in one pass and highlight them inline
       // rather than firing a series of Alert popups.
@@ -274,6 +285,15 @@ export default function HarvestScreen() {
       if (missing.size > 0) {
         onScanError();
         setMissingFields(missing);
+        return;
+      }
+      // Hard cap: one bucket can hold at most 130 stems. Server enforces the
+      // same limit; failing fast here saves a round-trip and surfaces a
+      // clearer message than the server's ValidationError.
+      if (qty > 130) {
+        onScanError();
+        setMissingFields(new Set(['quantity']));
+        showConfirmation('error', `${qty} stems exceeds the 130-stem bucket cap. Split into two buckets.`);
         return;
       }
       setMissingFields(new Set());
@@ -299,6 +319,8 @@ export default function HarvestScreen() {
           setEntries((prev) => [{
             bucket_id: bucketId, item_code: itemCode, quantity: qty,
             time: now, status: 'success', message: response.stock_entry ?? 'Created',
+            stock_entry: response.stock_entry,
+            section, harvester, greenhouse: gh, farm,
           }, ...prev]);
           await refreshStats();
           onScanSuccess();
@@ -366,6 +388,100 @@ export default function HarvestScreen() {
       }
     },
     [isConnected, refreshStats, selectedGreenhouse, selectedSection, selectedHarvester, selectedVariety, quantity]
+  );
+
+  // ── Recent-scans actions ────────────────────────────────────────────────
+  const handleDeleteEntry = useCallback((entry: HarvestListEntry) => {
+    if (!entry.stock_entry) return;
+    Alert.alert(
+      'Delete scan?',
+      `Cancel ${entry.bucket_id} (${entry.quantity} × ${entry.item_code})? The bucket goes back to Available so it can be re-scanned.`,
+      [
+        { text: 'Keep', style: 'cancel' },
+        {
+          text: 'Delete',
+          style: 'destructive',
+          onPress: async () => {
+            setDeletingEntry(entry.stock_entry!);
+            try {
+              await cancelHarvestEntry(entry.stock_entry!);
+              setEntries((prev) => prev.filter((e) => e.stock_entry !== entry.stock_entry));
+              await refreshStats();
+              showConfirmation('success', `${entry.bucket_id} cancelled`);
+            } catch (e: any) {
+              showConfirmation('error', e?.message || 'Could not cancel');
+            } finally {
+              setDeletingEntry(null);
+            }
+          },
+        },
+      ],
+    );
+  }, [refreshStats]);
+
+  const openEditEntry = useCallback((entry: HarvestListEntry) => {
+    if (!entry.stock_entry) return;
+    setEditingEntry(entry);
+    setEditQty(String(entry.quantity));
+  }, []);
+
+  const saveEditEntry = useCallback(async () => {
+    if (!editingEntry || !editingEntry.stock_entry) return;
+    const newQty = parseFloat(editQty);
+    if (!editQty.trim() || isNaN(newQty) || newQty <= 0) {
+      showConfirmation('error', 'Enter a valid quantity');
+      return;
+    }
+    if (newQty === editingEntry.quantity) {
+      // No-op edit — just close
+      setEditingEntry(null);
+      return;
+    }
+    if (!isConnected) {
+      showConfirmation('error', 'Editing needs internet — try again when reconnected.');
+      return;
+    }
+
+    setEditing(true);
+    try {
+      // Cancel the old SE, then re-submit with new qty. submitHarvest is
+      // serialized, so the cancel ACK lands before the new entry posts.
+      await cancelHarvestEntry(editingEntry.stock_entry);
+      const resp = await submitHarvest(
+        editingEntry.item_code,
+        newQty,
+        editingEntry.section || '',
+        editingEntry.harvester || '',
+        editingEntry.bucket_id,
+        editingEntry.farm || '',
+        editingEntry.greenhouse || '',
+      );
+      // Replace in-place — preserve list order
+      setEntries((prev) => prev.map((e) =>
+        e.stock_entry === editingEntry.stock_entry
+          ? {
+              ...e,
+              quantity: newQty,
+              stock_entry: resp.stock_entry,
+              time: new Date().toLocaleTimeString(),
+              message: resp.stock_entry,
+            }
+          : e
+      ));
+      await refreshStats();
+      showConfirmation('success', `${editingEntry.bucket_id} → ${newQty}`);
+      setEditingEntry(null);
+    } catch (e: any) {
+      showConfirmation('error', e?.message || 'Edit failed');
+    } finally {
+      setEditing(false);
+    }
+  }, [editingEntry, editQty, isConnected, refreshStats]);
+
+  // Most recent 4 successful entries, used by the inline Recent panel
+  const recentScans = useMemo(
+    () => entries.filter((e) => e.status === 'success' && e.stock_entry).slice(0, 4),
+    [entries],
   );
 
   // Lists are always sorted A→Z — the sort toggle has been removed to keep
@@ -847,6 +963,49 @@ export default function HarvestScreen() {
             onScan={handleBucketScanned}
           />
 
+          {/* Recent scans — last 4 successful entries with quick edit / cancel */}
+          {recentScans.length > 0 && (
+            <View style={styles.recentSection}>
+              <Text style={styles.recentHeader}>Recent · last {recentScans.length}</Text>
+              {recentScans.map((entry) => {
+                const isDeleting = deletingEntry === entry.stock_entry;
+                return (
+                  <View key={entry.stock_entry} style={styles.recentRow}>
+                    <View style={styles.recentDot} />
+                    <View style={{ flex: 1, minWidth: 0 }}>
+                      <Text style={styles.recentTitle} numberOfLines={1}>
+                        {entry.bucket_id}
+                      </Text>
+                      <Text style={styles.recentMeta} numberOfLines={1}>
+                        {entry.quantity} × {entry.item_code} · {entry.time}
+                      </Text>
+                    </View>
+                    <TouchableOpacity
+                      onPress={() => openEditEntry(entry)}
+                      style={styles.recentBtn}
+                      hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                      disabled={isDeleting}
+                    >
+                      <Ionicons name="create-outline" size={16} color={colors.text} />
+                    </TouchableOpacity>
+                    <TouchableOpacity
+                      onPress={() => handleDeleteEntry(entry)}
+                      style={[styles.recentBtn, styles.recentBtnDanger]}
+                      hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                      disabled={isDeleting}
+                    >
+                      <Ionicons
+                        name={isDeleting ? 'hourglass-outline' : 'trash-outline'}
+                        size={16}
+                        color={colors.error}
+                      />
+                    </TouchableOpacity>
+                  </View>
+                );
+              })}
+            </View>
+          )}
+
           {/* Entries */}
           <EntriesLog
             entries={entries}
@@ -977,6 +1136,65 @@ export default function HarvestScreen() {
                     );
                   })}
                 </ScrollView>
+              </>
+            )}
+          </View>
+        </View>
+      </Modal>
+
+      {/* ── Edit harvest qty modal ── */}
+      <Modal
+        visible={!!editingEntry}
+        transparent
+        animationType="fade"
+        onRequestClose={() => !editing && setEditingEntry(null)}
+      >
+        <View style={styles.editScrim}>
+          <View style={styles.editCard}>
+            <View style={styles.editHeader}>
+              <Text style={styles.editTitle}>Edit quantity</Text>
+              <TouchableOpacity
+                onPress={() => !editing && setEditingEntry(null)}
+                hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
+              >
+                <Ionicons name="close" size={20} color={colors.textMuted} />
+              </TouchableOpacity>
+            </View>
+            {editingEntry && (
+              <>
+                <Text style={styles.editMeta}>
+                  {editingEntry.bucket_id} · {editingEntry.item_code}
+                </Text>
+                <TextInput
+                  style={styles.editInput}
+                  value={editQty}
+                  onChangeText={setEditQty}
+                  keyboardType="numeric"
+                  placeholder="Quantity"
+                  placeholderTextColor={colors.textMuted}
+                  autoFocus
+                  editable={!editing}
+                />
+                <View style={styles.editActions}>
+                  <TouchableOpacity
+                    style={styles.editCancel}
+                    onPress={() => setEditingEntry(null)}
+                    disabled={editing}
+                    activeOpacity={0.7}
+                  >
+                    <Text style={styles.editCancelText}>Cancel</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={[styles.editSave, editing && styles.editSaveDisabled]}
+                    onPress={saveEditEntry}
+                    disabled={editing}
+                    activeOpacity={0.85}
+                  >
+                    <Text style={styles.editSaveText}>
+                      {editing ? 'Saving…' : 'Save'}
+                    </Text>
+                  </TouchableOpacity>
+                </View>
               </>
             )}
           </View>
@@ -1197,6 +1415,128 @@ const styles = StyleSheet.create({
     fontSize: fontSize.xs,
     color: colors.textMuted,
     maxWidth: 100,
+  },
+
+  // ── Recent scans panel ──
+  recentSection: { marginTop: spacing.lg },
+  recentHeader: {
+    fontFamily: fontFamily.medium,
+    fontSize: 10,
+    color: colors.textMuted,
+    textTransform: 'uppercase',
+    letterSpacing: 1.2,
+    marginBottom: spacing.sm,
+  },
+  recentRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.sm,
+    paddingVertical: spacing.sm + 2,
+    paddingHorizontal: spacing.md,
+    backgroundColor: colors.surface,
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: borderRadius.md,
+    marginBottom: spacing.xs,
+  },
+  recentDot: {
+    width: 6, height: 6, borderRadius: 3,
+    backgroundColor: colors.success,
+  },
+  recentTitle: {
+    fontFamily: fontFamily.semiBold,
+    fontSize: fontSize.sm,
+    color: colors.text,
+    letterSpacing: -0.2,
+  },
+  recentMeta: {
+    fontFamily: fontFamily.regular,
+    fontSize: fontSize.xs,
+    color: colors.textMuted,
+    marginTop: 1,
+  },
+  recentBtn: {
+    width: 32, height: 32, borderRadius: 16,
+    backgroundColor: colors.surfaceAlt,
+    alignItems: 'center', justifyContent: 'center',
+  },
+  recentBtnDanger: { backgroundColor: 'rgba(239, 68, 68, 0.10)' },
+
+  // ── Edit qty modal ──
+  editScrim: {
+    flex: 1,
+    backgroundColor: 'rgba(15, 23, 42, 0.45)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingHorizontal: spacing.xl,
+  },
+  editCard: {
+    width: '100%',
+    maxWidth: 380,
+    backgroundColor: colors.surface,
+    borderRadius: borderRadius.xl,
+    padding: spacing.lg,
+  },
+  editHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: spacing.xs,
+  },
+  editTitle: {
+    fontFamily: fontFamily.bold,
+    fontSize: fontSize.lg,
+    color: colors.text,
+    letterSpacing: -0.3,
+  },
+  editMeta: {
+    fontFamily: fontFamily.regular,
+    fontSize: fontSize.sm,
+    color: colors.textSecondary,
+    marginBottom: spacing.md,
+  },
+  editInput: {
+    backgroundColor: colors.background,
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: borderRadius.md,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.md,
+    fontFamily: fontFamily.semiBold,
+    fontSize: fontSize.lg,
+    color: colors.text,
+    textAlign: 'center',
+    marginBottom: spacing.lg,
+  },
+  editActions: {
+    flexDirection: 'row',
+    gap: spacing.sm,
+  },
+  editCancel: {
+    flex: 1,
+    paddingVertical: spacing.md,
+    borderRadius: borderRadius.md,
+    borderWidth: 1,
+    borderColor: colors.border,
+    alignItems: 'center',
+  },
+  editCancelText: {
+    fontFamily: fontFamily.medium,
+    fontSize: fontSize.sm,
+    color: colors.textSecondary,
+  },
+  editSave: {
+    flex: 1.4,
+    paddingVertical: spacing.md,
+    borderRadius: borderRadius.md,
+    backgroundColor: colors.primary,
+    alignItems: 'center',
+  },
+  editSaveDisabled: { opacity: 0.6 },
+  editSaveText: {
+    fontFamily: fontFamily.semiBold,
+    fontSize: fontSize.sm,
+    color: colors.textOnPrimary,
   },
   emptyText: {
     fontFamily: fontFamily.regular,

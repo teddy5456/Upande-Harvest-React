@@ -30,7 +30,7 @@ import {
 import { stripStemLength } from '../types';
 import { getTodayReceivingCount } from '../database/receiving';
 import { getTodayActualHarvest } from '../database/actual_harvest';
-import { fetchGradingDashboard, fetchDashboardData, fetchHarvesterStats, fetchUnreceivedBuckets } from '../services/api';
+import { fetchGradingDashboard, fetchDashboardData, fetchUnreceivedBuckets } from '../services/api';
 import { DashboardSkeleton } from '../components/Skeleton';
 import { fontFamily, fontSize, spacing, borderRadius } from '../theme';
 import { GreenhouseHarvestRow, UnreceivedBucketsResponse } from '../types';
@@ -135,15 +135,7 @@ export default function DashboardScreen() {
     const today = todayISODate();
 
     if (isHarvester) {
-      const localStems = await getTodayHarvestStemsByHarvester(userEmail);
-      let stemsVal = localStems;
-      if (isConnected) {
-        try {
-          const resp = await fetchHarvesterStats(userEmail, today);
-          stemsVal = resp.total_stems ?? localStems;
-        } catch {}
-      }
-      setHarvesterStems(stemsVal);
+      setHarvesterStems(await getTodayHarvestStemsByHarvester(userEmail));
       return;
     }
 
@@ -347,8 +339,6 @@ export default function DashboardScreen() {
             <ActionChip icon="settings-outline" label="Settings" onPress={() => navigation.navigate('Settings')} />
           </View>
 
-          <PersonalStatsPanel harvester={userEmail} />
-
           <View style={{ height: spacing.xxl }} />
         </Animated.ScrollView>
       </View>
@@ -487,12 +477,6 @@ export default function DashboardScreen() {
               ))}
             </ScrollView>
           </View>
-
-          {!isXflora && userEmail ? (
-            <CollapsibleSection title="My stats today">
-              <PersonalStatsPanel harvester={userEmail} />
-            </CollapsibleSection>
-          ) : null}
 
           <MissingBucketsModal
             visible={missingModal.visible}
@@ -657,154 +641,12 @@ function ActionChip({ icon, label, onPress }: { icon: any; label: string; onPres
   );
 }
 
-// Lazy-loaded breakdown of the harvester's day: by greenhouse, and by variety
-// in two granularities (with stem-length, and rolled-up by base variety).
-// Loads only when the user expands the panel — keeps the dashboard light.
-function PersonalStatsPanel({ harvester }: { harvester: string }) {
-  const [open, setOpen] = useState(false);
-  const [tab, setTab] = useState<'greenhouse' | 'variety_full' | 'variety_base'>('greenhouse');
-  const [ghRows, setGhRows] = useState<{ greenhouse: string; stems: number }[] | null>(null);
-  const [varRows, setVarRows] = useState<{ variety: string; stems: number }[] | null>(null);
-  const [busy, setBusy] = useState(false);
-
-  const load = useCallback(async () => {
-    if (!harvester || (ghRows && varRows)) return;
-    setBusy(true);
-    const [g, v] = await Promise.all([
-      getMyHarvestByGreenhouse(harvester),
-      getMyHarvestByVariety(harvester),
-    ]);
-    setGhRows(g);
-    setVarRows(v);
-    setBusy(false);
-  }, [harvester, ghRows, varRows]);
-
-  const onToggle = () => {
-    if (!open) { load(); }
-    setOpen(!open);
-  };
-
-  // Roll up "Andina 50cm" + "Andina 60cm" → "Andina"
-  const baseVarRows = useMemo(() => {
-    if (!varRows) return [];
-    const map: Record<string, number> = {};
-    for (const r of varRows) {
-      const base = stripStemLength(r.variety) || r.variety;
-      map[base] = (map[base] ?? 0) + r.stems;
-    }
-    return Object.entries(map)
-      .map(([variety, stems]) => ({ variety, stems }))
-      .sort((a, b) => b.stems - a.stems);
-  }, [varRows]);
-
-  const rows = tab === 'greenhouse'
-    ? (ghRows ?? []).map(r => ({ key: r.greenhouse, label: r.greenhouse, stems: r.stems }))
-    : tab === 'variety_full'
-      ? (varRows ?? []).map(r => ({ key: r.variety, label: r.variety, stems: r.stems }))
-      : baseVarRows.map(r => ({ key: r.variety, label: r.variety, stems: r.stems }));
-
-  return (
-    <View style={s.panelCard}>
-      <TouchableOpacity onPress={onToggle} activeOpacity={0.7} style={s.panelHeader}>
-        <Ionicons name="bar-chart-outline" size={16} color={C.textSec} />
-        <Text style={s.panelTitle}>All my stats today</Text>
-        <Ionicons name={open ? 'chevron-up' : 'chevron-down'} size={16} color={C.textMuted} />
-      </TouchableOpacity>
-
-      {open && (
-        <View style={s.panelBody}>
-          <View style={s.panelTabs}>
-            {([
-              { id: 'greenhouse', label: 'Greenhouse' },
-              { id: 'variety_base', label: 'Variety' },
-              { id: 'variety_full', label: 'Variety + length' },
-            ] as const).map((t) => (
-              <TouchableOpacity
-                key={t.id}
-                style={[s.panelTab, tab === t.id && s.panelTabActive]}
-                onPress={() => setTab(t.id)}
-                activeOpacity={0.7}
-              >
-                <Text style={[s.panelTabText, tab === t.id && s.panelTabTextActive]}>{t.label}</Text>
-              </TouchableOpacity>
-            ))}
-          </View>
-
-          {busy ? (
-            <Text style={s.panelEmpty}>Loading…</Text>
-          ) : rows.length === 0 ? (
-            <Text style={s.panelEmpty}>No harvest entries today</Text>
-          ) : (
-            <View>
-              {rows.map((r) => (
-                <View key={r.key} style={s.panelRow}>
-                  <Text style={s.panelRowLabel} numberOfLines={1}>{r.label || '—'}</Text>
-                  <Text style={s.panelRowValue}>{r.stems.toLocaleString()}</Text>
-                </View>
-              ))}
-            </View>
-          )}
-        </View>
-      )}
-    </View>
-  );
-}
 
 // ── Styles ─────────────────────────────────────────────────────────────────────
 const s = StyleSheet.create({
   container: { flex: 1, backgroundColor: C.bg },
   center: { flex: 1, alignItems: 'center', justifyContent: 'center' },
   content: { padding: spacing.lg, paddingBottom: spacing.xxl },
-
-  // Personal stats panel
-  panelCard: {
-    backgroundColor: C.surface,
-    borderRadius: borderRadius.md,
-    borderWidth: 1,
-    borderColor: C.border,
-    marginTop: spacing.lg,
-    overflow: 'hidden',
-  },
-  panelHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: spacing.sm,
-    paddingHorizontal: spacing.md,
-    paddingVertical: spacing.md,
-  },
-  panelTitle: { flex: 1, fontFamily: fontFamily.semiBold, fontSize: fontSize.sm, color: C.text },
-  panelBody: {
-    paddingHorizontal: spacing.md,
-    paddingBottom: spacing.md,
-    borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: C.border,
-  },
-  panelTabs: { flexDirection: 'row', gap: spacing.xs, marginVertical: spacing.sm },
-  panelTab: {
-    flex: 1,
-    paddingVertical: spacing.xs,
-    paddingHorizontal: spacing.sm,
-    borderRadius: borderRadius.sm,
-    backgroundColor: C.bg,
-    alignItems: 'center',
-  },
-  panelTabActive: { backgroundColor: C.text },
-  panelTabText: { fontFamily: fontFamily.medium, fontSize: fontSize.xs, color: C.textSec },
-  panelTabTextActive: { color: '#fff' },
-  panelEmpty: {
-    fontFamily: fontFamily.regular, fontSize: fontSize.xs, color: C.textMuted,
-    paddingVertical: spacing.md, textAlign: 'center',
-  },
-  panelRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    paddingVertical: spacing.sm,
-    borderTopWidth: StyleSheet.hairlineWidth,
-    borderTopColor: C.border,
-  },
-  panelRowLabel: { flex: 1, fontFamily: fontFamily.regular, fontSize: fontSize.sm, color: C.text, paddingRight: spacing.sm },
-  panelRowValue: { fontFamily: fontFamily.semiBold, fontSize: fontSize.sm, color: C.text },
 
   // Header
   header: {

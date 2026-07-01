@@ -14,7 +14,7 @@ import { useApp } from '../context/AppContext';
 import { addToSyncQueue } from '../database/sync-queue';
 import { getFarm } from '../database/settings';
 import { addGradingEntry } from '../database/grading';
-import { submitGrading, getBucketBalance, submitBucketReject, addToPool, gradeFromPool, getPoolStatus, getBunchInfo, getBouquetRecipeForBunch, submitBouquetGrading } from '../services/api';
+import { submitGrading, getBucketBalance, submitBucketReject, addToPool, gradeFromPool, getPoolStatus, getBouquetRecipeForBunch, submitBouquetGrading, getGraderOpenBucket } from '../services/api';
 import {
   detectGradingQRType,
   extractGradingQRValue,
@@ -31,7 +31,8 @@ import { onScanSuccess, onScanError, lockHaptic } from '../utils/feedback';
 import { colors, fontFamily, fontSize, spacing, borderRadius } from '../theme';
 
 type SlotKey = 'bunch' | 'grader' | 'bucket';
-const SLOT_ORDER: SlotKey[] = ['bunch', 'grader', 'bucket'];
+const FULL_SLOT_ORDER: SlotKey[] = ['bunch', 'grader', 'bucket'];
+const DTG_SLOT_ORDER: SlotKey[] = ['bunch', 'grader'];
 
 const SLOT_META: Record<SlotKey, { label: string; icon: keyof typeof Ionicons.glyphMap }> = {
   bunch: { label: 'Bunch', icon: 'leaf-outline' },
@@ -44,7 +45,17 @@ const GRADING_REJECT_REASONS = QUALITY_REASONS.grading_reject;
 type Mode = 'grade' | 'rejects' | 'pool';
 
 export default function GradeScreen() {
-  const { isConnected, refreshStats } = useApp();
+  const { isConnected, refreshStats, storageMode } = useApp();
+  // RO is the canonical bucket↔grader binding in EVERY storage mode now —
+  // shelving, zoning, and DTG all use the same 2-slot grading scan (bunch +
+  // grader), with the server resolving bucket from the grader's open RO row.
+  // The `directToGrader` name is kept for code-locality but it's effectively
+  // "always true" for the grading screen's flow.
+  const directToGrader = true;
+  // storageMode is still consumed elsewhere in the app (App.tsx tab gating,
+  // CS/OPL branching) — referenced here so the import isn't orphaned.
+  void storageMode;
+  const SLOT_ORDER: SlotKey[] = DTG_SLOT_ORDER;
 
   // ── Grade mode state ──────────────────────────────────────────
   const [slots, setSlots] = useState<Record<SlotKey, string | null>>({ bunch: null, grader: null, bucket: null });
@@ -115,6 +126,14 @@ export default function GradeScreen() {
 
     let detected = detectGradingQRType(data);
     if (forcedSlotRef.current) { detected = forcedSlotRef.current; forcedSlotRef.current = null; }
+
+    // Direct-to-Grader mode: bucket scans are not part of the grading flow.
+    // The server resolves the bucket from the grader's open Receiving Out.
+    if (directToGrader && detected === 'bucket') {
+      showConfirmation('error', 'In Direct-to-Grader mode, scan the grader QR — not the bucket. Do Receiving Out first.');
+      return;
+    }
+
     // Skip locked & already-filled slots when auto-detecting
     if (detected === 'unknown') {
       const next = SLOT_ORDER.find((s) => !slots[s] && !(s !== 'bunch' && locks[s as 'grader' | 'bucket'] && slots[s]));
@@ -187,41 +206,21 @@ export default function GradeScreen() {
     onScanSuccess();
     showConfirmation('success', `${SLOT_META[target].label}: ${value}`);
 
-    // When the BUCKET slot is filled and the bunch is already scanned,
-    // check up-front whether the bucket has enough stems for a full bunch.
-    // If not, prompt to pool the remainder instead of attempting a grading
-    // that we know will fail (or be incomplete).
-    if (target === 'bucket' && newSlots.bunch && newSlots.bucket) {
-      try {
-        const [info, bal] = await Promise.all([
-          getBunchInfo(newSlots.bunch),
-          getBucketBalance(newSlots.bucket),
-        ]);
-        const sizeMatch = (info.bunch_size || '').match(/\d+/);
-        const bunchSize = sizeMatch ? parseInt(sizeMatch[0], 10) : 10;
-        if (bal.remaining_stems > 0 && bal.remaining_stems < bunchSize) {
-          // Send the full variant item_code (e.g. "Athena-50cm") — the
-          // template "Athena" can't hold stock because it has variants.
-          setRemainderModal({
-            visible: true,
-            bucketId: newSlots.bucket,
-            variety: info.item_code || bal.item_code || bal.variety || '',
-            stems: bal.remaining_stems,
-            bunchSize,
-          });
-          resetSlots(locks, newSlots);
-          return;
-        }
-      } catch {
-        // If the lookup fails (offline / network), fall through to the
-        // normal submit path — server will reject if truly insufficient.
-      }
-    }
+    // (Previously we ran a pre-submit Promise.all to detect partial-bunch
+    // buckets — 2 extra round-trips per scan. Now we just submit; the server
+    // returns the bucket's post-submit remaining_stems and the client
+    // decides whether to auto-pool below. Cuts ~300-500ms off every scan.)
 
-    // Auto-submit only if all three are filled (including bucket)
-    if (newSlots.bunch && newSlots.grader && newSlots.bucket) {
+    // Auto-submit:
+    //  - Direct-to-Grader: as soon as bunch + grader are scanned (server
+    //    resolves bucket from the grader's open Receiving Out row)
+    //  - Shelving/Zoning: all three (bunch + grader + bucket) must be present
+    const readyToSubmit = directToGrader
+      ? !!(newSlots.bunch && newSlots.grader)
+      : !!(newSlots.bunch && newSlots.grader && newSlots.bucket);
+    if (readyToSubmit) {
       setSubmitting(true);
-      await doSubmit(newSlots.bunch, newSlots.grader, newSlots.bucket);
+      await doSubmit(newSlots.bunch!, newSlots.grader!, directToGrader ? null : newSlots.bucket);
       setSubmitting(false);
       resetSlots(locks, newSlots);
     }
@@ -262,33 +261,18 @@ export default function GradeScreen() {
       const now = new Date().toLocaleTimeString();
       const farm = await getFarm();
 
-      // Pull bunch_size + stem_length from ERP. Skip when offline; the request
-      // will sit in the queue until we're back online and the server-side
-      // mobile_grading_entry script reads these from the DB anyway.
-      let bunchSize = '';
-      let stemLength = '';
-      if (isConnected) {
-        try {
-          const info = await getBunchInfo(bunchId);
-          bunchSize = info.bunch_size;
-          stemLength = info.stem_length;
-        } catch {
-          // Fall through with empty values — server will surface a clearer
-          // validation error than we could fabricate here.
-        }
-      }
-
-      const qtyMatch = bunchSize.match(/\d+/);
-      const qty = qtyMatch ? parseInt(qtyMatch[0], 10) : 0;
-
+      // Note: we no longer pre-fetch bunch_size + stem_length here. The
+      // server's Mobile Grading Entry API reads them from the Bunch QR Code
+      // directly, so the pre-fetch was a redundant 150-300ms round-trip per
+      // scan. Sending empty strings is equivalent for the server.
       const payload = {
-        bucket_id: bucketId || '',  // Allow empty bucket ID
+        bucket_id: bucketId || '',
         bunch_id: bunchId,
-        bunch_size: bunchSize,
+        bunch_size: '',
         farm,
         grader: graderId,
-        qty,
-        stem_length: stemLength,
+        qty: 0,
+        stem_length: '',
         variety: '',
       };
 
@@ -302,36 +286,50 @@ export default function GradeScreen() {
           onScanSuccess();
           showConfirmation('success', `Graded: ${response.qty ?? 0} stems`);
 
-          // Only show remainder modal if a bucket was used and there are remaining stems
+          // Auto-pool the bucket's remainder when it's smaller than a full
+          // bunch. The server returns bucket_remaining_stems on every submit
+          // so this is decided without an extra round-trip.
           if (isConnected && bucketId) {
-            try {
-              const balance = await getBucketBalance(bucketId);
-              if (balance.remaining_stems > 0) {
-                setRemainderModal({
-                  visible: true,
-                  bucketId,
-                  variety: response.source_item ?? response.variety ?? '',
-                  stems: balance.remaining_stems,
-                  bunchSize: response.qty ?? 10,
-                });
+            const remaining = response.bucket_remaining_stems ?? null;
+            const bunchQty = response.qty ?? 10;
+            if (remaining !== null && remaining > 0 && remaining < bunchQty) {
+              const variety = (response.source_item ?? response.variety ?? '').toString();
+              if (variety) {
+                try {
+                  const pres = await addToPool(bucketId, variety, farm, graderId, remaining, bunchQty);
+                  setPoolBalance(pres.pooled_stems);
+                  if (poolVariety !== variety) setPoolVariety(variety);
+                  showConfirmation('success', `${remaining} stems auto-pooled (${pres.pooled_stems} total)`);
+                } catch { /* pool unavailable — silently skip */ }
               }
-            } catch { }
+            }
           }
         } catch (error: any) {
-          await addToSyncQueue('mobile_grading_entry', payload);
-          await addGradingEntry(bunchId, graderId, bucketId || '', farm, '', '', 0, false);
-          setEntries((prev) => [{ bunch_id: bunchId, grader: graderId, bucket_id: bucketId || '', variety: '', stem_length: '', qty: 0, time: now, status: 'error', message: error.message }, ...prev]);
-          await refreshStats();
-          onScanError();
-          showConfirmation('error', error.message);
+          try {
+            await addToSyncQueue('mobile_grading_entry', payload);
+            await addGradingEntry(bunchId, graderId, bucketId || '', farm, '', '', 0, false);
+            setEntries((prev) => [{ bunch_id: bunchId, grader: graderId, bucket_id: bucketId || '', variety: '', stem_length: '', qty: 0, time: now, status: 'error', message: error.message }, ...prev]);
+            await refreshStats();
+            onScanError();
+            showConfirmation('error', error.message);
+          } catch (qErr: any) {
+            // Offline queue full (cap = 5). Refuse the scan instead of pretending.
+            onScanError();
+            showConfirmation('error', qErr.message || 'Offline queue full — reconnect WiFi.');
+          }
         }
       } else {
-        await addToSyncQueue('mobile_grading_entry', payload);
-        await addGradingEntry(bunchId, graderId, bucketId || '', farm, '', '', 0, false);
-        setEntries((prev) => [{ bunch_id: bunchId, grader: graderId, bucket_id: bucketId || '', variety: '', stem_length: '', qty: 0, time: now, status: 'queued', message: 'Saved offline' }, ...prev]);
-        await refreshStats();
-        onScanSuccess();
-        showConfirmation('success', 'Saved offline');
+        try {
+          await addToSyncQueue('mobile_grading_entry', payload);
+          await addGradingEntry(bunchId, graderId, bucketId || '', farm, '', '', 0, false);
+          setEntries((prev) => [{ bunch_id: bunchId, grader: graderId, bucket_id: bucketId || '', variety: '', stem_length: '', qty: 0, time: now, status: 'queued', message: 'Saved offline' }, ...prev]);
+          await refreshStats();
+          onScanSuccess();
+          showConfirmation('success', 'Saved offline');
+        } catch (qErr: any) {
+          onScanError();
+          showConfirmation('error', qErr.message || 'Offline queue full — reconnect WiFi.');
+        }
       }
     };
 
@@ -351,8 +349,11 @@ export default function GradeScreen() {
   }, [slots, locks, submitting, resetSlots]);
 
   const filledCount = SLOT_ORDER.filter((s) => slots[s]).length;
-  const allFilled = filledCount === 3;
-  const hasBunchAndGrader = slots.bunch && slots.grader && !slots.bucket;
+  const allFilled = filledCount === SLOT_ORDER.length;
+  // Manual-submit affordance is only meaningful in Shelving/Zoning, where the
+  // bucket scan is part of the flow. In Direct-to-Grader the bucket slot does
+  // not exist, so auto-submit handles bunch + grader natively.
+  const hasBunchAndGrader = !directToGrader && slots.bunch && slots.grader && !slots.bucket;
 
   // ── Remainder modal handlers ──────────────────────────────────
   const handleAddToPool = async () => {
@@ -420,13 +421,58 @@ export default function GradeScreen() {
     setRejGrader(null);
     setRejQty('');
     setBucketBalance(null);
-    setRejSlot('bucket');
-  }, []);
+    // In DTG mode we never collect a bucket scan — start on grader.
+    setRejSlot(directToGrader ? 'grader' : 'bucket');
+  }, [directToGrader]);
 
   const handleRejectScan = useCallback(async (data: string) => {
     if (rejSubmitting) return;
     const value = extractGradingQRValue(data) || data.trim();
     if (!value) return;
+
+    // Direct-to-Grader: only the grader QR is scanned. We pull the open
+    // Receiving Out for that grader and use ITS bucket + remaining qty as the
+    // reject context. Skips the bucket-scan slot entirely.
+    if (directToGrader) {
+      setLoadingBalance(true);
+      try {
+        const open = await getGraderOpenBucket(value);
+        if (!open.open || !open.bucket_id) {
+          onScanError();
+          showConfirmation(
+            'error',
+            `${value} has no open bucket. Do Receiving Out first.`,
+          );
+          return;
+        }
+        setRejGrader(value);
+        setRejBucketId(open.bucket_id);
+        setBucketBalance({
+          bucket_id:       open.bucket_id,
+          variety:         open.variety || '',
+          item_code:       open.variety || '',
+          remaining_stems: open.remaining_qty || 0,
+          // Best-effort defaults for fields the rejects UI may render. Most
+          // are not relevant to the reject flow in DTG mode.
+          capacity:        open.initial_qty || 0,
+          graded_stems:    Math.max(0, (open.initial_qty || 0) - (open.remaining_qty || 0)),
+          rejected_stems:  0,
+          pooled_stems:    0,
+        } as any);
+        setRejQty(String(open.remaining_qty && open.remaining_qty > 0 ? open.remaining_qty : 0));
+        onScanSuccess();
+        showConfirmation(
+          'success',
+          `${value} · ${open.bucket_id} — ${open.remaining_qty} stems remaining`,
+        );
+      } catch (err: any) {
+        onScanError();
+        showConfirmation('error', err.message);
+      } finally {
+        setLoadingBalance(false);
+      }
+      return;
+    }
 
     if (rejSlot === 'bucket') {
       setLoadingBalance(true);
@@ -450,7 +496,7 @@ export default function GradeScreen() {
       onScanSuccess();
       showConfirmation('success', `Grader: ${value}`);
     }
-  }, [rejSlot, rejSubmitting]);
+  }, [rejSlot, rejSubmitting, directToGrader]);
 
   const handleRejectSubmit = async () => {
     if (!rejBucketId || !rejGrader) {
@@ -591,7 +637,7 @@ export default function GradeScreen() {
 
           <View style={styles.scanSection}>
             <ScanInput
-              placeholder={submitting ? 'Submitting…' : 'Scan bunch / grader / bucket'}
+              placeholder={submitting ? 'Submitting…' : (directToGrader ? 'Scan bunch / grader' : 'Scan bunch / grader / bucket')}
               scannerTitle="Scan QR Code"
               onScan={handleScanned}
               keepFocused
@@ -647,9 +693,10 @@ export default function GradeScreen() {
       ) : mode === 'rejects' ? (
         <ScrollView style={styles.scroll} contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
 
-          {/* Step indicators */}
+          {/* Step indicators — DTG mode hides the bucket pill since the
+              server resolves bucket from the grader's open Receiving Out. */}
           <View style={styles.pillRow}>
-            {(['bucket', 'grader'] as const).map((slot, i) => {
+            {(directToGrader ? ['grader'] as const : ['bucket', 'grader'] as const).map((slot, i) => {
               const value = slot === 'bucket' ? rejBucketId : rejGrader;
               const filled = !!value;
               const label = slot === 'bucket' ? 'Bucket' : 'Grader';
@@ -659,7 +706,7 @@ export default function GradeScreen() {
                   {i > 0 && <View style={[styles.pillConnector, filled ? styles.pillConnectorDone : null]} />}
                   <TouchableOpacity
                     style={[styles.pill, filled ? styles.pillFilled : null]}
-                    onPress={() => { if (!filled) setRejSlot(slot); }}
+                    onPress={() => { if (!filled) setRejSlot(slot as 'bucket' | 'grader'); }}
                     activeOpacity={0.7}
                   >
                     <Ionicons
@@ -674,7 +721,7 @@ export default function GradeScreen() {
                       <TouchableOpacity
                         onPress={() => {
                           if (slot === 'bucket') { setRejBucketId(null); setBucketBalance(null); setRejQty(''); setRejSlot('bucket'); }
-                          else { setRejGrader(null); setRejSlot('grader'); }
+                          else { setRejGrader(null); if (directToGrader) { setRejBucketId(null); setBucketBalance(null); setRejQty(''); } setRejSlot(directToGrader ? 'grader' : 'grader'); }
                         }}
                         hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
                       >
@@ -692,18 +739,31 @@ export default function GradeScreen() {
             {loadingBalance ? (
               <View style={styles.balanceLoading}>
                 <ActivityIndicator size="small" color={colors.text} />
-                <Text style={styles.balanceLoadingText}>Fetching bucket balance…</Text>
+                <Text style={styles.balanceLoadingText}>
+                  {directToGrader ? 'Resolving grader\'s open bucket…' : 'Fetching bucket balance…'}
+                </Text>
               </View>
             ) : (
               <ScanInput
                 placeholder={
-                  !rejBucketId ? 'Scan bucket' :
-                  !rejGrader   ? 'Scan grader' :
-                  'Ready to submit'
+                  directToGrader
+                    ? (!rejGrader ? 'Scan grader QR' : 'Ready to submit')
+                    : (!rejBucketId ? 'Scan bucket' :
+                       !rejGrader   ? 'Scan grader' :
+                       'Ready to submit')
                 }
-                scannerTitle={!rejBucketId ? 'Scan Bucket' : 'Scan Grader'}
+                scannerTitle={
+                  directToGrader
+                    ? 'Scan Grader'
+                    : (!rejBucketId ? 'Scan Bucket' : 'Scan Grader')
+                }
                 onScan={handleRejectScan}
-                disabled={rejSubmitting || (!!rejBucketId && !!rejGrader)}
+                disabled={
+                  rejSubmitting ||
+                  (directToGrader
+                    ? !!rejGrader
+                    : (!!rejBucketId && !!rejGrader))
+                }
               />
             )}
           </View>

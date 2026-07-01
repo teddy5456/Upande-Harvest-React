@@ -21,9 +21,16 @@ import DashboardScreen from './src/screens/DashboardScreen';
 import HarvestScreen from './src/screens/HarvestScreen';
 import ReceivingScreen from './src/screens/ReceivingScreen';
 import ShelveScreen from './src/screens/ShelveScreen';
+import ReceivingOutScreen from './src/screens/ReceivingOutScreen';
+import IssuingScreen from './src/screens/IssuingScreen';
 import GradeScreen from './src/screens/GradeScreen';
 import PackingScreen from './src/screens/PackingScreen';
 import XfloraPackingScreen from './src/screens/XfloraPackingScreen';
+import DispatchScreen from './src/screens/DispatchScreen';
+import LongStorageScreen from './src/screens/LongStorageScreen';
+import ChatScreen from './src/screens/ChatScreen';
+import SupportFab, { useSupport } from './src/components/SupportFab';
+import StaleConnectionBanner from './src/components/StaleConnectionBanner';
 import TransferScreen from './src/screens/TransferScreen';
 import QualityScreen from './src/screens/QualityScreen';
 import ShelfMapScreen from './src/screens/ShelfMapScreen';
@@ -94,12 +101,35 @@ function AgricultureNavigator() {
   );
 }
 
+/**
+ * Top-right "Contact support" button rendered in every screen's header.
+ * Calls into the SupportFab context to open the modal. Must be mounted INSIDE
+ * the SupportFab provider — which the entire Tab.Navigator is wrapped in.
+ */
+function HeaderSupportButton() {
+  const { open } = useSupport();
+  return (
+    <TouchableOpacity
+      onPress={open}
+      style={{ marginRight: spacing.lg, padding: 4 }}
+      activeOpacity={0.7}
+      hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+      accessibilityLabel="Contact support"
+      accessibilityRole="button"
+    >
+      <Ionicons name="headset-outline" size={22} color={colors.text} />
+    </TouchableOpacity>
+  );
+}
+
 const TAB_ICONS: Record<string, { outline: keyof typeof Ionicons.glyphMap; filled: keyof typeof Ionicons.glyphMap }> = {
   Dashboard: { outline: 'home-outline', filled: 'home' },
   Harvest: { outline: 'leaf-outline', filled: 'leaf' },
   Receive: { outline: 'download-outline', filled: 'download' },
   Transfer: { outline: 'swap-horizontal-outline', filled: 'swap-horizontal' },
   Shelve: { outline: 'scan-outline', filled: 'scan' },
+  ReceivingOut: { outline: 'paper-plane-outline', filled: 'paper-plane' },
+  Issuing: { outline: 'cart-outline', filled: 'cart' },
   Grade: { outline: 'clipboard-outline', filled: 'clipboard' },
   Pack: { outline: 'cube-outline', filled: 'cube' },
   Quality: { outline: 'shield-checkmark-outline', filled: 'shield-checkmark' },
@@ -108,7 +138,8 @@ const TAB_ICONS: Record<string, { outline: keyof typeof Ionicons.glyphMap; fille
 };
 
 function AppContent() {
-  const { isReady, isLoggedIn, isXflora } = useApp();
+  const { isReady, isLoggedIn, isXflora, storageMode } = useApp();
+  const isDirectToGrader = storageMode === 'Direct-to-Grader';
   const insets = useSafeAreaInsets();
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [changelogOpen, setChangelogOpen] = useState(false);
@@ -141,6 +172,7 @@ function AppContent() {
 
   return (
     <NavigationContainer ref={navigationRef}>
+      <SupportFab>
       <Tab.Navigator
         screenOptions={({ route }) => ({
           headerStyle: {
@@ -164,6 +196,7 @@ function AppContent() {
               <Ionicons name="menu-outline" size={24} color={colors.text} />
             </TouchableOpacity>
           ),
+          headerRight: () => <HeaderSupportButton />,
           tabBarActiveTintColor: colors.text,
           tabBarInactiveTintColor: colors.textMuted,
           tabBarShowLabel: false,
@@ -190,9 +223,24 @@ function AppContent() {
         <Tab.Screen name="Harvest" component={HarvestScreen} options={{ title: 'Harvest', tabBarItemStyle: isXflora ? { display: 'none' } : undefined }} />
         <Tab.Screen name="Receive" component={ReceivingScreen} options={{ title: 'Receiving' }} />
         <Tab.Screen name="Transfer" component={TransferScreen} options={{ tabBarItemStyle: isXflora ? undefined : { display: 'none' }, title: 'Transfer' }} />
-        <Tab.Screen name="Shelve" component={ShelveScreen} options={{ title: 'Shelve' }} />
+        {/* Shelve is reachable via the drawer; hidden from the bottom nav. */}
+        <Tab.Screen
+          name="Shelve"
+          component={ShelveScreen}
+          options={{ title: 'Shelve', tabBarItemStyle: { display: 'none' } }}
+        />
+        {/* Receiving Out is now the bucket↔grader binding for ALL modes. */}
+        <Tab.Screen
+          name="ReceivingOut"
+          component={ReceivingOutScreen}
+          options={{ title: 'Receiving Out' }}
+        />
         <Tab.Screen name="Grade" component={GradeScreen} options={{ title: 'Grade' }} />
         <Tab.Screen name="Pack" component={isXflora ? XfloraPackingScreen : PackingScreen} options={{ tabBarItemStyle: { display: 'none' }, title: 'Packing' }} />
+        <Tab.Screen name="LongStorage" component={LongStorageScreen} options={{ tabBarItemStyle: { display: 'none' }, title: 'Long Storage' }} />
+        <Tab.Screen name="Chat" component={ChatScreen} options={{ tabBarItemStyle: { display: 'none' }, title: 'Chat' }} />
+        <Tab.Screen name="Dispatch" component={DispatchScreen} options={{ tabBarItemStyle: { display: 'none' }, title: 'Dispatch' }} />
+        <Tab.Screen name="Issuing" component={IssuingScreen} options={{ tabBarItemStyle: { display: 'none' }, title: 'Issuing' }} />
         <Tab.Screen name="Quality" component={QualityScreen} options={{ tabBarItemStyle: { display: 'none' }, title: 'Quality' }} />
         <Tab.Screen name="Map" component={ShelfMapScreen} options={{ tabBarItemStyle: { display: 'none' }, title: 'Shelf Map' }} />
         <Tab.Screen name="Settings" component={SettingsScreen} options={{ tabBarItemStyle: { display: 'none' }, title: 'Settings' }} />
@@ -207,6 +255,9 @@ function AppContent() {
           }}
         />
       </Tab.Navigator>
+      </SupportFab>
+
+      <StaleConnectionBanner />
 
       <DrawerMenu
         visible={drawerOpen}

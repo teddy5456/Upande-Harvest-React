@@ -51,28 +51,33 @@ export function generateAllShelfIds(): string[] {
 }
 
 export function parseScannedShelfQR(data: string): string | null {
+  let candidate = data;
   try {
     const parsed = JSON.parse(data);
-    if (parsed.shelf) return parsed.shelf;
+    if (parsed.shelf) candidate = String(parsed.shelf);
   } catch {
     // Not JSON — treat as raw shelf ID
   }
-  const cleaned = data.trim().toUpperCase();
+  // Some QR generators encode the shelf with an internal space (e.g. "B 1041");
+  // strip all whitespace before validating so both spaced and unspaced forms work.
+  const cleaned = candidate.replace(/\s+/g, '').toUpperCase();
   if (parseShelfId(cleaned)) return cleaned;
   return null;
 }
 
 export function parseScannedBucketQR(data: string): string | null {
+  let candidate: string | null = null;
   try {
     const parsed = JSON.parse(data);
-    if (parsed['bucket-id']) return parsed['bucket-id'];
-    if (parsed.bucket_id) return parsed.bucket_id;
-    if (parsed.bucket) return parsed.bucket;
-    if (parsed.id) return parsed.id;
+    candidate = parsed['bucket-id'] ?? parsed.bucket_id ?? parsed.bucket ?? parsed.id ?? null;
   } catch {
     // Not JSON — treat as raw bucket ID
+    candidate = data.trim() || null;
   }
-  const cleaned = data.trim();
-  if (cleaned.length > 0) return cleaned;
-  return null;
+  if (!candidate) return null;
+  // Reject accidental scans of non-bucket QRs (bunch/grader/shelf labels) —
+  // a real bucket ID is always of the form "BUCKET-…", so the substring
+  // must be present (case-insensitive).
+  if (!/bucket/i.test(candidate)) return null;
+  return candidate;
 }

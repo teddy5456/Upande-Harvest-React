@@ -74,6 +74,20 @@ export async function setUserEmail(email: string): Promise<void> {
   await setSetting('user_email', email);
 }
 
+// ─── Storage mode cache ──────────────────────────────────────────────────────
+// Persist storage_mode locally so the app stays in Direct-to-Grader mode even
+// when WiFi drops. Without this the GradeScreen reverts to the 3-slot
+// (bunch+grader+bucket) default whenever the network fetch fails — confusing
+// graders mid-shift. Refresh whenever a successful getStorageMode() lands.
+
+export async function getCachedStorageMode(): Promise<string | null> {
+  return getSetting('storage_mode');
+}
+
+export async function setCachedStorageMode(mode: string): Promise<void> {
+  await setSetting('storage_mode', mode);
+}
+
 // ─── Greenhouse cache ─────────────────────────────────────────────────────────
 // Stores the full greenhouse list so the Harvest screen can render instantly
 // even when the device is offline. The cache is refreshed in the background

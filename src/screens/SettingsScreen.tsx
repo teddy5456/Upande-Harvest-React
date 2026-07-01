@@ -17,10 +17,40 @@ import { resetDatabase } from '../database/database';
 import { useApp } from '../context/AppContext';
 import Dropdown, { DropdownOption } from '../components/Dropdown';
 import { getCachedFarms } from '../utils/farm-cache';
-import { submitIssue } from '../services/api';
 import { SyncQueueEntry } from '../types';
 import { colors, fontFamily, fontSize, spacing, borderRadius } from '../theme';
 import { version } from '../../package.json';
+import {
+  hasEnrolledCredentials,
+  clearEnrolledCredentials,
+  enrollCredentials,
+  biometricSupported,
+  resetOfferedFlag,
+} from '../services/auth';
+import { getSid, getApiUrl } from '../database/settings';
+
+/**
+ * Parse a sync_queue.created_at value to the device's local clock.
+ *
+ * Two formats live in the DB:
+ *   - New rows (from this build forward): full ISO with 'Z' (e.g. '2026-05-29T11:30:00.000Z')
+ *     — JS parses cleanly as UTC and toLocaleString() localizes.
+ *   - Old rows (from SQLite's `datetime('now')` default): naked UTC text
+ *     without a zone marker (e.g. '2026-05-29 11:30:00') — JS would mis-parse
+ *     this as LOCAL time, producing a 3-hour drift in EAT. Append 'Z' to
+ *     force UTC interpretation.
+ */
+function formatQueueTime(createdAt: string | null | undefined): string {
+  if (!createdAt) return '—';
+  let iso = String(createdAt);
+  // Detect "no zone marker": 'YYYY-MM-DD HH:MM:SS' style → convert to ISO + Z
+  if (!iso.endsWith('Z') && !/[+-]\d{2}:?\d{2}$/.test(iso)) {
+    iso = iso.replace(' ', 'T') + 'Z';
+  }
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return createdAt;
+  return d.toLocaleString();
+}
 
 function Row({ icon, label, value, onPress, color }: {
   icon: keyof typeof Ionicons.glyphMap;
@@ -53,8 +83,77 @@ export default function SettingsScreen() {
   const [queueEntries, setQueueEntries] = useState<SyncQueueEntry[]>([]);
   const [showQueue, setShowQueue] = useState(false);
   const [retryProgress, setRetryProgress] = useState<{ total: number; done: number } | null>(null);
-  const [supportVisible, setSupportVisible] = useState(false);
+  const [bioEnrolled, setBioEnrolled] = useState(false);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const screenshotRef = useRef<View>(null);
+
+  useEffect(() => {
+    let alive = true;
+    hasEnrolledCredentials().then(v => { if (alive) setBioEnrolled(v); });
+    return () => { alive = false; };
+  }, []);
+
+  const handleToggleFingerprint = async () => {
+    if (bioEnrolled) {
+      Alert.alert(
+        'Turn off fingerprint sign-in?',
+        'You\'ll need to type your email and password the next time you sign in.',
+        [
+          { text: 'Cancel', style: 'cancel' },
+          {
+            text: 'Turn off',
+            style: 'destructive',
+            onPress: async () => {
+              await clearEnrolledCredentials();
+              await resetOfferedFlag();
+              setBioEnrolled(false);
+            },
+          },
+        ],
+      );
+      return;
+    }
+
+    // Turning ON — biometrically encrypt the current session's credentials.
+    // We need the password fresh from the user (we never keep it in JS memory
+    // outside the unlocked SecureStore blob), so ask them to confirm it.
+    const bio = await biometricSupported();
+    if (!bio.available) {
+      Alert.alert('Not supported', 'This device doesn\'t support biometric or device-PIN authentication.');
+      return;
+    }
+    Alert.prompt(
+      'Confirm your password',
+      'Re-enter your password to enable fingerprint sign-in. We need it to encrypt your credentials behind your fingerprint.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Enable',
+          onPress: async (pwd?: string) => {
+            if (!pwd) return;
+            const serverUrl = await getApiUrl();
+            if (!serverUrl || !userEmail) {
+              Alert.alert('Not signed in', 'Please sign in first.');
+              return;
+            }
+            const ok = await enrollCredentials({
+              serverUrl,
+              email: userEmail,
+              password: pwd,
+              enrolledAt: new Date().toISOString(),
+            });
+            if (ok) {
+              setBioEnrolled(true);
+              Alert.alert('Enabled', 'Fingerprint sign-in is now on.');
+            } else {
+              Alert.alert('Not enabled', 'Fingerprint enrolment was cancelled.');
+            }
+          },
+        },
+      ],
+      'secure-text',
+    );
+  };
 
   const refreshSyncState = async () => {
     setPendingCount(await getPendingCount());
@@ -175,7 +274,7 @@ export default function SettingsScreen() {
     .slice(0, 2);
 
   return (
-    <View style={styles.container}>
+    <View style={styles.container} ref={screenshotRef}>
       <ScrollView style={styles.scroll} contentContainerStyle={styles.content}>
         {/* Profile */}
         <TouchableOpacity style={styles.profile} activeOpacity={0.6}>
@@ -265,7 +364,7 @@ export default function SettingsScreen() {
                     <View style={styles.queueMain}>
                       <Text style={styles.queueAction}>{entry.action}</Text>
                       <Text style={styles.queueTime}>
-                        {new Date(entry.created_at).toLocaleString()}
+                        {formatQueueTime(entry.created_at)}
                       </Text>
                       {entry.error_message ? (
                         <Text style={styles.queueError}>{entry.error_message}</Text>
@@ -293,29 +392,20 @@ export default function SettingsScreen() {
           </View>
         )}
 
-        {/* Support */}
-        <Text style={styles.sectionHeader}>Support</Text>
-        <View style={styles.section}>
-          <Row
-            icon="help-circle-outline"
-            label="Contact support"
-            onPress={() => setSupportVisible(true)}
-          />
-        </View>
-
         {/* Account */}
         <Text style={styles.sectionHeader}>Account</Text>
         <View style={styles.section}>
+          <Row
+            icon="finger-print-outline"
+            label="Fingerprint sign-in"
+            value={bioEnrolled ? 'On' : 'Off'}
+            onPress={handleToggleFingerprint}
+          />
+          <View style={styles.divider} />
           <Row icon="trash-outline" label="Reset all data" onPress={handleResetData} color={colors.error} />
           <View style={styles.divider} />
           <Row icon="log-out-outline" label="Sign out" onPress={handleLogout} color={colors.error} />
         </View>
-
-        <SupportModal
-          visible={supportVisible}
-          onClose={() => setSupportVisible(false)}
-        />
-
 
         <Text style={styles.versionText}>Upande Harvest v{version}</Text>
       </ScrollView>
@@ -578,92 +668,3 @@ const styles = StyleSheet.create({
   spSkipText: { fontFamily: fontFamily.medium, fontSize: fontSize.sm, color: colors.textMuted },
 });
 
-function SupportModal({
-  visible,
-  onClose,
-}: {
-  visible: boolean;
-  onClose: () => void;
-}) {
-  const [subject, setSubject] = useState('');
-  const [description, setDescription] = useState('');
-  const [submitting, setSubmitting] = useState(false);
-
-  const reset = () => {
-    setSubject('');
-    setDescription('');
-  };
-
-  const handleSubmit = async () => {
-    const subj = subject.trim();
-    if (!subj) {
-      Alert.alert('Required', 'Enter a short subject');
-      return;
-    }
-    setSubmitting(true);
-    try {
-      const resp = await submitIssue(subj, description.trim());
-      Alert.alert('Sent', `Issue ${resp.issue} logged — we'll follow up.`);
-      reset();
-      onClose();
-    } catch (e: any) {
-      Alert.alert('Failed', e?.message ?? 'Could not submit. Check connection and try again.');
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  return (
-    <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
-      <View style={styles.spOverlay}>
-        <View style={styles.spCard}>
-          <View style={styles.spHeader}>
-            <Text style={styles.spTitle}>Contact support</Text>
-            <TouchableOpacity onPress={onClose}>
-              <Ionicons name="close" size={20} color={colors.textMuted} />
-            </TouchableOpacity>
-          </View>
-
-          <Text style={styles.spLabel}>SUBJECT</Text>
-          <TextInput
-            style={styles.spInput}
-            placeholder="What's the issue?"
-            placeholderTextColor={colors.textMuted}
-            value={subject}
-            onChangeText={setSubject}
-            maxLength={140}
-            editable={!submitting}
-          />
-
-          <Text style={styles.spLabel}>DESCRIPTION</Text>
-          <TextInput
-            style={[styles.spInput, { minHeight: 90, textAlignVertical: 'top' }]}
-            placeholder="Steps to reproduce, what you expected, what happened..."
-            placeholderTextColor={colors.textMuted}
-            value={description}
-            onChangeText={setDescription}
-            multiline
-            editable={!submitting}
-          />
-
-          <View style={styles.spActions}>
-            <TouchableOpacity style={styles.spSkip} onPress={onClose} disabled={submitting}>
-              <Text style={styles.spSkipText}>Cancel</Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={[styles.spSubmit, submitting && { opacity: 0.6 }]}
-              onPress={handleSubmit}
-              disabled={submitting}
-            >
-              {submitting ? (
-                <ActivityIndicator size="small" color="#fff" />
-              ) : (
-                <Text style={styles.spSubmitText}>Send</Text>
-              )}
-            </TouchableOpacity>
-          </View>
-        </View>
-      </View>
-    </Modal>
-  );
-}

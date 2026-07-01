@@ -34,6 +34,18 @@ function genBatchId(): string {
   return `QB-${Date.now()}`;
 }
 
+// Server returns harvest_time as "YYYY-MM-DD HH:MM:SS" (or sometimes a bare
+// timestamp). Show just HH:MM if it's today, otherwise include the date.
+function formatHarvestTime(raw: string): string {
+  if (!raw) return '';
+  const trimmed = raw.replace('T', ' ').trim();
+  const [datePart, timePartRaw] = trimmed.split(' ');
+  const timePart = (timePartRaw || '').slice(0, 5); // HH:MM
+  const todayISO = new Date().toISOString().slice(0, 10);
+  if (datePart === todayISO) return timePart || trimmed;
+  return [datePart, timePart].filter(Boolean).join(' ');
+}
+
 export default function ReceivingScreen() {
   const { isConnected, refreshStats, isXflora } = useApp();
   const route = useRoute<RouteProp<Record<string, ReceivingRouteParams>, string>>();
@@ -48,6 +60,7 @@ export default function ReceivingScreen() {
   // Inline quality check — appears BEFORE receiving
   const [pendingQuality, setPendingQuality] = useState<{
     bucketId: string; variety?: string; greenhouse?: string; qty?: number;
+    harvester?: string; harvestTime?: string;
   } | null>(null);
   const [qualityLines, setQualityLines] = useState<RejectLine[]>([]);
   const [qualityNotes, setQualityNotes] = useState('');
@@ -189,19 +202,23 @@ export default function ReceivingScreen() {
         setQualityNotes('');
       }
 
-      // Look up bucket info (variety/greenhouse/qty) from harvest entry pre-receive
+      // Look up bucket info (variety/greenhouse/qty + harvester) from harvest entry pre-receive
       let variety: string | undefined;
       let greenhouse: string | undefined;
       let qty: number | undefined;
+      let harvester: string | undefined;
+      let harvestTime: string | undefined;
       if (isConnected) {
         try {
           const info = await getBucketBalance(bucketId);
           variety = info.variety;
           greenhouse = info.greenhouse;
           qty = info.bucket_total;
+          harvester = info.harvester;
+          harvestTime = info.harvest_time;
         } catch {}
       }
-      setPendingQuality({ bucketId, variety, greenhouse, qty });
+      setPendingQuality({ bucketId, variety, greenhouse, qty, harvester, harvestTime });
       if (batchMode) setBatchBuckets((prev) => prev.includes(bucketId) ? prev : [...prev, bucketId]);
     },
     [isConnected, batchMode, pendingQuality, doReceive]
@@ -392,6 +409,22 @@ export default function ReceivingScreen() {
                   <Text style={styles.qualityCardSub}>
                     {[stripStemLength(pendingQuality.variety || ''), pendingQuality.greenhouse, pendingQuality.qty ? `${pendingQuality.qty} stems` : ''].filter(Boolean).join('  ·  ')}
                   </Text>
+                ) : null}
+                {(pendingQuality.harvester || pendingQuality.harvestTime) ? (
+                  <View style={styles.harvestMeta}>
+                    {pendingQuality.harvester ? (
+                      <View style={styles.harvestMetaItem}>
+                        <Ionicons name="person-outline" size={11} color={colors.textMuted} />
+                        <Text style={styles.harvestMetaText}>{pendingQuality.harvester}</Text>
+                      </View>
+                    ) : null}
+                    {pendingQuality.harvestTime ? (
+                      <View style={styles.harvestMetaItem}>
+                        <Ionicons name="time-outline" size={11} color={colors.textMuted} />
+                        <Text style={styles.harvestMetaText}>{formatHarvestTime(pendingQuality.harvestTime)}</Text>
+                      </View>
+                    ) : null}
+                  </View>
                 ) : null}
               </View>
             </View>
@@ -660,6 +693,9 @@ const styles = StyleSheet.create({
   qualityCardHeader: { flexDirection: 'row', alignItems: 'flex-start', gap: spacing.sm, marginBottom: spacing.md },
   qualityCardTitle: { fontFamily: fontFamily.semiBold, fontSize: fontSize.sm, color: colors.text },
   qualityCardSub: { fontFamily: fontFamily.regular, fontSize: fontSize.xs, color: colors.textMuted, marginTop: 2 },
+  harvestMeta: { flexDirection: 'row', flexWrap: 'wrap', gap: spacing.md, marginTop: 4 },
+  harvestMetaItem: { flexDirection: 'row', alignItems: 'center', gap: 3 },
+  harvestMetaText: { fontFamily: fontFamily.regular, fontSize: fontSize.xs, color: colors.textMuted },
   qualityReasonLabel: { fontFamily: fontFamily.medium, fontSize: fontSize.sm, color: colors.text, marginBottom: spacing.sm },
   qualityOptional: { fontFamily: fontFamily.regular, fontSize: fontSize.xs, color: colors.textMuted },
   reasonGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: spacing.xs, marginBottom: spacing.md },

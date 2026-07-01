@@ -38,11 +38,15 @@ import {
 } from '../types';
 import { onScanSuccess, onScanError } from '../utils/feedback';
 import { colors, fontFamily, fontSize, spacing, borderRadius } from '../theme';
+import DiscardSection from './quality/DiscardSection';
 
 // ---------------------------------------------------------------------------
 // Section config — only what's truly needed per section
 // ---------------------------------------------------------------------------
-const SECTION_CONFIG: Record<QualitySection, {
+// Note: `discard` is request-driven and renders its own component, so it
+// doesn't appear in SECTION_CONFIG — we short-circuit before consulting it.
+type FormSection = Exclude<QualitySection, 'discard'>;
+const SECTION_CONFIG: Record<FormSection, {
   showGreenhouse: boolean;
   greenhouseRequired: boolean;
   showVariety: boolean;
@@ -74,22 +78,6 @@ const SECTION_CONFIG: Record<QualitySection, {
     showBucketId: true, bucketRequired: true,
     showQuarantine: false,
     refPlaceholder: 'Bucket ID',
-  },
-  packhouse_discard: {
-    showGreenhouse: false, greenhouseRequired: false,
-    showVariety: false, showStandaloneVariety: false, varietyRequired: false,
-    showBucketId: true, bucketRequired: false,
-    showQuarantine: false,
-    refPlaceholder: 'Bunch / Bucket ID (optional)',
-  },
-  dispatch_reject: {
-    // Discarding graded bunches from the dispatch cold store —
-    // variety is selected from the full 50cm items list, bunch ID optional
-    showGreenhouse: false, greenhouseRequired: false,
-    showVariety: false, showStandaloneVariety: true, varietyRequired: true,
-    showBucketId: true, bucketRequired: false,
-    showQuarantine: false,
-    refPlaceholder: 'Bunch ID (optional)',
   },
 };
 
@@ -154,8 +142,12 @@ export default function QualityScreen() {
   const show = (type: 'success' | 'error', msg: string) =>
     setConfirmation({ visible: true, type, message: msg });
 
-  const cfg = SECTION_CONFIG[activeSection];
-  const reasons = QUALITY_REASONS[activeSection];
+  // `discard` is request-driven and renders its own component below — guard
+  // every lookup that would index by `activeSection` here so a tab swap to
+  // Discard never tries to read the form config / reasons.
+  const isDiscard = activeSection === 'discard';
+  const cfg = isDiscard ? null : SECTION_CONFIG[activeSection as FormSection];
+  const reasons = isDiscard ? [] : QUALITY_REASONS[activeSection as FormSection];
   const totalRejects = rejectLines.reduce((s, l) => s + l.quantity, 0);
 
   useEffect(() => {
@@ -168,7 +160,7 @@ export default function QualityScreen() {
 
 // Lazy-load packable varieties the first time a section that needs them is opened
 useEffect(() => {
-  if (!cfg.showStandaloneVariety || packableVarieties.length > 0 || loadingPackable) return;
+  if (!cfg?.showStandaloneVariety || packableVarieties.length > 0 || loadingPackable) return;
   setLoadingPackable(true);
   fetchPackableVarieties()
     .then((resp) => {
@@ -178,7 +170,7 @@ useEffect(() => {
     })
     .catch(() => {})
     .finally(() => setLoadingPackable(false));
-}, [cfg.showStandaloneVariety, packableVarieties.length, loadingPackable]);
+}, [cfg?.showStandaloneVariety, packableVarieties.length, loadingPackable]);
 
   const ghOptions: DropdownOption[] = greenhouses.map((g) => ({
     label: g.warehouse_name || g.name,
@@ -250,6 +242,7 @@ const varietyOptions: DropdownOption[] = (() => {
 
   // ── Submit ────────────────────────────────────────────────────────────────
   const handleSubmit = async () => {
+    if (!cfg) return; // discard section has its own submit path
     const quarantineOnly = cfg.showQuarantine && quarantineOn && rejectLines.length === 0;
     if (!quarantineOnly && rejectLines.length === 0) {
       show('error', 'Select at least one reason or toggle Quarantine');
@@ -297,7 +290,7 @@ const varietyOptions: DropdownOption[] = (() => {
     }
 
     // If quarantine is on and scope is greenhouse or batch, create the batch record too
-    if (cfg.showQuarantine && quarantineOn) {
+    if (cfg!.showQuarantine && quarantineOn) {
       setSubmittingQuarantine(true);
       const batchId = genBatchId();
       const scope: QuarantineScope = quarantineScope === 'greenhouse' ? 'greenhouse' : 'buckets';
@@ -383,10 +376,13 @@ const varietyOptions: DropdownOption[] = (() => {
         </TouchableOpacity>
       </View>
 
+      {isDiscard ? (
+        <DiscardSection show={show} />
+      ) : (
       <ScrollView style={styles.scroll} contentContainerStyle={styles.scrollContent} keyboardShouldPersistTaps="handled">
 
         {/* Greenhouse — field_reject only */}
-        {cfg.showGreenhouse && (
+        {cfg!.showGreenhouse && (
           <View style={styles.field}>
             <Text style={styles.label}>Greenhouse <Text style={styles.req}>*</Text></Text>
             {loadingGreenhouses
@@ -398,7 +394,7 @@ const varietyOptions: DropdownOption[] = (() => {
         )}
 
         {/* Variety — field_reject only, after greenhouse picked */}
-        {cfg.showVariety && greenhouse ? (
+        {cfg!.showVariety && greenhouse ? (
           <View style={styles.field}>
             <Text style={styles.label}>Variety</Text>
             <Dropdown value={variety} options={varietyOptions} placeholder="Select variety"
@@ -407,10 +403,10 @@ const varietyOptions: DropdownOption[] = (() => {
         ) : null}
 
         {/* Variety — standalone picker for dispatch_reject (all 50cm items) */}
-        {cfg.showStandaloneVariety && (
+        {cfg!.showStandaloneVariety && (
           <View style={styles.field}>
             <Text style={styles.label}>
-              Variety {cfg.varietyRequired && <Text style={styles.req}>*</Text>}
+              Variety {cfg!.varietyRequired && <Text style={styles.req}>*</Text>}
             </Text>
             {loadingPackable
               ? <ActivityIndicator size="small" color={colors.textMuted} />
@@ -425,7 +421,7 @@ const varietyOptions: DropdownOption[] = (() => {
         )}
 
         {/* Bucket / reference ID */}
-        {cfg.showBucketId && (
+        {cfg!.showBucketId && (
           <View style={styles.field}>
             <TextInput
               style={styles.input}
@@ -433,7 +429,7 @@ const varietyOptions: DropdownOption[] = (() => {
               onChangeText={(v) => { setBucketId(v); setBucketBalance(null); }}
               onSubmitEditing={() => fetchBalance(bucketId)}
               onBlur={() => fetchBalance(bucketId)}
-              placeholder={cfg.refPlaceholder}
+              placeholder={cfg!.refPlaceholder}
               placeholderTextColor={colors.textMuted}
               returnKeyType="done"
             />
@@ -555,7 +551,7 @@ const varietyOptions: DropdownOption[] = (() => {
         </View>
 
         {/* ── Unified quarantine card (receiving_reject only) ── */}
-        {cfg.showQuarantine && (
+        {cfg!.showQuarantine && (
           <View style={styles.field}>
             <TouchableOpacity
               style={[styles.quarantineToggleRow, quarantineOn && styles.quarantineToggleRowOn]}
@@ -639,9 +635,9 @@ const varietyOptions: DropdownOption[] = (() => {
         {/* Submit — enabled when there are reject lines OR quarantine is toggled on */}
         <TouchableOpacity
           style={[styles.submitBtn,
-            (submitting || (rejectLines.length === 0 && !(cfg.showQuarantine && quarantineOn))) && styles.submitBtnOff]}
+            (submitting || (rejectLines.length === 0 && !(cfg!.showQuarantine && quarantineOn))) && styles.submitBtnOff]}
           onPress={handleSubmit}
-          disabled={submitting || (rejectLines.length === 0 && !(cfg.showQuarantine && quarantineOn))}
+          disabled={submitting || (rejectLines.length === 0 && !(cfg!.showQuarantine && quarantineOn))}
           activeOpacity={0.8}
         >
           <Ionicons name="save-outline" size={19} color={colors.textOnPrimary} />
@@ -650,7 +646,7 @@ const varietyOptions: DropdownOption[] = (() => {
               ? 'Saving…'
               : totalRejects > 0
                 ? `Record ${totalRejects} Reject${totalRejects !== 1 ? 's' : ''}`
-                : (cfg.showQuarantine && quarantineOn)
+                : (cfg!.showQuarantine && quarantineOn)
                   ? 'Quarantine Bucket'
                   : 'Record Rejects'}
           </Text>
@@ -677,6 +673,7 @@ const varietyOptions: DropdownOption[] = (() => {
         )}
 
       </ScrollView>
+      )}
 
       {/* ── Quarantine list modal ── */}
       <Modal visible={listVisible} transparent animationType="slide">

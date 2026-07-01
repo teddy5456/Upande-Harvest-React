@@ -101,6 +101,9 @@ export interface GradingResponse {
   source_item: string;
   stem_length: string;
   qty: number;
+  // Server returns the source bucket's remaining stem count post-submit so
+  // the client can decide whether to auto-pool without a follow-up call.
+  bucket_remaining_stems?: number;
 }
 
 export interface GradedEntry {
@@ -137,6 +140,15 @@ export interface HarvestListEntry {
   time: string;
   status: 'success' | 'error' | 'queued';
   message?: string;
+  // Server-side handle for cancel/edit on the last-scans panel. Only set when
+  // the entry actually went through to the ERP (status==='success'). Queued
+  // entries don't have one yet — sync.ts populates it later.
+  stock_entry?: string;
+  // Context needed to rebuild the entry when the user edits the qty
+  section?: string;
+  harvester?: string;
+  greenhouse?: string;
+  farm?: string;
 }
 
 export interface HarvestResponse {
@@ -358,6 +370,47 @@ export interface OpenBoxResponse {
   pack_rate: number;
 }
 
+// ── Direct-to-FPL packing (Pack by OPL mode) ────────────────────────────────
+export interface PackableOpl {
+  opl: string;
+  customer: string;
+  customer_name: string;
+  sales_order: string | null;
+  pack_rate: number;
+  is_mix: boolean;
+  total_stems: number;
+  box_count: number;
+  open_count: number;
+  current_sequence: number;
+  date_created: string | null;
+  status: 'ready' | 'in_progress' | 'done';
+}
+
+export interface ListOpenOplsResponse {
+  opls: PackableOpl[];
+  count: number;
+}
+
+export interface PackBunchToOplResponse {
+  box_id: string;
+  box_sequence: number;
+  pack_box_name: string;
+  opl: string;
+  stems_count: number;
+  pack_rate: number;
+  remaining: number;
+  full: boolean;
+  auto_created_box: boolean;
+  fpl: string | null;
+  bunch: {
+    bunch_id: string;
+    variety: string;
+    stem_length: string;
+    bunch_size: string;
+    stems: number;
+  };
+}
+
 export interface PackableVariety {
   display: string;      // e.g. "Athena"
   item_code: string;    // e.g. "Athena 50cm"
@@ -370,24 +423,95 @@ export interface PackableVarietiesResponse {
   varieties: PackableVariety[];
 }
 
+// ── Long Storage ────────────────────────────────────────────────────────────
+export interface StorageBoxSealResponse {
+  storage_box: string;
+  box_id: string;
+  variety: string;
+  stem_length: string;
+  stems_count: number;
+  original_stems: number;
+  bucket_id: string;
+  stems_added: number;
+  stock_entry: string;
+  bucket_status: 'Available' | 'In Use';
+}
+
+export interface LongStorageTotals {
+  boxes: number;
+  stems: number;
+  varieties: number;
+  oldest_days: number;
+}
+
+export interface LongStorageVarietyRow {
+  variety: string;
+  variety_name: string;
+  stem_length: string;
+  stems: number;
+  boxes: number;
+  oldest_sealed_at: string | null;
+}
+
+export interface LongStorageWarehouseRow {
+  warehouse: string;
+  stems: number;
+  boxes: number;
+}
+
+export interface LongStorageActiveBox {
+  name: string;
+  box_id: string;
+  variety: string;
+  stem_length: string;
+  stems_count: number;
+  original_stems: number;
+  status: string;
+  warehouse: string;
+  farm: string | null;
+  sealed_at: string | null;
+  last_drained_at: string | null;
+}
+
+export interface LongStorageData {
+  totals: LongStorageTotals;
+  per_variety: LongStorageVarietyRow[];
+  per_warehouse: LongStorageWarehouseRow[];
+  active_boxes: LongStorageActiveBox[];
+}
+
+export interface ScanResolveResponse {
+  kind: 'bucket' | 'storage_box';
+  id: string;
+  box_id?: string;
+  variety?: string;
+  variety_name?: string;
+  stem_length?: string;
+  stems_count?: number;
+  warehouse?: string;
+  status?: string;
+}
+
 // Quality types
-export type QualitySection = 'field_reject' | 'receiving_reject' | 'grading_reject' | 'packhouse_discard' | 'dispatch_reject';
+//
+// `discard` is a request-driven flow (Discard Request doctype): operators
+// pick an approved request and scan buckets (Intake coldstore) or bunches
+// (Dispatch coldstore) against it. The reason lives on the request, so this
+// section has no per-scan reason picker — see DiscardSection.tsx.
+export type QualitySection = 'field_reject' | 'receiving_reject' | 'grading_reject' | 'discard';
 export type QuarantineAction = 'discard' | 'intake' | '';
 
 export const QUALITY_SECTIONS: { key: QualitySection; label: string; icon: string }[] = [
   { key: 'field_reject', label: 'Field', icon: 'leaf-outline' },
   { key: 'receiving_reject', label: 'Receiving', icon: 'download-outline' },
   { key: 'grading_reject', label: 'Grading', icon: 'funnel-outline' },
-  { key: 'packhouse_discard', label: 'Packhouse', icon: 'trash-outline' },
-  { key: 'dispatch_reject', label: 'Dispatch', icon: 'send-outline' },
+  { key: 'discard', label: 'Discard', icon: 'trash-bin-outline' },
 ];
 
-export const QUALITY_REASONS: Record<QualitySection, string[]> = {
+export const QUALITY_REASONS: Record<Exclude<QualitySection, 'discard'>, string[]> = {
   field_reject: ['Botrytis', 'Rust', 'Downy Mildew', 'Thrips Damage', 'Broken Stem', 'Short Stem', 'Drooping', 'Bent Neck', 'Mixed Variety', 'Other'],
   receiving_reject: ['Botrytis', 'Rust', 'Downy Mildew', 'Thrips Damage', 'Broken Stem', 'Short Stem', 'Drooping', 'Bent Neck', 'Mixed Variety', 'Damaged in Transit', 'Over-aged', 'Other'],
   grading_reject: ['Botrytis', 'Bent Neck', 'Short Stem', 'Broken Stem', 'Thrips Damage', 'Bruised', 'Rust', 'Mixed Variety', 'Tight Cut Stage', 'Advanced Cut Stage', 'Other'],
-  packhouse_discard: ['Bent Neck', 'Short Stem', 'Botrytis', 'Thrips', 'Bruised', 'Other'],
-  dispatch_reject: ['Over-aged', 'Bent Neck', 'Botrytis', 'Bruised', 'Dehydrated', 'Broken Stem', 'Other'],
 };
 
 // ---------------------------------------------------------------------------
@@ -494,6 +618,43 @@ export interface QualityResponse {
   message: string;
 }
 
+// Discard Request — request/approval-driven coldstore discards.
+export type DiscardColdstore = 'Intake' | 'Dispatch';
+
+export interface DiscardRequestRow {
+  variety: string;            // item_code
+  variety_name?: string;
+  qty_requested: number;
+  qty_discarded: number;
+  qty_remaining: number;
+}
+
+export interface DiscardRequestSummary {
+  name: string;
+  reason: string;
+  request_date: string | null;
+  requested_by: string | null;
+  approved_by: string | null;
+  approved_at: string | null;
+  farm: string | null;
+  notes: string | null;
+  total_requested: number;
+  total_discarded: number;
+  total_remaining: number;
+  items: DiscardRequestRow[];
+}
+
+export interface DiscardConsumeResponse {
+  status: 'ok';
+  request: string;
+  request_status: 'Approved' | 'Completed';
+  variety: string;
+  stems: number;
+  stock_entry: string;
+  shelves_cleared: number;
+  row: DiscardRequestRow;
+}
+
 // Actual harvest types
 export interface ActualHarvestEntry {
   id: number;
@@ -557,6 +718,8 @@ export interface BucketBalance {
   on_shelf?: boolean;
   shelf_stem_qty?: number;
   pre_receive?: boolean;
+  harvester?: string;
+  harvest_time?: string;
 }
 
 export interface RejectResponse {

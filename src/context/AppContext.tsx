@@ -5,8 +5,14 @@ import { getPendingCount, getFailedCount } from '../database/sync-queue';
 import { syncPendingEntries, SyncResult } from '../services/sync';
 import { useNetworkStatus } from '../hooks/useNetworkStatus';
 import { getDatabase } from '../database/database';
-import { getSid, getApiUrl, clearAuth as clearAuthStorage, getFullName as getStoredFullName, getUserEmail as getStoredUserEmail, getUserRoles as getStoredUserRoles } from '../database/settings';
-import { registerAuthFailureHandler } from '../services/api';
+import {
+  getSid, getApiUrl, clearAuth as clearAuthStorage,
+  getFullName as getStoredFullName,
+  getUserEmail as getStoredUserEmail,
+  getUserRoles as getStoredUserRoles,
+  getCachedStorageMode, setCachedStorageMode,
+} from '../database/settings';
+import { registerAuthFailureHandler, getStorageMode, StorageMode } from '../services/api';
 import { preloadSounds, unloadSounds } from '../utils/feedback';
 import { clearFarmCache } from '../utils/farm-cache';
 
@@ -32,6 +38,8 @@ interface AppContextType {
   isSyncing: boolean;
   lastSyncResult: SyncResult | null;
   logs: SyncLog[];
+  storageMode: StorageMode;
+  refreshStorageMode: () => Promise<void>;
   refreshStats: () => Promise<void>;
   triggerSync: (onProgress?: (done: number, total: number) => void) => Promise<void>;
   retryConnection: () => Promise<void>;
@@ -57,6 +65,8 @@ const AppContext = createContext<AppContextType>({
   isSyncing: false,
   lastSyncResult: null,
   logs: [],
+  storageMode: 'Shelving',
+  refreshStorageMode: async () => {},
   refreshStats: async () => {},
   triggerSync: async () => {},
   retryConnection: async () => {},
@@ -87,6 +97,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [isSyncing, setIsSyncing] = useState(false);
   const [lastSyncResult, setLastSyncResult] = useState<SyncResult | null>(null);
   const [logs, setLogs] = useState<SyncLog[]>([]);
+  const [storageMode, setStorageMode] = useState<StorageMode>('Shelving');
   const { isConnected, forceCheck } = useNetworkStatus();
   const syncInProgress = useRef(false);
   const prevConnected = useRef<boolean | null>(null);
@@ -105,6 +116,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     (async () => {
       await getDatabase();
       await preloadSounds();
+      // Restore storageMode from the local cache BEFORE we hand control back
+      // to the UI, so screens don't flash the wrong slot layout during the
+      // online-fetch round-trip (or when offline).
+      const cachedMode = await getCachedStorageMode();
+      if (cachedMode === 'Shelving' || cachedMode === 'Zoning' || cachedMode === 'Direct-to-Grader') {
+        setStorageMode(cachedMode);
+      }
       const auth = await getSid();
       if (auth) {
         setLoggedIn(true);
@@ -138,6 +156,19 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
       prevConnected.current = isConnected;
     }
   }, [isConnected, isReady, pushLog]);
+
+  const refreshStorageMode = useCallback(async () => {
+    try {
+      const mode = await getStorageMode();
+      setStorageMode(mode);
+      // Persist so we survive a WiFi drop on the next launch / hot reload.
+      await setCachedStorageMode(mode);
+    } catch {
+      // Leave whatever value (cached or default) is currently set. Old builds
+      // and offline both land here; the cache from a prior online session is
+      // good enough to keep the right slot layout.
+    }
+  }, []);
 
   const refreshStats = useCallback(async () => {
     try {
@@ -179,6 +210,14 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const logout = useCallback(async () => {
     clearFarmCache();
     await clearAuthStorage();
+    // Drop the in-memory cached credentials so a 401 won't silently re-log in
+    // after the user has explicitly signed out. The biometric-gated secure
+    // store blob is intentionally KEPT so they can biometric-unlock to sign
+    // back in without retyping. Use "Remove fingerprint" in Settings to wipe.
+    try {
+      const { dropMemoryCache } = await import('../services/auth');
+      dropMemoryCache();
+    } catch { /* auth module unavailable */ }
     setLoggedIn(false);
     setFullName('');
     setUserEmail('');
@@ -188,6 +227,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     if (isReady && isLoggedIn) refreshStats();
   }, [isReady, isLoggedIn, refreshStats]);
+
+  // Pull storage_mode once on login + whenever connectivity restores.
+  // Direct-to-Grader mode flips the bucket-scan step off in GradeScreen and
+  // surfaces the Receiving Out tab — so we want a fresh read each session.
+  useEffect(() => {
+    if (isReady && isLoggedIn && isConnected) refreshStorageMode();
+  }, [isReady, isLoggedIn, isConnected, refreshStorageMode]);
 
   // Wire up the API layer so any 401 response triggers an automatic logout.
   // This handles server URL migrations where the stored session is no longer
@@ -221,6 +267,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
         isSyncing,
         lastSyncResult,
         logs,
+        storageMode,
+        refreshStorageMode,
         refreshStats,
         triggerSync,
         retryConnection,

@@ -8,7 +8,9 @@
     },
     "production": {
       "channel": "production",
-      "android": {}
+      "android": {
+        "buildType": "apk"
+      }
     }
   }
 }
