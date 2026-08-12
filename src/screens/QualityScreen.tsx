@@ -115,6 +115,7 @@ export default function QualityScreen() {
   const [variety, setVariety] = useState('');
   const [bucketId, setBucketId] = useState('');
   const [rejectLines, setRejectLines] = useState<RejectLine[]>([]);
+  const [otherText, setOtherText] = useState('');
   const [notes, setNotes] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [bucketBalance, setBucketBalance] = useState<BucketBalance | null>(null);
@@ -208,6 +209,7 @@ const varietyOptions: DropdownOption[] = (() => {
   const resetForm = () => {
     setGreenhouse(''); setVariety(''); setBucketId('');
     setRejectLines([]); setNotes(''); setBucketBalance(null);
+    setOtherText('');
     setQuarantineOn(false); setQuarantineScope('bucket');
     setQuarantineGreenhouse(''); setQuarantineAction('');
   };
@@ -224,6 +226,8 @@ const varietyOptions: DropdownOption[] = (() => {
     catch { setBucketBalance(null); }
     finally { setLoadingBalance(false); }
   };
+
+  const resolveReason = (r: string) => (r === 'Other' ? otherText.trim() : r);
 
   const toggleReason = (reason: string) => {
     setRejectLines((prev) => {
@@ -253,6 +257,11 @@ const varietyOptions: DropdownOption[] = (() => {
 
     if (cfg.varietyRequired && !variety.trim()) { show('error', 'Select a variety'); return; }
 
+    if (rejectLines.some((l) => l.reason === 'Other') && !otherText.trim()) {
+      show('error', 'Type the reason for “Other”');
+      return;
+    }
+
     setSubmitting(true);
     const farm = await getFarm();
     const now = new Date().toLocaleTimeString();
@@ -271,21 +280,21 @@ const varietyOptions: DropdownOption[] = (() => {
     for (const line of rejectLines) {
       const payload = {
         section: activeSection, ref_id: refId, quantity: line.quantity,
-        reason: line.reason, notes, farm, greenhouse: gh, variety: vr,
+        reason: resolveReason(line.reason), notes, farm, greenhouse: gh, variety: vr,
         quarantined: isQuarantined ? 1 : 0, quarantine_action: qAction,
       };
       if (isConnected) {
         try {
-          await submitQualityEntry(activeSection, refId, line.quantity, line.reason, notes, farm, gh, vr, isQuarantined, qAction as QuarantineAction);
-          await addQualityEntry(activeSection, refId, line.quantity, line.reason, notes, farm, true, gh, vr, isQuarantined, qAction as QuarantineAction);
+          await submitQualityEntry(activeSection, refId, line.quantity, resolveReason(line.reason), notes, farm, gh, vr, isQuarantined, qAction as QuarantineAction);
+          await addQualityEntry(activeSection, refId, line.quantity, resolveReason(line.reason), notes, farm, true, gh, vr, isQuarantined, qAction as QuarantineAction);
         } catch {
           await addToSyncQueue('create_quality_entry', payload);
-          await addQualityEntry(activeSection, refId, line.quantity, line.reason, notes, farm, false, gh, vr, isQuarantined, qAction as QuarantineAction);
+          await addQualityEntry(activeSection, refId, line.quantity, resolveReason(line.reason), notes, farm, false, gh, vr, isQuarantined, qAction as QuarantineAction);
           allSuccess = false;
         }
       } else {
         await addToSyncQueue('create_quality_entry', payload);
-        await addQualityEntry(activeSection, refId, line.quantity, line.reason, notes, farm, false, gh, vr, isQuarantined, qAction as QuarantineAction);
+        await addQualityEntry(activeSection, refId, line.quantity, resolveReason(line.reason), notes, farm, false, gh, vr, isQuarantined, qAction as QuarantineAction);
       }
     }
 
@@ -296,7 +305,7 @@ const varietyOptions: DropdownOption[] = (() => {
       const scope: QuarantineScope = quarantineScope === 'greenhouse' ? 'greenhouse' : 'buckets';
       const ghForBatch = quarantineScope === 'greenhouse' ? quarantineGreenhouse : gh;
       const bucketsForBatch = quarantineScope !== 'greenhouse' && refId !== 'unknown' ? [refId] : [];
-      const payload = { batch_id: batchId, scope, greenhouse: ghForBatch, bucket_ids: bucketsForBatch, reason: rejectLines.map(l => l.reason).join(', '), notes };
+      const payload = { batch_id: batchId, scope, greenhouse: ghForBatch, bucket_ids: bucketsForBatch, reason: rejectLines.map((l) => resolveReason(l.reason)).join(', '), notes };
       if (isConnected) {
         try { await createQuarantineBatch(batchId, scope, ghForBatch, bucketsForBatch, payload.reason, notes); }
         catch { await addToSyncQueue('create_quarantine_batch', payload); }
@@ -308,7 +317,7 @@ const varietyOptions: DropdownOption[] = (() => {
     }
 
     const summary = rejectLines.length > 0
-      ? rejectLines.map((l) => `${l.quantity}×${l.reason}`).join(', ')
+      ? rejectLines.map((l) => `${l.quantity}×${resolveReason(l.reason)}`).join(', ')
       : 'Quarantine';
     setRecentEntries((prev) => [{
       ref_id: refId, quantity: totalRejects, reason: summary, time: now,
@@ -498,6 +507,20 @@ const varietyOptions: DropdownOption[] = (() => {
             })}
           </View>
         </View>
+
+        {/* Free-text reason when "Other" is selected */}
+        {rejectLines.some((l) => l.reason === 'Other') && (
+          <View style={styles.field}>
+            <Text style={styles.label}>Other reason</Text>
+            <TextInput
+              style={styles.input}
+              value={otherText}
+              onChangeText={setOtherText}
+              placeholder="Type the reason"
+              placeholderTextColor={colors.textMuted}
+            />
+          </View>
+        )}
 
         {/* Qty per reason */}
         {rejectLines.length > 0 && (

@@ -287,6 +287,19 @@ export default function DashboardScreen() {
           variance: r.variance,
         });
       }
+      // The greenhouse header should equal the sum of its per-variety rows —
+      // not the separate `received_by_greenhouse` query, which can lag and
+      // leave the header at 0% received while the expanded rows show real
+      // receipts. Roll the breakdown up: received = Σ variety received, and
+      // harvested = Σ variety harvested (falling back to the harvest-by-GH
+      // total only when the breakdown carries no harvested figure).
+      for (const gh of Object.values(map)) {
+        if (gh.varietyBreakdown.length === 0) continue;
+        const sumHarvested = gh.varietyBreakdown.reduce((sum, v) => sum + (v.stems || 0), 0);
+        const sumReceived = gh.varietyBreakdown.reduce((sum, v) => sum + ((v as any).received || 0), 0);
+        if (sumHarvested > 0) gh.stems = sumHarvested;
+        gh.received = sumReceived;
+      }
     } else {
       for (const r of varietiesByGH) {
         if (!map[r.greenhouse]) map[r.greenhouse] = empty(r.greenhouse);

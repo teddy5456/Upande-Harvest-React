@@ -35,6 +35,7 @@ import TransferScreen from './src/screens/TransferScreen';
 import QualityScreen from './src/screens/QualityScreen';
 import ShelfMapScreen from './src/screens/ShelfMapScreen';
 import SettingsScreen from './src/screens/SettingsScreen';
+import JourneyScreen from './src/screens/JourneyScreen';
 import ActualHarvestScreen from './src/screens/ActualHarvestScreen';
 import AgricultureScreen from './src/screens/AgricultureScreen';
 import ProductionPlanScreen from './src/screens/agriculture/ProductionPlanScreen';
@@ -244,6 +245,7 @@ function AppContent() {
         <Tab.Screen name="Quality" component={QualityScreen} options={{ tabBarItemStyle: { display: 'none' }, title: 'Quality' }} />
         <Tab.Screen name="Map" component={ShelfMapScreen} options={{ tabBarItemStyle: { display: 'none' }, title: 'Shelf Map' }} />
         <Tab.Screen name="Settings" component={SettingsScreen} options={{ tabBarItemStyle: { display: 'none' }, title: 'Settings' }} />
+        <Tab.Screen name="Journey" component={JourneyScreen} options={{ tabBarItemStyle: { display: 'none' }, title: 'Journey' }} />
         <Tab.Screen name="ActualHarvest" component={ActualHarvestScreen} options={{ tabBarItemStyle: { display: 'none' }, title: 'Actual Harvest' }} />
         <Tab.Screen
           name="Agriculture"

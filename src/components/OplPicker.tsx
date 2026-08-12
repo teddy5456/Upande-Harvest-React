@@ -135,7 +135,9 @@ export default function OplPicker({ onSelect, disabled }: Props) {
       if (!q) return true;
       return (
         (o.customer_name || '').toLowerCase().includes(q) ||
-        (o.opl || '').toLowerCase().includes(q)
+        (o.opl || '').toLowerCase().includes(q) ||
+        (o.sales_order || '').toLowerCase().includes(q) ||
+        (o.varieties || '').toLowerCase().includes(q)
       );
     });
   }, [opls, query, statusFilter]);
@@ -156,7 +158,7 @@ export default function OplPicker({ onSelect, disabled }: Props) {
         <Ionicons name="search" size={16} color={colors.textMuted} />
         <TextInput
           style={styles.searchInput}
-          placeholder="Customer or OPL"
+          placeholder="Customer, OPL, SO or variety"
           placeholderTextColor={colors.textMuted}
           value={query}
           onChangeText={setQuery}

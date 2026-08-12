@@ -11,6 +11,7 @@ import {
   TextInput,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
+import { useNavigation } from '@react-navigation/native';
 import { getSetting, setSetting } from '../database/settings';
 import { getPendingCount, getFailedCount, retryFailed, clearSynced, getAllEntries } from '../database/sync-queue';
 import { resetDatabase } from '../database/database';
@@ -75,6 +76,7 @@ function Row({ icon, label, value, onPress, color }: {
 }
 
 export default function SettingsScreen() {
+  const navigation = useNavigation<any>();
   const { triggerSync, refreshStats, logout, fullName, userEmail, isSyncing } = useApp();
   const [farm, setFarm] = useState('');
   const [farmOptions, setFarmOptions] = useState<DropdownOption[]>([]);
@@ -84,6 +86,10 @@ export default function SettingsScreen() {
   const [showQueue, setShowQueue] = useState(false);
   const [retryProgress, setRetryProgress] = useState<{ total: number; done: number } | null>(null);
   const [bioEnrolled, setBioEnrolled] = useState(false);
+  const [serverUrl, setServerUrl] = useState('');
+  // Mona sites drive sync differently — the manual "Retry failed" action is
+  // hidden there (see the Sync section below).
+  const isMonaServer = serverUrl.toLowerCase().includes('mona');
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const screenshotRef = useRef<View>(null);
 
@@ -165,6 +171,7 @@ export default function SettingsScreen() {
     (async () => {
       const f = await getSetting('farm');
       if (f) setFarm(f);
+      setServerUrl((await getApiUrl()) || '');
       await refreshSyncState();
       const farms = await getCachedFarms();
       if (farms.length > 0) {
@@ -307,18 +314,33 @@ export default function SettingsScreen() {
           </View>
         </View>
 
+        {/* Tools */}
+        <Text style={styles.sectionHeader}>Tools</Text>
+        <View style={styles.section}>
+          <Row
+            icon="git-branch-outline"
+            label="Bucket Journey"
+            value="Trace any scan"
+            onPress={() => navigation.navigate('Journey')}
+          />
+        </View>
+
         {/* Sync */}
         <Text style={styles.sectionHeader}>Sync</Text>
         <View style={styles.section}>
           <Row icon="time-outline" label="Pending" value={String(pendingCount)} />
           <View style={styles.divider} />
           <Row icon="alert-circle-outline" label="Failed" value={String(failedCount)} />
-          <View style={styles.divider} />
-          <Row
-            icon="refresh-outline"
-            label={retryProgress ? 'Retrying…' : 'Retry failed'}
-            onPress={retryProgress ? undefined : handleRetryFailed}
-          />
+          {!isMonaServer && (
+            <>
+              <View style={styles.divider} />
+              <Row
+                icon="refresh-outline"
+                label={retryProgress ? 'Retrying…' : 'Retry failed'}
+                onPress={retryProgress ? undefined : handleRetryFailed}
+              />
+            </>
+          )}
           {retryProgress && (
             <View style={styles.progressWrap}>
               <View style={styles.progressHeader}>

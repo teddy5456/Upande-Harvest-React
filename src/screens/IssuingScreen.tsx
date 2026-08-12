@@ -62,6 +62,11 @@ export default function IssuingScreen() {
   // like duplicates. selectedCustomer is the Customer.name (e.g. CUS00059);
   // the API filters across all of that customer's today-OPLs.
   const [selectedCustomer, setSelectedCustomer] = useState<string | null>(null);
+  // "All customers" mode: pick every bucket of this variety regardless of which
+  // customer it's assigned to. Separate from selectedCustomer (which is `null`
+  // both before a choice is made AND after choosing All) so the picker screen
+  // knows when to dismiss.
+  const [pickAllCustomers, setPickAllCustomers] = useState(false);
   const [buckets, setBuckets] = useState<IssuingBucket[]>([]);
   const [scanLog, setScanLog] = useState<ScannedLogEntry[]>([]);
   const [submitting, setSubmitting] = useState(false);
@@ -105,16 +110,25 @@ export default function IssuingScreen() {
     }
   }, []);
 
+  // Monotonic request id — a filtered load and a 5s poll can be in flight
+  // at once, and whichever resolves LAST used to win regardless of which
+  // was issued last. Only the newest request may write state.
+  const bucketReqSeq = useRef(0);
   const loadBuckets = useCallback(async (variety: string, customer?: string) => {
+    const seq = ++bucketReqSeq.current;
     setLoading(true);
     try {
       const res = await getIssuingBuckets(variety, undefined, customer);
+      if (seq !== bucketReqSeq.current) return; // superseded — drop stale response
       setBuckets(res.buckets || []);
     } catch (e: any) {
+      if (seq !== bucketReqSeq.current) return;
       showConfirmation('error', e?.message || 'Could not load buckets');
     } finally {
-      setLoading(false);
-      setRefreshing(false);
+      if (seq === bucketReqSeq.current) {
+        setLoading(false);
+        setRefreshing(false);
+      }
     }
   }, []);
 
@@ -124,16 +138,21 @@ export default function IssuingScreen() {
   // every 5 seconds so buckets another operator scans/skips disappear (or
   // replacements appear) without manual pull-to-refresh. Skipped when no
   // variety is selected (variety list refreshes via pull-to-refresh only).
+  // Only while the BUCKET VIEW is actually visible (mirrors the render
+  // guard below) — polling during the customer picker used to fetch the
+  // unfiltered list and race/overwrite the user's customer selection.
+  const bucketViewVisible =
+    !!selectedVariety && (opls.length <= 1 || selectedCustomer !== null || pickAllCustomers);
   useEffect(() => {
-    if (!selectedVariety) return;
+    if (!bucketViewVisible) return;
     const t = setInterval(() => {
       // Don't poll while a scan is in flight — would race the state update
       // and could blank the just-scanned bucket back into the list.
       if (submitting) return;
-      loadBuckets(selectedVariety, selectedCustomer || undefined);
+      loadBuckets(selectedVariety!, selectedCustomer || undefined);
     }, 5000);
     return () => clearInterval(t);
-  }, [selectedVariety, selectedCustomer, submitting, loadBuckets]);
+  }, [bucketViewVisible, selectedVariety, selectedCustomer, submitting, loadBuckets]);
 
   // ── handlers ─────────────────────────────────────────────────────────────
   // Variety tap: if there's only ONE OPL for the variety, skip the OPL
@@ -141,8 +160,12 @@ export default function IssuingScreen() {
   const handleVarietyPress = async (v: IssuingVariety) => {
     setSelectedVariety(v.variety);
     setSelectedCustomer(null);
+    setPickAllCustomers(false);
     setBuckets([]);
     setScanLog([]);
+    // Clear the PREVIOUS variety's customer cards — leaving them made the
+    // picker (or the bucket view) flash stale content while opls loaded.
+    setOpls([]);
     // Always check how many distinct CUSTOMERS share this variety. If just
     // one (or none — the v.opl_count fallback), jump straight to scanning.
     const customerOpls = await loadOpls(v.variety);
@@ -153,22 +176,26 @@ export default function IssuingScreen() {
 
   const handleCustomerPress = (customer: string | null) => {
     setSelectedCustomer(customer);
+    setPickAllCustomers(customer === null);
     setBuckets([]);
     setScanLog([]);
     loadBuckets(selectedVariety!, customer || undefined);
   };
 
   const handleBack = () => {
-    // If we drilled customer → buckets, back goes to customer picker
-    // (when variety had multiple customers). Otherwise back to varieties.
-    if (selectedCustomer !== null && opls.length > 1) {
+    // If we drilled customer → buckets (single customer OR "all customers"),
+    // back goes to the customer picker when the variety had multiple customers.
+    // Otherwise back to varieties.
+    if ((selectedCustomer !== null || pickAllCustomers) && opls.length > 1) {
       setSelectedCustomer(null);
+      setPickAllCustomers(false);
       setBuckets([]);
       setScanLog([]);
       return;
     }
     setSelectedVariety(null);
     setSelectedCustomer(null);
+    setPickAllCustomers(false);
     setOpls([]);
     setBuckets([]);
     setScanLog([]);
@@ -277,6 +304,32 @@ export default function IssuingScreen() {
     [varieties],
   );
 
+  // Shelf-proximity sort: walk shelf-by-shelf, position-by-position so buckets
+  // that are physically close get picked one after the other. Format is
+  // <coldstore letter(s)><shelf number 1-300><position 1|2|3>, e.g. A11 = cold-
+  // store A, shelf 1, position 1; A111 = coldstore A, shelf 11, position 1
+  // (ten shelves away). Unparseable / null shelf_ids sort to the end.
+  const sortedBuckets = useMemo(() => {
+    const parseShelf = (s: string | null): [string, number, number] | null => {
+      if (!s) return null;
+      const m = /^([A-Za-z]+)(\d+)([1-3])$/.exec(s.trim());
+      if (!m) return null;
+      return [m[1].toUpperCase(), parseInt(m[2], 10), parseInt(m[3], 10)];
+    };
+    return [...buckets].sort((a, b) => {
+      const pa = parseShelf(a.shelf_id);
+      const pb = parseShelf(b.shelf_id);
+      if (pa && pb) {
+        if (pa[0] !== pb[0]) return pa[0] < pb[0] ? -1 : 1;
+        if (pa[1] !== pb[1]) return pa[1] - pb[1];
+        return pa[2] - pb[2];
+      }
+      if (pa && !pb) return -1;
+      if (!pa && pb) return 1;
+      return (a.bucket_id || '').localeCompare(b.bucket_id || '');
+    });
+  }, [buckets]);
+
   // ── render: variety list ─────────────────────────────────────────────────
   if (!selectedVariety) {
     return (
@@ -339,7 +392,7 @@ export default function IssuingScreen() {
   }
 
   // ── render: customer picker for a variety (when multiple customers share it) ─
-  if (selectedCustomer === null && opls.length > 1) {
+  if (!pickAllCustomers && selectedCustomer === null && opls.length > 1) {
     return (
       <View style={styles.container}>
         <View style={styles.header}>
@@ -398,10 +451,14 @@ export default function IssuingScreen() {
 
   // ── render: bucket list for a variety (optionally narrowed to a customer) ─
   const selectedCustomerObj = opls.find(o => o.customer === selectedCustomer);
+  const issuedCount = scanLog.filter(l => l.status === 'success').length;
+  const bucketCountLabel = `${buckets.length} bucket${buckets.length === 1 ? '' : 's'}`;
   const headerSubtitle =
     selectedCustomer
-      ? `${selectedCustomerObj?.customer_name || selectedCustomerObj?.customer || selectedCustomer} · ${buckets.length} bucket${buckets.length === 1 ? '' : 's'} · ${scanLog.filter(l => l.status === 'success').length} issued`
-      : `${buckets.length} bucket${buckets.length === 1 ? '' : 's'} to pull · ${scanLog.filter(l => l.status === 'success').length} issued`;
+      ? `${selectedCustomerObj?.customer_name || selectedCustomerObj?.customer || selectedCustomer} · ${bucketCountLabel} · ${issuedCount} issued`
+      : pickAllCustomers
+        ? `All customers · ${bucketCountLabel} to pull · ${issuedCount} issued`
+        : `${bucketCountLabel} to pull · ${issuedCount} issued`;
 
   return (
     <View style={styles.container}>
@@ -409,21 +466,21 @@ export default function IssuingScreen() {
         <TouchableOpacity onPress={handleBack} style={styles.backRow}>
           <Ionicons name="chevron-back" size={20} color={colors.text} />
           <Text style={styles.backText}>
-            {selectedCustomer && opls.length > 1 ? 'Customers' : 'Varieties'}
+            {(selectedCustomer || pickAllCustomers) && opls.length > 1 ? 'Customers' : 'Varieties'}
           </Text>
         </TouchableOpacity>
         <Text style={styles.title} numberOfLines={1}>{selectedVariety}</Text>
         <Text style={styles.subtitle} numberOfLines={1}>{headerSubtitle}</Text>
       </View>
 
-      {buckets.length > 0 && (
+      {sortedBuckets.length > 0 && (
         <View style={styles.nextBanner}>
           <Text style={styles.nextBannerLabel}>NEXT — SHELF</Text>
           <Text style={styles.nextBannerShelf} numberOfLines={1}>
-            {buckets[0].shelf_id || '—'}
+            {sortedBuckets[0].shelf_id || '—'}
           </Text>
           <Text style={styles.nextBannerBucket} numberOfLines={1}>
-            bucket {buckets[0].bucket_id} · {buckets[0].qty} stems
+            bucket {sortedBuckets[0].bucket_id} · {sortedBuckets[0].qty} stems
           </Text>
         </View>
       )}
@@ -444,7 +501,12 @@ export default function IssuingScreen() {
         contentContainerStyle={styles.scrollContent}
         refreshControl={
           <RefreshControl refreshing={refreshing}
-            onRefresh={() => { setRefreshing(true); loadBuckets(selectedVariety); }} />
+            onRefresh={() => {
+              setRefreshing(true);
+              // Keep the active customer filter — refreshing used to reload
+              // ALL buckets onto a customer-filtered view.
+              loadBuckets(selectedVariety!, selectedCustomer || undefined);
+            }} />
         }
       >
         {loading && buckets.length === 0 ? (
@@ -455,7 +517,7 @@ export default function IssuingScreen() {
             <Text style={styles.emptyText}>All buckets for {selectedVariety} are issued.</Text>
           </View>
         ) : (
-          buckets.map(b => (
+          sortedBuckets.map(b => (
             <View key={b.pli_name} style={styles.bucketRow}>
               <View style={styles.bucketShelfBox}>
                 <Text style={styles.bucketShelfText} numberOfLines={1}>

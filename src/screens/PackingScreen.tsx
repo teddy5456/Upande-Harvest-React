@@ -533,6 +533,7 @@ export default function PackingScreen() {
               scannerTitle="Scan OPL / Box Label"
               onScan={handleScanEntry}
               disabled={loadingSession}
+              keepFocused
             />
             {loadingSession && (
               <View style={styles.loading}>
@@ -623,6 +624,7 @@ export default function PackingScreen() {
                 scannerTitle="Scan Bunch QR Code"
                 onScan={handleBunchScanned}
                 disabled={closing || atCap}
+                keepFocused
               />
               {atCap && (
                 <View style={styles.capWarning}>
@@ -699,6 +701,11 @@ export default function PackingScreen() {
                     )}
                   </View>
                   <Text style={styles.sessionOpl}>{oplSession.opl.opl}</Text>
+                  {oplSession.opl.varieties ? (
+                    <Text style={styles.sessionVarieties} numberOfLines={2}>
+                      {oplSession.opl.varieties}
+                    </Text>
+                  ) : null}
                 </View>
                 <TouchableOpacity onPress={resetOplSession} style={styles.resetBtn}>
                   <Ionicons name="close-outline" size={18} color={colors.textMuted} />
@@ -773,6 +780,7 @@ export default function PackingScreen() {
                 scannerTitle="Scan Bunch QR Code"
                 onScan={handleOplBunchScanned}
                 disabled={oplScanning || boxFullDialog}
+                keepFocused
               />
 
               {/* Close-box button — always visible once a box is open, so the
@@ -919,6 +927,7 @@ const styles = StyleSheet.create({
   sessionHeaderRow: { flexDirection: 'row', alignItems: 'center', marginBottom: spacing.sm },
   sessionCustomer: { fontFamily: fontFamily.bold, fontSize: fontSize.lg, color: colors.text },
   sessionOpl: { fontFamily: fontFamily.regular, fontSize: fontSize.xs, color: colors.textMuted, marginTop: 2 },
+  sessionVarieties: { fontFamily: fontFamily.regular, fontSize: 11, color: colors.textMuted, marginTop: 3, fontStyle: 'italic' },
   resetBtn: { padding: spacing.xs },
 
   oplHeaderTitleRow: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm },

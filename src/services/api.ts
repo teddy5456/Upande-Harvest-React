@@ -121,6 +121,50 @@ function extractFrappeError(body: any): string {
   return '';
 }
 
+// "Session-invalid" detection — anything that means the stored sid/csrf is
+// dead and the user needs to re-login. Frappe uses several codes/exc_types
+// for this, not just HTTP 401.
+const _AUTH_EXC_TYPES = new Set([
+  'AuthenticationError',
+  'CSRFTokenError',
+  'SessionExpired',
+  'SessionStoppedError',
+  'PermissionError',
+]);
+
+function isSessionInvalid(status: number, body: any): boolean {
+  if (status === 401) return true;
+  if (!body || typeof body !== 'object') return status === 401;
+
+  const excType = (body.exc_type || body.exception_type || '').toString();
+  if (excType && _AUTH_EXC_TYPES.has(excType)) return true;
+
+  if (body.session_expired === 1 || body.session_expired === true) return true;
+
+  // 400 with "Invalid Request" is Frappe's CSRF failure body text.
+  if (status === 400) {
+    const msg = ((body.exception || body.exc || body.message || '') + '').toLowerCase();
+    if (msg.includes('csrf') || msg.includes('invalid request')) return true;
+  }
+
+  // 403 with an auth-shaped message.
+  if (status === 403) {
+    const msg = ((body.exception || body.exc || body.message || '') + '').toLowerCase();
+    if (msg.includes('authenticationerror')) return true;
+    if (msg.includes('not permitted') && msg.includes('guest')) return true;
+  }
+
+  // Session expiry sometimes lands as 417 with a _server_messages entry.
+  const raw = body._server_messages;
+  if (typeof raw === 'string' && raw.length) {
+    const t = raw.toLowerCase();
+    if (t.includes('session') && (t.includes('expired') || t.includes('invalid'))) return true;
+  }
+
+  return false;
+}
+
+
 async function apiPost<T>(endpoint: string, payload: object, _retry = false): Promise<T> {
   let baseUrl = await getApiUrl();
   if (!baseUrl) throw new Error('Server URL not configured — go to Settings');
@@ -177,19 +221,24 @@ async function apiPost<T>(endpoint: string, payload: object, _retry = false): Pr
 
   const body = await res.json().catch(() => ({}));
 
-  // 401 means the session has expired or the server changed and the stored sid
-  // is no longer valid. Try a silent re-login using stored credentials before
-  // giving up — the user should not see a sign-in screen mid-shift.
-  if (res.status === 401) {
+  // "Session invalid" isn't just HTTP 401 on Frappe — it also comes back as:
+  //   400 + exc_type=CSRFTokenError                → "Invalid Request"
+  //   403 + exc_type=AuthenticationError|PermissionError
+  //   417 + _server_messages containing "session"/"expired"
+  //   body.session_expired = 1
+  // Any of these means the stored sid/csrf is dead and every subsequent call
+  // will keep failing until the user logs out and back in. Detect the whole
+  // family and run the same silent-relogin → auto-logout path.
+  if (isSessionInvalid(res.status, body)) {
     if (!_retry) {
       const reloggedIn = await trySilentRelogin();
       if (reloggedIn) {
         pushTrace({
           ts: new Date().toISOString(),
           method: endpoint,
-          status: 401,
+          status: res.status,
           durationMs: Date.now() - startedAt,
-          error: 'session expired → silently re-logged in, retrying',
+          error: `session invalid (${res.status}) → silently re-logged in, retrying`,
         });
         return apiPost<T>(endpoint, payload, true);
       }
@@ -197,9 +246,9 @@ async function apiPost<T>(endpoint: string, payload: object, _retry = false): Pr
     pushTrace({
       ts: new Date().toISOString(),
       method: endpoint,
-      status: 401,
+      status: res.status,
       durationMs: Date.now() - startedAt,
-      error: 'session expired (silent re-login failed)',
+      error: `session invalid (${res.status}) — silent re-login failed`,
     });
     _onAuthFailure?.();
     throw new Error('Session expired — please log in again');
@@ -1076,9 +1125,17 @@ export async function submitQualityEntry(
 
 export async function addToPool(
   bucketId: string, variety: string, farm: string,
-  grader: string, stems: number, bunchSize: number
-): Promise<{ pool: string; pooled_stems: number; ready_to_grade: boolean }> {
-  return apiPost('add_to_pool', { bucket_id: bucketId, variety, farm, grader, stems, bunch_size: bunchSize });
+  grader: string, stems: number, bunchSize: number,
+  /** Employee the stems are handed to. Omitted = the shared pool. */
+  assignedTo?: string
+): Promise<{
+  pool: string; pooled_stems: number; ready_to_grade: boolean;
+  variety?: string; assigned_to?: string | null; shared?: boolean;
+}> {
+  return apiPost('add_to_pool', {
+    bucket_id: bucketId, variety, farm, grader, stems, bunch_size: bunchSize,
+    ...(assignedTo ? { assigned_to: assignedTo } : {}),
+  });
 }
 
 export async function submitIssue(
@@ -1150,16 +1207,49 @@ export async function fetchUnreceivedBuckets(
   });
 }
 
+export type PoolEntry = {
+  pool: string;
+  variety: string;
+  item_code: string;
+  pooled_stems: number;
+  /** How many stem lengths this pool spans — pooling ignores length. */
+  lengths: number;
+  assigned_to?: string | null;
+};
+
 export async function getPoolStatus(
-  variety: string, farm: string
-): Promise<{ pool: string | null; pooled_stems: number; bunch_size: number; ready_to_grade: boolean; variety?: string }> {
-  return apiPost('get_pool_status', { variety, farm });
+  variety: string, farm: string,
+  /** Scope to one grader's handed-over stems. Omitted = the shared pool. */
+  assignedTo?: string
+): Promise<{
+  pool: string | null; pooled_stems: number; bunch_size: number;
+  ready_to_grade: boolean; variety?: string;
+  /** How many stem lengths the pool spans — pooling ignores length. */
+  lengths?: number;
+  assigned_to?: string | null;
+  /** EVERY variety with stems pooled. The top-level fields above describe only
+   *  the biggest one, which hid every other variety from the graders. */
+  pools?: PoolEntry[];
+  total_pooled_stems?: number;
+}> {
+  return apiPost('get_pool_status', {
+    variety, farm, ...(assignedTo ? { assigned_to: assignedTo } : {}),
+  });
 }
 
 export async function gradeFromPool(
-  bunchId: string, grader: string, farm: string, variety: string
-): Promise<{ stock_entry: string; pooled_stems: number; contributing_buckets: string[] }> {
-  return apiPost('grade_from_pool', { bunch_id: bunchId, grader, farm, variety });
+  bunchId: string, grader: string, farm: string,
+  /** Fallback only — the server reads the variety off the scanned bunch label,
+   *  which is the physical thing in the grader's hand. */
+  variety?: string
+): Promise<{
+  stock_entry: string; pooled_stems: number; contributing_buckets: string[];
+  variety?: string; bunch_size?: number; lengths_used?: number;
+  assigned_to?: string | null;
+}> {
+  return apiPost('grade_from_pool', {
+    bunch_id: bunchId, grader, farm, ...(variety ? { variety } : {}),
+  });
 }
 
 export async function getBouquetRecipeForBunch(bunchId: string): Promise<BouquetRecipe> {
@@ -1733,4 +1823,129 @@ export async function consumeDiscardRequest(
     scan_id:      scanId,
   });
   return unwrapFrappeMessage<DiscardConsumeResponse>(resp);
+}
+
+// ── Item Journey (Settings → Bucket Journey) ────────────────────────────────
+// Scan any bucket / bunch / storage box / pack box / shelf code → full life
+// story as a normalized timeline, plus which fields a supervisor-authorized
+// correction may change.
+
+export type JourneyEntityType = 'bucket' | 'bunch' | 'storage_box' | 'pack_box' | 'shelf';
+
+export interface JourneyEvent {
+  stage: string;
+  ts: string | null;
+  title: string;
+  detail: string;
+  doc: { doctype: string; name: string } | null;
+  meta: Record<string, any>;
+}
+
+export interface JourneyLink {
+  type: JourneyEntityType | 'opl';
+  id: string;
+  label: string;
+}
+
+export interface JourneyEditable {
+  key: string;
+  label: string;
+  type: 'text' | 'number' | 'select' | 'relocate';
+  options_source?: 'varieties' | 'greenhouses';
+  scan_hint?: string;
+  current: string | number;
+}
+
+/** How a bucket correction should land — the operator picks, we never guess. */
+export interface JourneyCorrectionMode {
+  key: 'new_cycle' | 'amend';
+  label: string;
+  hint: string;
+  default: boolean;
+}
+
+export interface JourneyTrace {
+  entity_type: JourneyEntityType;
+  id: string;
+  header: {
+    id: string;
+    title: string;
+    subtitle: string;
+    status: string;
+    harvested_at: string | null;
+    stems: number;
+    /** 'idle' = empty and unheld, so everything shown is LAST KNOWN, not current. */
+    cycle_state?: 'idle' | 'live';
+    stale?: boolean;
+    meta: Record<string, any>;
+  };
+  cycle_state?: 'idle' | 'live';
+  timeline: JourneyEvent[];
+  previous_cycles: { start_ts: string | null; events: JourneyEvent[] }[];
+  links: JourneyLink[];
+  editable: JourneyEditable[];
+  correction_modes?: JourneyCorrectionMode[];
+  corrections: { text: string; ts: string }[];
+}
+
+// Journey endpoints live in upande_harvest.api once the app is deployed, but
+// on servers still waiting for that deploy they exist as Server Scripts under
+// the short method name. Try the permanent path first, fall back on
+// "method missing"-shaped errors only.
+async function journeyPost<T>(dotted: string, short: string, payload: object): Promise<T> {
+  try {
+    return await apiPost<T>(dotted, payload);
+  } catch (e: any) {
+    const msg = String(e?.message || '');
+    if (/not whitelisted|not found|no attribute|failed to get method|404/i.test(msg)) {
+      return apiPost<T>(short, payload);
+    }
+    throw e;
+  }
+}
+
+export async function traceItemJourney(code: string): Promise<JourneyTrace> {
+  const resp = await journeyPost<any>(
+    'upande_harvest.api.trace_item_journey', 'trace_item_journey', { code });
+  return unwrapFrappeMessage<JourneyTrace>(resp);
+}
+
+export async function applyJourneyCorrection(params: {
+  code: string;
+  changes: Record<string, string | number>;
+  supervisorUser: string;
+  supervisorPwd: string;
+  /** Buckets only: 'new_cycle' posts a fresh Harvesting entry, 'amend' rewrites
+   *  the last one. Omitted → the server keeps its legacy 'amend' default, which
+   *  is what servers still running the old Server Script will do regardless. */
+  mode?: 'new_cycle' | 'amend';
+}): Promise<{ status: string; applied: string[]; mode?: string }> {
+  const resp = await journeyPost<any>(
+    'upande_harvest.api.apply_journey_correction', 'apply_journey_correction', {
+      code:            params.code,
+      changes:         params.changes,
+      supervisor_user: params.supervisorUser,
+      supervisor_pwd:  params.supervisorPwd,
+      ...(params.mode ? { mode: params.mode } : {}),
+    });
+  return unwrapFrappeMessage(resp);
+}
+
+/**
+ * Verify a supervisor's credentials against the current server with a
+ * throwaway login call (no session state is stored). Needed because the
+ * temporary Server Script deployment can't check another user's password
+ * server-side — and it doubles as a crisp pre-submit check everywhere else.
+ */
+export async function verifySupervisorCredentials(email: string, pwd: string): Promise<void> {
+  const serverUrl = await getApiUrl();
+  if (!serverUrl) throw new Error('Server URL not configured');
+  try {
+    await loginToServer(serverUrl, email, pwd);
+  } catch (e: any) {
+    if (/invalid username or password/i.test(String(e?.message || ''))) {
+      throw new Error('Supervisor email or password is incorrect');
+    }
+    throw e;
+  }
 }

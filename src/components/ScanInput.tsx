@@ -47,6 +47,21 @@ const ScanInput = forwardRef<ScanInputHandle, ScanInputProps>(function ScanInput
     }
   }, [autoFocus, disabled]);
 
+  // Aggressive re-focus for Honeywell scanner flows: RN's TextInput silently
+  // blurs when the ScanConfirmation overlay renders on top, when screens
+  // push/pop, or when the OS soft keyboard toggles. isFocused() sometimes
+  // reports true while the input has actually been detached, so we skip
+  // that check and just call focus() unconditionally — focus() on an
+  // already-focused input is a no-op, so the heartbeat is cheap.
+  useEffect(() => {
+    if (!keepFocused || disabled || cameraOpen) return;
+    inputRef.current?.focus();
+    const iv = setInterval(() => {
+      inputRef.current?.focus();
+    }, 250);
+    return () => clearInterval(iv);
+  }, [keepFocused, disabled, cameraOpen]);
+
   const submitCurrent = useCallback(() => {
     if (debounceRef.current) {
       clearTimeout(debounceRef.current);
@@ -108,6 +123,13 @@ const ScanInput = forwardRef<ScanInputHandle, ScanInputProps>(function ScanInput
           blurOnSubmit={false}
           editable={!disabled}
           selectTextOnFocus
+          // Honeywell scanners deliver characters as HID key-presses, so the
+          // input just needs focus — the on-screen soft keyboard adds noise,
+          // eats half the screen, and destabilises focus by toggling on
+          // every re-render. Suppress it when the caller opts in to
+          // keepFocused. Manual typing still works via the camera flow.
+          showSoftInputOnFocus={keepFocused ? false : undefined}
+          caretHidden={keepFocused}
         />
         {value.length > 0 && (
           <TouchableOpacity onPress={handleSubmit} style={styles.goButton} activeOpacity={0.6}>

@@ -48,6 +48,9 @@ export interface ShelveResponse {
   bucket_id: string;
   stems: number;
   stem_length: string;
+  /** The shelving_entry script has always returned this; the screen used to
+   *  throw it away, so the operator could not see what they were shelving. */
+  variety?: string;
 }
 
 export interface DashboardStats {
@@ -384,6 +387,10 @@ export interface PackableOpl {
   current_sequence: number;
   date_created: string | null;
   status: 'ready' | 'in_progress' | 'done';
+  // Comma-separated variety list from Pick List Items (server-populated).
+  // Powers the OPL picker search and the small variety caption on the
+  // packing screen once an OPL is chosen.
+  varieties?: string;
 }
 
 export interface ListOpenOplsResponse {
@@ -513,6 +520,18 @@ export const QUALITY_REASONS: Record<Exclude<QualitySection, 'discard'>, string[
   receiving_reject: ['Botrytis', 'Rust', 'Downy Mildew', 'Thrips Damage', 'Broken Stem', 'Short Stem', 'Drooping', 'Bent Neck', 'Mixed Variety', 'Damaged in Transit', 'Over-aged', 'Other'],
   grading_reject: ['Botrytis', 'Bent Neck', 'Short Stem', 'Broken Stem', 'Thrips Damage', 'Bruised', 'Rust', 'Mixed Variety', 'Tight Cut Stage', 'Advanced Cut Stage', 'Other'],
 };
+
+// Receiving-Out leftover-stem rejects (scoped to ReceivingOutScreen): the
+// receiving reasons plus receiving-out-specific mismatches. Kept separate from
+// receiving_reject so the receiving-IN screen is unaffected. When the reasons
+// move server-side (a "Rejection Reason" DocType keyed by page/category), this
+// list becomes the `receiving_out` category.
+export const RECEIVING_OUT_REASONS: string[] = [
+  ...QUALITY_REASONS.receiving_reject.filter((r) => r !== 'Other'),
+  'Wrong Variety',
+  'Wrong Length',
+  'Other',
+];
 
 // ---------------------------------------------------------------------------
 // Variety display helpers

@@ -23,6 +23,7 @@ import ScanInput from '../components/ScanInput';
 import BucketEntry from '../components/BucketEntry';
 import ScanConfirmation from '../components/ScanConfirmation';
 import EntriesLog from '../components/EntriesLog';
+import VarietyBanner from '../components/VarietyBanner';
 import { ScanPhase, ShelvedBucketEntry } from '../types';
 import { onScanSuccess, onScanError } from '../utils/feedback';
 import { colors, fontFamily, fontSize, spacing, borderRadius } from '../theme';
@@ -152,6 +153,7 @@ export default function ShelveScreen() {
     setCurrentShelf(null);
     setBucketCount(0);
     setEntries([]);
+    setLastBucket(null);
   }, []);
 
   const handleShelfScanned = useCallback(
@@ -182,6 +184,12 @@ export default function ShelveScreen() {
     []
   );
 
+  // What the bucket just scanned actually holds. The server has always sent it;
+  // the operator could never see it.
+  const [lastBucket, setLastBucket] = useState<{
+    bucketId: string; variety: string; stemLength: string; stems: number;
+  } | null>(null);
+
   const handleBucketScanned = useCallback(
     async (data: string) => {
       const bucketId = parseScannedBucketQR(data);
@@ -197,18 +205,23 @@ export default function ShelveScreen() {
       if (isConnected) {
         try {
           const response = await submitShelve(currentShelf, bucketId, farm);
+          const variety = response.variety ?? '';
           await addShelfItem(
             currentShelf,
             bucketId,
-            response.stem_length ? '' : '',
+            variety,
             response.stem_length ?? '',
             response.stems ?? 0,
             '',
             true
           );
 
+          setLastBucket({
+            bucketId, variety, stemLength: response.stem_length ?? '',
+            stems: response.stems ?? 0,
+          });
           setEntries((prev) => [{
-            bucket_id: bucketId, variety: '', stems: response.stems ?? 0,
+            bucket_id: bucketId, variety, stems: response.stems ?? 0,
             stem_length: response.stem_length ?? '', greenhouse: '',
             time: now, status: 'success', message: `${response.stems} stems`,
           }, ...prev]);
@@ -220,6 +233,7 @@ export default function ShelveScreen() {
           await addToSyncQueue('shelving_entry', { shelf_id: currentShelf, bucket_id: bucketId, farm });
           try { await addShelfItem(currentShelf, bucketId, '', '', 0, '', false); } catch {}
 
+          setLastBucket(null);
           setEntries((prev) => [{
             bucket_id: bucketId, variety: '', stems: 0, stem_length: '', greenhouse: '',
             time: now, status: 'error', message: error.message,
@@ -233,6 +247,7 @@ export default function ShelveScreen() {
         await addToSyncQueue('shelving_entry', { shelf_id: currentShelf, bucket_id: bucketId, farm });
         try { await addShelfItem(currentShelf, bucketId, '', '', 0, '', false); } catch {}
 
+        setLastBucket(null);
         setEntries((prev) => [{
           bucket_id: bucketId, variety: '', stems: 0, stem_length: '', greenhouse: '',
           time: now, status: 'queued', message: 'Saved offline',
@@ -388,6 +403,16 @@ export default function ShelveScreen() {
                 <Text style={styles.bucketBadgeLabel}>buckets</Text>
               </View>
             </View>
+
+            {/* What the last bucket held — the reason the operator is here */}
+            {lastBucket && (
+              <VarietyBanner
+                variety={lastBucket.variety}
+                stemLength={lastBucket.stemLength}
+                stems={lastBucket.stems}
+                context={`Bucket ${lastBucket.bucketId}`}
+              />
+            )}
 
             {/* Bucket scan input */}
             <View style={styles.inputSection}>

@@ -87,6 +87,10 @@ export async function enrollCredentials(credentials: StoredCredentials): Promise
     authenticationPrompt: 'Sign in to Mona Shelve',
   });
   memCache = { ...credentials };
+  // Set the side-channel marker so `hasEnrolledCredentials()` sees the enrol
+  // on next app open. Without this the login screen kept showing the password
+  // form even after a successful enrolment.
+  await setEnrolledMarker(true);
   return true;
 }
 

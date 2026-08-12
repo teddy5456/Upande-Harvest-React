@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useRef } from 'react';
+import React, { useState, useCallback, useRef, useEffect } from 'react';
 import {
   View,
   Text,
@@ -8,11 +8,13 @@ import {
   ActivityIndicator,
   Alert,
   Modal,
+  TextInput,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { useApp } from '../context/AppContext';
 import { getFarm } from '../database/settings';
-import { submitReceivingOut } from '../services/api';
+import { submitReceivingOut, submitBucketReject } from '../services/api';
+import { QUALITY_REASONS, RECEIVING_OUT_REASONS } from '../types';
 import {
   detectGradingQRType,
   extractGradingQRValue,
@@ -22,6 +24,7 @@ import {
 import ScanInput from '../components/ScanInput';
 import ScanConfirmation from '../components/ScanConfirmation';
 import EntriesLog from '../components/EntriesLog';
+import VarietyBanner from '../components/VarietyBanner';
 import { onScanSuccess, onScanError } from '../utils/feedback';
 import { colors, fontFamily, fontSize, spacing, borderRadius } from '../theme';
 
@@ -48,6 +51,9 @@ export default function ReceivingOutScreen() {
   const { isConnected, storageMode } = useApp();
   const [slots, setSlots] = useState<Record<SlotKey, string | null>>({ bucket: null, grader: null });
   const [submitting, setSubmitting] = useState(false);
+  const [lastIssued, setLastIssued] = useState<{
+    bucket: string; grader: string; variety: string; stems: number | null;
+  } | null>(null);
   const [entries, setEntries] = useState<LogEntry[]>([]);
   const [confirmation, setConfirmation] = useState<{
     visible: boolean;
@@ -66,6 +72,21 @@ export default function ReceivingOutScreen() {
     newBucket: string;
     newGrader: string;
   } | null>(null);
+  // Reject-reasons rows for the Reject Bucket modal. Empty until the operator
+  // taps a reason chip. Each row is one reason + its share of the prior
+  // remaining qty. Sum of qtys must equal priorRemaining before the Reject
+  // Bucket button unlocks.
+  const [rejectRows, setRejectRows] = useState<{ reason: string; qty: string }[]>([]);
+  // Free-text captured when the operator picks the "Other" reason; sent in
+  // place of the literal "Other" for those rows.
+  const [otherText, setOtherText] = useState('');
+  const resolveReason = (r: string) => (r === 'Other' ? otherText.trim() : r);
+  // Reset the reject rows every time the modal opens so a stale distribution
+  // from a previous prompt doesn't bleed into the next scan.
+  useEffect(() => {
+    if (replacePrompt?.visible) { setRejectRows([]); setOtherText(''); }
+  }, [replacePrompt?.visible]);
+
   const forcedSlotRef = useRef<SlotKey | null>(null);
 
   const showConfirmation = (
@@ -161,6 +182,16 @@ export default function ReceivingOutScreen() {
     }
 
     const fromBox = res?.from_storage_box || null;
+    // A grader taking a bucket needs to know what is in it before they cut a
+    // single bunch — it only ever appeared inside a toast that vanishes.
+    if (!res?.cancelled) {
+      setLastIssued({
+        bucket: fromBox ? (res?.bucket_id || bucket) : bucket,
+        grader,
+        variety: res?.variety || '',
+        stems: res?.remaining_qty ?? null,
+      });
+    }
     setEntries((prev) => [{
       bucket: fromBox ? (res?.bucket_id || bucket) : bucket,
       grader,
@@ -251,6 +282,14 @@ export default function ReceivingOutScreen() {
           </View>
         )}
 
+        {lastIssued && (
+          <VarietyBanner
+            variety={lastIssued.variety}
+            stems={lastIssued.stems}
+            context={`${lastIssued.bucket} → ${lastIssued.grader}`}
+          />
+        )}
+
         <View style={styles.scanSection}>
           <ScanInput
             placeholder={submitting ? 'Submitting…' : 'Scan bucket / grader'}
@@ -304,6 +343,9 @@ export default function ReceivingOutScreen() {
                 }
               />
               <View style={{ flex: 1, marginLeft: spacing.sm }}>
+                {e.variety ? (
+                  <VarietyBanner size="sm" variety={e.variety} stems={e.remaining_qty ?? null} />
+                ) : null}
                 <View style={styles.logBucketRow}>
                   <Text style={styles.logBucket}>{e.bucket} → {e.grader}</Text>
                   {e.from_storage_box ? (
@@ -351,20 +393,103 @@ export default function ReceivingOutScreen() {
             ) : null}
             <View style={styles.replaceDivider} />
             <Text style={styles.replaceQuestion}>
-              Replace with <Text style={{ fontFamily: fontFamily.semiBold, color: colors.text }}>
+              Switching to <Text style={{ fontFamily: fontFamily.semiBold, color: colors.text }}>
                 {replacePrompt?.newBucket}
-              </Text>?
+              </Text>
             </Text>
             <Text style={styles.replaceHint}>
-              Leftover stays in the queue and is auto-handled at end-of-day —
-              no immediate reject.
+              Pick reason(s) for the {replacePrompt?.priorRemaining ?? 0} leftover stems.
+              Tap a chip to add it; total must match remaining.
             </Text>
+
+            {/* Reason chips — tap to add a row (or remove if already added) */}
+            <View style={styles.rejectChipsWrap}>
+              {RECEIVING_OUT_REASONS.map((r) => {
+                const already = rejectRows.some(row => row.reason === r);
+                return (
+                  <TouchableOpacity
+                    key={r}
+                    style={[styles.rejectChip, already && styles.rejectChipActive]}
+                    activeOpacity={0.7}
+                    onPress={() => {
+                      setRejectRows(prev => {
+                        const idx = prev.findIndex(x => x.reason === r);
+                        if (idx >= 0) return prev.filter((_, i) => i !== idx);
+                        // First reason added: default to full remaining. Any
+                        // additional reason starts at 0 so the operator can
+                        // redistribute manually without over-counting.
+                        const isFirst = prev.length === 0;
+                        const remaining = replacePrompt?.priorRemaining ?? 0;
+                        return [...prev, { reason: r, qty: isFirst ? String(remaining) : '0' }];
+                      });
+                    }}
+                  >
+                    <Text style={[styles.rejectChipText, already && styles.rejectChipTextActive]}>
+                      {r}
+                    </Text>
+                  </TouchableOpacity>
+                );
+              })}
+            </View>
+
+            {rejectRows.some((r) => r.reason === 'Other') && (
+              <TextInput
+                style={styles.otherReasonInput}
+                value={otherText}
+                onChangeText={setOtherText}
+                placeholder="Type the other reason"
+                placeholderTextColor={colors.textMuted}
+              />
+            )}
+
+            {/* Per-reason qty rows */}
+            {rejectRows.length > 0 && (
+              <View style={styles.rejectRowsWrap}>
+                {rejectRows.map((row, idx) => (
+                  <View key={row.reason} style={styles.rejectRow}>
+                    <Text style={styles.rejectRowLabel} numberOfLines={1}>{row.reason}</Text>
+                    <TextInput
+                      style={styles.rejectQtyInput}
+                      value={row.qty}
+                      onChangeText={(t) => {
+                        const clean = (t || '').replace(/[^0-9]/g, '');
+                        setRejectRows(prev => prev.map((r, i) => i === idx ? { ...r, qty: clean } : r));
+                      }}
+                      keyboardType="number-pad"
+                      maxLength={5}
+                      selectTextOnFocus
+                    />
+                    <Text style={styles.rejectRowUnit}>stems</Text>
+                    <TouchableOpacity
+                      onPress={() => setRejectRows(prev => prev.filter((_, i) => i !== idx))}
+                      hitSlop={{ top: 6, bottom: 6, left: 6, right: 6 }}
+                    >
+                      <Ionicons name="close-circle" size={18} color={colors.textMuted} />
+                    </TouchableOpacity>
+                  </View>
+                ))}
+                {(() => {
+                  const total = rejectRows.reduce((s, r) => s + (parseInt(r.qty, 10) || 0), 0);
+                  const expected = replacePrompt?.priorRemaining ?? 0;
+                  const balanced = total === expected;
+                  return (
+                    <Text style={[styles.rejectTotal, !balanced && styles.rejectTotalOff]}>
+                      Total {total} / {expected}
+                      {!balanced ? ' — must match' : ''}
+                    </Text>
+                  );
+                })()}
+              </View>
+            )}
+
             <View style={styles.replaceActions}>
               <TouchableOpacity
                 style={[styles.replaceBtn, styles.replaceBtnKeep]}
                 onPress={() => {
                   const prior = replacePrompt?.priorBucket;
                   setReplacePrompt(null);
+                  setRejectRows([]);
+                  setOtherText('');
                   showConfirmation('queued', `Kept ${prior}`, 'No change');
                   resetSlots();
                 }}
@@ -375,24 +500,60 @@ export default function ReceivingOutScreen() {
                   Keep {replacePrompt?.priorBucket}
                 </Text>
               </TouchableOpacity>
-              <TouchableOpacity
-                style={[styles.replaceBtn, styles.replaceBtnSwitch]}
-                onPress={async () => {
-                  const data = replacePrompt;
-                  setReplacePrompt(null);
-                  if (!data) return;
-                  setSubmitting(true);
-                  try {
-                    await submitOnce(data.newBucket, data.newGrader, 'reject');
-                  } finally {
-                    setSubmitting(false);
-                  }
-                }}
-                activeOpacity={0.8}
-              >
-                <Ionicons name="swap-horizontal" size={18} color="#fff" />
-                <Text style={styles.replaceBtnSwitchText}>Replace anyway</Text>
-              </TouchableOpacity>
+              {(() => {
+                const total = rejectRows.reduce((s, r) => s + (parseInt(r.qty, 10) || 0), 0);
+                const expected = replacePrompt?.priorRemaining ?? 0;
+                const disabled = rejectRows.length === 0 || total !== expected || submitting;
+                return (
+                  <TouchableOpacity
+                    style={[styles.replaceBtn, styles.replaceBtnSwitch, disabled && styles.replaceBtnDisabled]}
+                    disabled={disabled}
+                    onPress={async () => {
+                      const data = replacePrompt;
+                      if (!data) return;
+                      const validRows = rejectRows.filter(r => r.reason && (parseInt(r.qty, 10) || 0) > 0);
+                      // Placed before setSubmitting(true) so the modal stays
+                      // open for the operator to fill in the free-text reason;
+                      // no submitting-flag reset needed on this early return.
+                      if (validRows.some((r) => r.reason === 'Other') && !otherText.trim()) {
+                        showConfirmation('error', 'Type the reason for “Other”');
+                        return;
+                      }
+                      setReplacePrompt(null);
+                      setSubmitting(true);
+                      try {
+                        const farm = (await getFarm()) || '';
+                        // Post one Grading Reject per reason against the prior
+                        // bucket. Doing this BEFORE confirm=reject keeps the
+                        // grader as the holder of the prior bucket, which
+                        // submit_bucket_reject requires.
+                        for (const row of validRows) {
+                          await submitBucketReject(
+                            data.priorBucket,
+                            data.newGrader,
+                            parseInt(row.qty, 10),
+                            farm,
+                            resolveReason(row.reason),
+                          );
+                        }
+                        // Close prior + open new (confirm=reject on the server
+                        // marks the prior Receiving Out closed as 'Replaced').
+                        await submitOnce(data.newBucket, data.newGrader, 'reject');
+                        setRejectRows([]);
+                        setOtherText('');
+                      } catch (e: any) {
+                        showConfirmation('error', e?.message || 'Reject failed');
+                      } finally {
+                        setSubmitting(false);
+                      }
+                    }}
+                    activeOpacity={0.8}
+                  >
+                    <Ionicons name="close-circle" size={18} color="#fff" />
+                    <Text style={styles.replaceBtnSwitchText}>Reject bucket</Text>
+                  </TouchableOpacity>
+                );
+              })()}
             </View>
           </View>
         </View>
@@ -655,5 +816,98 @@ const styles = StyleSheet.create({
     fontFamily: fontFamily.semiBold,
     fontSize: fontSize.sm,
     color: '#fff',
+  },
+  replaceBtnDisabled: {
+    opacity: 0.4,
+  },
+
+  // ── Reject Bucket reason UI ─────────────────────────────────────────
+  rejectChipsWrap: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 6,
+    marginTop: spacing.md,
+    alignSelf: 'stretch',
+  },
+  rejectChip: {
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: colors.border,
+    backgroundColor: colors.surfaceAlt,
+  },
+  rejectChipActive: {
+    backgroundColor: colors.error || '#dc2626',
+    borderColor: colors.error || '#dc2626',
+  },
+  rejectChipText: {
+    fontFamily: fontFamily.medium,
+    fontSize: 11,
+    color: colors.text,
+  },
+  rejectChipTextActive: {
+    color: '#fff',
+  },
+  otherReasonInput: {
+    alignSelf: 'stretch',
+    marginTop: spacing.sm,
+    paddingHorizontal: spacing.sm,
+    paddingVertical: 8,
+    borderRadius: borderRadius.sm,
+    borderWidth: 1,
+    borderColor: colors.border,
+    backgroundColor: colors.surface,
+    fontFamily: fontFamily.medium,
+    fontSize: fontSize.sm,
+    color: colors.text,
+  },
+  rejectRowsWrap: {
+    alignSelf: 'stretch',
+    marginTop: spacing.sm,
+    gap: 6,
+  },
+  rejectRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.sm,
+    paddingHorizontal: spacing.sm,
+    paddingVertical: 6,
+    borderRadius: borderRadius.sm,
+    backgroundColor: colors.surfaceAlt,
+  },
+  rejectRowLabel: {
+    flex: 1,
+    fontFamily: fontFamily.medium,
+    fontSize: fontSize.xs,
+    color: colors.text,
+  },
+  rejectQtyInput: {
+    width: 60,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: borderRadius.sm,
+    borderWidth: 1,
+    borderColor: colors.border,
+    backgroundColor: colors.surface,
+    fontFamily: fontFamily.semiBold,
+    fontSize: fontSize.sm,
+    color: colors.text,
+    textAlign: 'center',
+  },
+  rejectRowUnit: {
+    fontFamily: fontFamily.regular,
+    fontSize: 11,
+    color: colors.textMuted,
+  },
+  rejectTotal: {
+    fontFamily: fontFamily.medium,
+    fontSize: fontSize.xs,
+    color: colors.textSecondary,
+    marginTop: 4,
+    textAlign: 'right',
+  },
+  rejectTotalOff: {
+    color: colors.error || '#dc2626',
   },
 });

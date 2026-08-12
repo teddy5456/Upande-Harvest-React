@@ -15,11 +15,14 @@ import { addToSyncQueue } from '../database/sync-queue';
 import { getFarm } from '../database/settings';
 import { addGradingEntry } from '../database/grading';
 import { submitGrading, getBucketBalance, submitBucketReject, addToPool, gradeFromPool, getPoolStatus, getBouquetRecipeForBunch, submitBouquetGrading, getGraderOpenBucket } from '../services/api';
+import type { PoolEntry } from '../services/api';
 import {
   detectGradingQRType,
   extractGradingQRValue,
 } from '../utils/grading-utils';
 import BouquetRecipeCard, { BouquetVarietyState } from '../components/BouquetRecipe';
+import QRScanner from '../components/QRScanner';
+import VarietyBanner from '../components/VarietyBanner';
 import { BouquetRecipe } from '../types';
 import ScanInput from '../components/ScanInput';
 import GradingEntryComponent from '../components/GradingEntry';
@@ -70,6 +73,7 @@ export default function GradeScreen() {
   const [rejGrader, setRejGrader] = useState<string | null>(null);
   const [rejQty, setRejQty] = useState<string>('');
   const [rejReason, setRejReason] = useState<string>('');
+  const [rejOtherText, setRejOtherText] = useState('');
   const [bucketBalance, setBucketBalance] = useState<BucketBalance | null>(null);
   const [loadingBalance, setLoadingBalance] = useState(false);
   const [rejSubmitting, setRejSubmitting] = useState(false);
@@ -82,6 +86,7 @@ export default function GradeScreen() {
   const [poolSlot, setPoolSlot] = useState<'bunch' | 'grader'>('bunch');
   const [poolSubmitting, setPoolSubmitting] = useState(false);
   const [poolBalance, setPoolBalance] = useState<number>(0);
+  const [pools, setPools] = useState<PoolEntry[]>([]);
 
   // Bouquet mode (hidden — long-press the flower icon in the header to toggle)
   const [bouquetMode, setBouquetMode] = useState(false);
@@ -95,6 +100,22 @@ export default function GradeScreen() {
     visible: boolean; bucketId: string; variety: string; stems: number; bunchSize: number;
   }>({ visible: false, bucketId: '', variety: '', stems: 0, bunchSize: 10 });
   const [addingToPool, setAddingToPool] = useState(false);
+  // How many of the leftover stems to take, and who they go to. Blank assignee
+  // means the shared pool, which is the default.
+  const [takeStems, setTakeStems] = useState('');
+  const [assignTo, setAssignTo] = useState<string | null>(null);
+  const [assignScanOpen, setAssignScanOpen] = useState(false);
+  // Which target the badge scanner is filling: the after-grading card, or the
+  // pool card in the Rejects tab.
+  const [assignScanFor, setAssignScanFor] = useState<'modal' | 'card'>('modal');
+
+  // ── Pool card (bottom of the Rejects tab) ─────────────────────
+  // Pooling never asks for a bucket: it comes from the grader's open Receiving
+  // Out, same as the reject above it.
+  const [cardTake, setCardTake] = useState('');
+  const [cardDest, setCardDest] = useState<'shared' | 'self' | 'other'>('shared');
+  const [cardAssignee, setCardAssignee] = useState<string | null>(null);
+  const [cardSubmitting, setCardSubmitting] = useState(false);
 
   // ── Shared confirmation ───────────────────────────────────────
   const [confirmation, setConfirmation] = useState<{ visible: boolean; type: 'success' | 'error'; message: string }>(
@@ -286,22 +307,35 @@ export default function GradeScreen() {
           onScanSuccess();
           showConfirmation('success', `Graded: ${response.qty ?? 0} stems`);
 
-          // Auto-pool the bucket's remainder when it's smaller than a full
-          // bunch. The server returns bucket_remaining_stems on every submit
-          // so this is decided without an extra round-trip.
+          // Offer to pool the bucket's remainder when it is smaller than a full
+          // bunch. The remainder comes from get_bucket_balance, NOT from the
+          // grading response's bucket_remaining_stems: that field sums every
+          // harvest and every bunch the bucket has ever seen, with no cycle
+          // window, so on any re-used bucket it floors at 0 and this card
+          // never opened. get_bucket_balance windows to the current cycle,
+          // nets rejects, and prefers the open Receiving Out's count.
           if (isConnected && bucketId) {
-            const remaining = response.bucket_remaining_stems ?? null;
+            let remaining: number | null = null;
+            try {
+              const bal = await getBucketBalance(bucketId);
+              remaining = bal?.remaining_stems ?? null;
+            } catch {
+              remaining = response.bucket_remaining_stems ?? null;
+            }
             const bunchQty = response.qty ?? 10;
             if (remaining !== null && remaining > 0 && remaining < bunchQty) {
+              // The tail cannot make a bunch, so the operator decides what
+              // happens to it: pool it, hand it to a named grader, or take only
+              // part of it. Auto-pooling silently was quick but gave no choice
+              // and hid its own failures, which is why "add to pool" looked
+              // broken — nothing ever opened this card.
               const variety = (response.source_item ?? response.variety ?? '').toString();
-              if (variety) {
-                try {
-                  const pres = await addToPool(bucketId, variety, farm, graderId, remaining, bunchQty);
-                  setPoolBalance(pres.pooled_stems);
-                  if (poolVariety !== variety) setPoolVariety(variety);
-                  showConfirmation('success', `${remaining} stems auto-pooled (${pres.pooled_stems} total)`);
-                } catch { /* pool unavailable — silently skip */ }
-              }
+              setRemainderModal({
+                visible: true, bucketId, variety,
+                stems: remaining, bunchSize: bunchQty,
+              });
+              setTakeStems(String(remaining));
+              setAssignTo(null);
             }
           }
         } catch (error: any) {
@@ -358,15 +392,37 @@ export default function GradeScreen() {
   // ── Remainder modal handlers ──────────────────────────────────
   const handleAddToPool = async () => {
     const { bucketId, variety, stems, bunchSize } = remainderModal;
+    if (!variety) {
+      showConfirmation('error',
+        'This bucket has no variety on record, so there is no pool to add it to.');
+      return;
+    }
+    // They may take only part of the tail — 3 of the 5 that are still usable.
+    const take = parseInt(takeStems, 10);
+    if (!take || take <= 0) {
+      showConfirmation('error', 'Enter how many stems you are taking');
+      return;
+    }
+    if (take > stems) {
+      showConfirmation('error', `Only ${stems} stems are left in ${bucketId}`);
+      return;
+    }
     const farm = await getFarm();
     const grader = slots.grader ?? '';
     setAddingToPool(true);
     try {
-      const resp = await addToPool(bucketId, variety, farm, grader, stems, bunchSize);
-      setPoolBalance(resp.pooled_stems);
-      if (poolVariety !== variety) setPoolVariety(variety);
+      const resp = await addToPool(
+        bucketId, variety, farm, grader, take, bunchSize, assignTo || undefined);
+      // An assigned tail belongs to that person, so it must not be shown as the
+      // shared pool balance sitting on the Pool tab.
+      if (!assignTo) {
+        setPoolBalance(resp.pooled_stems);
+        if (poolVariety !== variety) setPoolVariety(variety);
+      }
       setRemainderModal((p) => ({ ...p, visible: false }));
-      showConfirmation('success', `${stems} stems added to pool (${resp.pooled_stems} total)`);
+      showConfirmation('success', assignTo
+        ? `${take} stems given to ${assignTo} (${resp.pooled_stems} waiting for them)`
+        : `${take} stems added to the pool (${resp.pooled_stems} total)`);
     } catch (err: any) {
       showConfirmation('error', err.message);
     } finally {
@@ -375,6 +431,24 @@ export default function GradeScreen() {
   };
 
   // ── Pool mode handlers ────────────────────────────────────────
+  // Every variety in the pool, biggest first. `prefer` keeps the row the
+  // operator is working on selected after a bunch is graded off it.
+  const refreshPools = useCallback(async (prefer?: string | null) => {
+    const farm = await getFarm();
+    const status = await getPoolStatus('', farm);
+    const list = status?.pools ?? (status?.pool && status.pooled_stems > 0
+      ? [{
+          pool: status.pool, variety: status.variety ?? '', item_code: status.variety ?? '',
+          pooled_stems: status.pooled_stems, lengths: status.lengths ?? 1,
+        } as PoolEntry]
+      : []);
+    setPools(list);
+    if (!list.length) { setPoolVariety(null); setPoolBalance(0); return; }
+    const chosen = list.find((p) => p.variety === (prefer ?? poolVariety)) ?? list[0];
+    setPoolVariety(chosen.variety);
+    setPoolBalance(chosen.pooled_stems);
+  }, [poolVariety]);
+
   const handlePoolScan = useCallback(async (data: string) => {
     if (poolSubmitting) return;
     const value = extractGradingQRValue(data) || data.trim();
@@ -391,19 +465,69 @@ export default function GradeScreen() {
     }
   }, [poolSlot, poolSubmitting]);
 
+  // Pool from the Rejects tab. The bucket, variety and farm all come from the
+  // grader's open Receiving Out — the operator only chooses how many and where.
+  const handleCardPool = async () => {
+    const take = parseInt(cardTake, 10);
+    const avail = bucketBalance?.remaining_stems ?? 0;
+    if (!rejGrader || !rejBucketId) {
+      showConfirmation('error', 'Scan the grader first');
+      return;
+    }
+    if (!take || take <= 0) {
+      showConfirmation('error', 'Enter how many stems to pool');
+      return;
+    }
+    if (take > avail) {
+      showConfirmation('error', `Only ${avail} stems left in ${rejBucketId}`);
+      return;
+    }
+    if (cardDest === 'other' && !cardAssignee) {
+      setAssignScanFor('card'); setAssignScanOpen(true);
+      return;
+    }
+    // 'self' hands the stems to this same grader, so they surface on their next
+    // bucket instead of going into the shared remainders pool.
+    const assignedTo = cardDest === 'other' ? cardAssignee!
+      : cardDest === 'self' ? rejGrader
+      : undefined;
+    setCardSubmitting(true);
+    try {
+      const farm = await getFarm();
+      const variety = bucketBalance?.variety || bucketBalance?.item_code || '';
+      const resp = await addToPool(rejBucketId, variety, farm, rejGrader, take, 0, assignedTo);
+      setCardTake('');
+      await loadGraderSession(rejGrader);
+      await refreshStats();
+      onScanSuccess();
+      showConfirmation('success',
+        cardDest === 'other' ? `${take} stems given to ${cardAssignee} (${resp.pooled_stems} waiting for them)`
+        : cardDest === 'self' ? `${take} stems kept for ${rejGrader}'s next bucket (${resp.pooled_stems} waiting)`
+        : `${take} stems in the remainders bucket (${resp.pooled_stems} pooled)`);
+    } catch (err: any) {
+      onScanError();
+      showConfirmation('error', err.message);
+    } finally {
+      setCardSubmitting(false);
+    }
+  };
+
   const handlePoolSubmit = async () => {
-    if (!poolBunchId || !poolGrader || !poolVariety) {
-      showConfirmation('error', !poolVariety ? 'No active pool — add remainder stems first' : 'Scan bunch and grader first');
+    if (!poolBunchId || !poolGrader) {
+      showConfirmation('error', 'Scan bunch and grader first');
       return;
     }
     setPoolSubmitting(true);
     try {
       const farm = await getFarm();
-      const resp = await gradeFromPool(poolBunchId, poolGrader, farm, poolVariety);
+      const resp = await gradeFromPool(poolBunchId, poolGrader, farm, poolVariety ?? undefined);
       setPoolBalance(resp.pooled_stems);
+      if (resp.variety) setPoolVariety(resp.variety);
+      try { await refreshPools(resp.variety); } catch { /* offline */ }
       await refreshStats();
       onScanSuccess();
-      showConfirmation('success', `Pool bunch graded. ${resp.pooled_stems} stems remaining.`);
+      showConfirmation('success', `${resp.variety ?? 'Pool'} bunch of ${resp.bunch_size ?? ''} graded. `
+        + `${resp.pooled_stems} stems left in that pool.`);
       setPoolBunchId(null);
       setPoolGrader(null);
       setPoolSlot('bunch');
@@ -425,15 +549,11 @@ export default function GradeScreen() {
     setRejSlot(directToGrader ? 'grader' : 'bucket');
   }, [directToGrader]);
 
-  const handleRejectScan = useCallback(async (data: string) => {
-    if (rejSubmitting) return;
-    const value = extractGradingQRValue(data) || data.trim();
-    if (!value) return;
-
-    // Direct-to-Grader: only the grader QR is scanned. We pull the open
-    // Receiving Out for that grader and use ITS bucket + remaining qty as the
-    // reject context. Skips the bucket-scan slot entirely.
-    if (directToGrader) {
+  // Everything the Rejects tab needs about a grader: their open bucket, its
+  // variety and what is left in it. Called by the grader scan AND on entering
+  // the tab with a grader already scanned in the Grade tab — re-scanning the
+  // same badge to reject was pure friction.
+  const loadGraderSession = useCallback(async (value: string) => {
       setLoadingBalance(true);
       try {
         const open = await getGraderOpenBucket(value);
@@ -459,7 +579,9 @@ export default function GradeScreen() {
           rejected_stems:  0,
           pooled_stems:    0,
         } as any);
-        setRejQty(String(open.remaining_qty && open.remaining_qty > 0 ? open.remaining_qty : 0));
+        // Do NOT prefill with the whole remainder: with a pool card sitting
+        // right below, a mis-tap would write the entire tail off as rejects.
+        setRejQty('');
         onScanSuccess();
         showConfirmation(
           'success',
@@ -471,6 +593,18 @@ export default function GradeScreen() {
       } finally {
         setLoadingBalance(false);
       }
+  }, []);
+
+  const handleRejectScan = useCallback(async (data: string) => {
+    if (rejSubmitting) return;
+    const value = extractGradingQRValue(data) || data.trim();
+    if (!value) return;
+
+    // Direct-to-Grader: only the grader QR is scanned. We pull the open
+    // Receiving Out for that grader and use ITS bucket + remaining qty as the
+    // reject context. Skips the bucket-scan slot entirely.
+    if (directToGrader) {
+      await loadGraderSession(value);
       return;
     }
 
@@ -512,15 +646,20 @@ export default function GradeScreen() {
       showConfirmation('error', 'Select a reject reason');
       return;
     }
+    if (rejReason === 'Other' && !rejOtherText.trim()) {
+      showConfirmation('error', 'Type the reason for “Other”');
+      return;
+    }
     setRejSubmitting(true);
     try {
       const farm = await getFarm();
-      const resp = await submitBucketReject(rejBucketId, rejGrader, qty, farm, rejReason);
+      const resp = await submitBucketReject(rejBucketId, rejGrader, qty, farm, rejReason === 'Other' ? rejOtherText.trim() : rejReason);
       await refreshStats();
       onScanSuccess();
       showConfirmation('success', `${qty} rejects recorded. ${resp.remaining_stems} stems remaining.`);
       resetRejects();
       setRejReason('');
+      setRejOtherText('');
     } catch (err: any) {
       onScanError();
       showConfirmation('error', err.message);
@@ -544,7 +683,20 @@ export default function GradeScreen() {
         </TouchableOpacity>
         <TouchableOpacity
           style={[styles.modeBtn, mode === 'rejects' && styles.modeBtnReject]}
-          onPress={() => { setMode('rejects'); resetRejects(); }}
+          onPress={() => {
+            setMode('rejects');
+            // Carry the grader over from the Grade tab. Their open Receiving Out
+            // is the whole reject/pool context, so scanning the same badge again
+            // was friction for nothing.
+            const carried = slots.grader;
+            if (carried) {
+              setRejQty(''); setRejReason(''); setRejOtherText('');
+              setCardTake(''); setCardDest('shared'); setCardAssignee(null);
+              loadGraderSession(carried);
+            } else {
+              resetRejects();
+            }
+          }}
           activeOpacity={0.7}
         >
           <Ionicons name="close-circle-outline" size={14} color={mode === 'rejects' ? '#fff' : colors.textMuted} />
@@ -557,12 +709,7 @@ export default function GradeScreen() {
             // Recover any existing pool state from the server so the user
             // doesn't see "no active pool" just because the app was restarted.
             try {
-              const farm = await getFarm();
-              const status = await getPoolStatus('', farm);
-              if (status?.pool && status.pooled_stems > 0) {
-                setPoolVariety((status as any).variety ?? null);
-                setPoolBalance(status.pooled_stems);
-              }
+              await refreshPools();
             } catch { /* offline — pool stays whatever it was */ }
           }}
           activeOpacity={0.7}
@@ -845,6 +992,106 @@ export default function GradeScreen() {
             </View>
           )}
 
+          {/* Other reason free-text input */}
+          {rejBucketId && rejReason === 'Other' && (
+            <View style={styles.reasonSection}>
+              <Text style={styles.reasonLabel}>Other reason <Text style={styles.reasonReq}>*</Text></Text>
+              <TextInput
+                style={styles.reasonInput}
+                value={rejOtherText}
+                onChangeText={setRejOtherText}
+                placeholder="Type the reason"
+                placeholderTextColor={colors.textMuted}
+              />
+            </View>
+          )}
+
+          {/* Pool card. Whatever is left that cannot make a bunch goes somewhere
+              deliberate: the remainders bucket, another grader, or this grader's
+              own next bucket. No bucket is ever scanned — it comes from the
+              open Receiving Out above. */}
+          {rejBucketId && rejGrader && (
+            <View style={styles.poolCard}>
+              <View style={styles.poolCardHead}>
+                <Ionicons name="layers-outline" size={15} color="#4338CA" />
+                <Text style={styles.poolCardTitle}>Pool what is left</Text>
+                <Text style={styles.poolCardMax}>
+                  {bucketBalance?.remaining_stems ?? 0} available
+                </Text>
+              </View>
+
+              <Text style={styles.modalFieldLabel}>Stems to pool</Text>
+              <View style={styles.takeRow}>
+                <TextInput
+                  style={styles.takeInput}
+                  value={cardTake}
+                  onChangeText={(t) => setCardTake(t.replace(/[^0-9]/g, ''))}
+                  keyboardType="number-pad"
+                  selectTextOnFocus
+                  placeholder="0"
+                  placeholderTextColor={colors.textMuted}
+                />
+                <Text style={styles.takeOf}>of {bucketBalance?.remaining_stems ?? 0}</Text>
+                <TouchableOpacity
+                  onPress={() => setCardTake(String(bucketBalance?.remaining_stems ?? 0))}
+                  activeOpacity={0.7}
+                >
+                  <Text style={styles.takeAll}>all</Text>
+                </TouchableOpacity>
+              </View>
+
+              <Text style={styles.modalFieldLabel}>Where they go</Text>
+              <View style={styles.poolDestCol}>
+                {([
+                  ['shared', 'archive-outline', 'Remainders bucket',
+                   'Any variety, anyone can bunch it later'],
+                  ['self', 'repeat-outline', 'My next bucket',
+                   'Waits for this grader to open their next bucket'],
+                  ['other', 'person-outline', cardAssignee ? `To ${cardAssignee}` : 'Give to a grader',
+                   'Becomes theirs to bunch'],
+                ] as const).map(([key, icon, label, hint]) => {
+                  const on = cardDest === key;
+                  return (
+                    <TouchableOpacity
+                      key={key}
+                      style={[styles.poolDestRow, on && styles.poolDestRowOn]}
+                      onPress={() => {
+                        setCardDest(key);
+                        if (key === 'other' && !cardAssignee) {
+                          setAssignScanFor('card'); setAssignScanOpen(true);
+                        }
+                      }}
+                      activeOpacity={0.7}
+                    >
+                      <Ionicons name={icon} size={16} color={on ? '#4338CA' : colors.textMuted} />
+                      <View style={{ flex: 1 }}>
+                        <Text style={[styles.poolDestLabel, on && styles.poolDestLabelOn]}>{label}</Text>
+                        <Text style={styles.poolDestHint}>{hint}</Text>
+                      </View>
+                      {on && <Ionicons name="checkmark-circle" size={16} color="#4338CA" />}
+                    </TouchableOpacity>
+                  );
+                })}
+              </View>
+
+              <TouchableOpacity
+                style={[styles.poolCardBtn, cardSubmitting && styles.submitBtnDisabled]}
+                onPress={handleCardPool}
+                disabled={cardSubmitting}
+                activeOpacity={0.8}
+              >
+                {cardSubmitting ? (
+                  <ActivityIndicator size="small" color="#fff" />
+                ) : (
+                  <>
+                    <Ionicons name="layers-outline" size={16} color="#fff" />
+                    <Text style={styles.submitBtnText}>Pool {cardTake || '0'} stems</Text>
+                  </>
+                )}
+              </TouchableOpacity>
+            </View>
+          )}
+
           {/* Submit button */}
           {rejBucketId && rejGrader && (
             <TouchableOpacity
@@ -868,20 +1115,41 @@ export default function GradeScreen() {
       ) : mode === 'pool' ? (
         <ScrollView style={styles.scroll} contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
 
-          {/* Pool variety banner */}
-          <View style={styles.poolBanner}>
-            {poolVariety ? (
-              <>
-                <Ionicons name="leaf-outline" size={15} color={colors.success} />
-                <Text style={styles.poolVarietyText}>{stripStemLength(poolVariety)}</Text>
-                <View style={styles.poolBadge}>
-                  <Text style={styles.poolBadgeText}>{poolBalance} stems pooled</Text>
+          {/* One row per variety in the pool. The server used to return only the
+              biggest pool, so a second variety was invisible until it overtook
+              the first — graders could not see stems they were holding. */}
+          {pools.length ? (
+            <>
+              <VarietyBanner
+                variety={poolVariety ?? pools[0].variety}
+                stems={poolBalance}
+                context="pooled and ready to bunch"
+              />
+              {pools.length > 1 ? (
+                <View style={styles.poolChipRow}>
+                  {pools.map((p) => {
+                    const on = (poolVariety ?? pools[0].variety) === p.variety;
+                    return (
+                      <TouchableOpacity
+                        key={p.pool}
+                        style={[styles.poolChip, on && styles.poolChipOn]}
+                        onPress={() => { setPoolVariety(p.variety); setPoolBalance(p.pooled_stems); }}
+                        activeOpacity={0.7}
+                      >
+                        <Text style={[styles.poolChipText, on && styles.poolChipTextOn]}>
+                          {p.variety} · {p.pooled_stems}
+                        </Text>
+                      </TouchableOpacity>
+                    );
+                  })}
                 </View>
-              </>
-            ) : (
+              ) : null}
+            </>
+          ) : (
+            <View style={styles.poolBanner}>
               <Text style={styles.poolEmptyText}>No active pool — grade a bucket first to add remainders</Text>
-            )}
-          </View>
+            </View>
+          )}
 
           {/* Step pills */}
           <View style={styles.pillRow}>
@@ -957,19 +1225,74 @@ export default function GradeScreen() {
               <Ionicons name="layers-outline" size={20} color={colors.text} />
               <Text style={styles.modalTitle}>Remainder Stems</Text>
             </View>
+            <VarietyBanner
+              variety={remainderModal.variety}
+              stems={remainderModal.stems}
+              context={`Bucket ${remainderModal.bucketId}`}
+            />
             <Text style={styles.modalBody}>
-              Bunch needs <Text style={styles.modalHighlight}>{remainderModal.bunchSize}</Text> stems but{' '}
-              <Text style={styles.modalHighlight}>{remainderModal.bucketId}</Text> only has{' '}
-              <Text style={styles.modalHighlight}>{remainderModal.stems}</Text>.
-              {'\n'}Pool these stems for later grading, or skip to scan a smaller bunch.
+              Not enough for a bunch of{' '}
+              <Text style={styles.modalHighlight}>{remainderModal.bunchSize}</Text>.
+              Pool them for later, or give them to a grader.
             </Text>
+
+            {/* They may take only some of what is left. */}
+            <Text style={styles.modalFieldLabel}>Stems you are taking</Text>
+            <View style={styles.takeRow}>
+              <TextInput
+                style={styles.takeInput}
+                value={takeStems}
+                onChangeText={(t) => setTakeStems(t.replace(/[^0-9]/g, ''))}
+                keyboardType="number-pad"
+                selectTextOnFocus
+                placeholder={String(remainderModal.stems)}
+                placeholderTextColor={colors.textMuted}
+              />
+              <Text style={styles.takeOf}>of {remainderModal.stems}</Text>
+              {takeStems !== String(remainderModal.stems) ? (
+                <TouchableOpacity
+                  onPress={() => setTakeStems(String(remainderModal.stems))}
+                  activeOpacity={0.7}
+                >
+                  <Text style={styles.takeAll}>take all</Text>
+                </TouchableOpacity>
+              ) : null}
+            </View>
+
+            {/* Shared pool by default; scanning a badge hands them over instead. */}
+            <Text style={styles.modalFieldLabel}>Where they go</Text>
+            <View style={styles.destRow}>
+              <TouchableOpacity
+                style={[styles.destChip, !assignTo && styles.destChipOn]}
+                onPress={() => setAssignTo(null)}
+                activeOpacity={0.7}
+              >
+                <Ionicons name="layers-outline" size={14}
+                  color={!assignTo ? colors.textOnPrimary : colors.textSecondary} />
+                <Text style={[styles.destChipText, !assignTo && styles.destChipTextOn]}>
+                  Shared pool
+                </Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.destChip, !!assignTo && styles.destChipOn]}
+                onPress={() => { setAssignScanFor('modal'); setAssignScanOpen(true); }}
+                activeOpacity={0.7}
+              >
+                <Ionicons name="person-outline" size={14}
+                  color={assignTo ? colors.textOnPrimary : colors.textSecondary} />
+                <Text style={[styles.destChipText, !!assignTo && styles.destChipTextOn]}>
+                  {assignTo ? `To ${assignTo}` : 'Give to a grader'}
+                </Text>
+              </TouchableOpacity>
+            </View>
+
             <View style={styles.modalActions}>
               <TouchableOpacity
                 style={styles.modalSkip}
                 onPress={() => setRemainderModal((p) => ({ ...p, visible: false }))}
                 activeOpacity={0.7}
               >
-                <Text style={styles.modalSkipText}>Skip</Text>
+                <Text style={styles.modalSkipText}>Leave in bucket</Text>
               </TouchableOpacity>
               <TouchableOpacity
                 style={[styles.modalPool, addingToPool && styles.submitBtnDisabled]}
@@ -979,12 +1302,32 @@ export default function GradeScreen() {
               >
                 {addingToPool
                   ? <ActivityIndicator size="small" color="#fff" />
-                  : <Text style={styles.modalPoolText}>Add to Pool</Text>}
+                  : (
+                    <Text style={styles.modalPoolText}>
+                      {assignTo ? 'Hand over' : 'Add to pool'}
+                    </Text>
+                  )}
               </TouchableOpacity>
             </View>
           </View>
         </View>
       </Modal>
+
+      <QRScanner
+        visible={assignScanOpen}
+        title="Scan the grader's badge"
+        onScanned={(data) => {
+          const who = (extractGradingQRValue(data) || data.trim()).trim();
+          setAssignScanOpen(false);
+          if (!who) {
+            showConfirmation('error', 'Could not read that badge');
+            return;
+          }
+          if (assignScanFor === 'card') { setCardAssignee(who); setCardDest('other'); }
+          else { setAssignTo(who); }
+        }}
+        onClose={() => setAssignScanOpen(false)}
+      />
 
       <ScanConfirmation
         visible={confirmation.visible}
@@ -998,6 +1341,34 @@ export default function GradeScreen() {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: colors.background },
+
+  modalFieldLabel: {
+    fontFamily: fontFamily.medium, fontSize: fontSize.xs, color: colors.textSecondary,
+    marginTop: spacing.md, marginBottom: spacing.xs,
+  },
+  takeRow: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm },
+  takeInput: {
+    borderWidth: 1, borderColor: colors.border, borderRadius: borderRadius.md,
+    paddingHorizontal: spacing.md, paddingVertical: spacing.sm,
+    fontFamily: fontFamily.semiBold, fontSize: 22, color: colors.text,
+    minWidth: 84, textAlign: 'center',
+  },
+  takeOf: { fontFamily: fontFamily.regular, fontSize: fontSize.sm, color: colors.textSecondary },
+  takeAll: {
+    fontFamily: fontFamily.medium, fontSize: fontSize.xs, color: colors.text,
+    textDecorationLine: 'underline',
+  },
+  destRow: { flexDirection: 'row', gap: spacing.sm, flexWrap: 'wrap' },
+  destChip: {
+    flexDirection: 'row', alignItems: 'center', gap: 6,
+    borderWidth: 1, borderColor: colors.border, borderRadius: borderRadius.full,
+    paddingHorizontal: spacing.md, paddingVertical: 7,
+  },
+  destChipOn: { backgroundColor: colors.text, borderColor: colors.text },
+  destChipText: {
+    fontFamily: fontFamily.medium, fontSize: fontSize.xs, color: colors.textSecondary,
+  },
+  destChipTextOn: { color: colors.textOnPrimary },
   scroll: { flex: 1 },
   content: { padding: spacing.lg, paddingBottom: spacing.xxl },
 
@@ -1246,6 +1617,17 @@ const styles = StyleSheet.create({
   reasonReq: {
     color: '#ef4444',
   },
+  reasonInput: {
+    backgroundColor: colors.surface,
+    borderRadius: borderRadius.md,
+    borderWidth: 1,
+    borderColor: colors.border,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
+    fontFamily: fontFamily.regular,
+    fontSize: fontSize.md,
+    color: colors.text,
+  },
   chipGrid: {
     flexDirection: 'row',
     flexWrap: 'wrap',
@@ -1304,6 +1686,101 @@ const styles = StyleSheet.create({
     fontFamily: fontFamily.medium,
     fontSize: 11,
     color: colors.success,
+  },
+  poolCard: {
+    backgroundColor: colors.surface,
+    borderRadius: borderRadius.md,
+    borderWidth: 1,
+    borderColor: '#C7D2FE',
+    padding: spacing.md,
+    marginTop: spacing.sm,
+    gap: spacing.xs,
+  },
+  poolCardHead: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.xs,
+    marginBottom: spacing.xs,
+  },
+  poolCardTitle: {
+    fontFamily: fontFamily.semiBold,
+    fontSize: fontSize.md,
+    color: colors.text,
+    flex: 1,
+  },
+  poolCardMax: {
+    fontFamily: fontFamily.medium,
+    fontSize: fontSize.sm,
+    color: colors.textSecondary,
+  },
+  poolDestCol: {
+    gap: spacing.xs,
+    marginBottom: spacing.xs,
+  },
+  poolDestRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.sm,
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: borderRadius.md,
+    paddingHorizontal: spacing.sm,
+    paddingVertical: 10,
+  },
+  poolDestRowOn: {
+    borderColor: '#6366f1',
+    backgroundColor: '#EEF2FF',
+  },
+  poolDestLabel: {
+    fontFamily: fontFamily.medium,
+    fontSize: fontSize.sm,
+    color: colors.text,
+  },
+  poolDestLabelOn: {
+    fontFamily: fontFamily.semiBold,
+    color: '#3730A3',
+  },
+  poolDestHint: {
+    fontFamily: fontFamily.regular,
+    fontSize: 11,
+    color: colors.textMuted,
+  },
+  poolCardBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: spacing.sm,
+    backgroundColor: '#6366f1',
+    borderRadius: borderRadius.md,
+    paddingVertical: 12,
+    marginTop: spacing.xs,
+  },
+  poolChipRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: spacing.xs,
+    marginBottom: spacing.sm,
+  },
+  poolChip: {
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: borderRadius.full,
+    borderWidth: 1,
+    borderColor: colors.border,
+    backgroundColor: colors.surface,
+  },
+  poolChipOn: {
+    borderColor: '#6366f1',
+    backgroundColor: '#EEF2FF',
+  },
+  poolChipText: {
+    fontFamily: fontFamily.medium,
+    fontSize: fontSize.sm,
+    color: colors.textSecondary,
+  },
+  poolChipTextOn: {
+    color: '#4338CA',
+    fontFamily: fontFamily.semiBold,
   },
   poolEmptyText: {
     fontFamily: fontFamily.regular,

@@ -20,9 +20,10 @@ import { submitReceiving, submitQualityEntry, createQuarantineBatch, getBucketBa
 import { parseScannedBucketQR } from '../utils/shelf-utils';
 import { getFarm } from '../database/settings';
 import ScanInput from '../components/ScanInput';
+import VarietyBanner from '../components/VarietyBanner';
 import ScanConfirmation from '../components/ScanConfirmation';
 import EntriesLog from '../components/EntriesLog';
-import { ReceivingListEntry, RejectLine, QUALITY_REASONS, stripStemLength } from '../types';
+import { ReceivingListEntry, RejectLine, QUALITY_REASONS } from '../types';
 import { onScanSuccess, onScanError } from '../utils/feedback';
 import { colors, fontFamily, fontSize, spacing, borderRadius } from '../theme';
 
@@ -64,6 +65,7 @@ export default function ReceivingScreen() {
   } | null>(null);
   const [qualityLines, setQualityLines] = useState<RejectLine[]>([]);
   const [qualityNotes, setQualityNotes] = useState('');
+  const [otherText, setOtherText] = useState('');
   const [submittingQuality, setSubmittingQuality] = useState(false);
 
   // Batch mode
@@ -90,6 +92,8 @@ export default function ReceivingScreen() {
     });
   };
 
+  const resolveReason = (r: string) => (r === 'Other' ? otherText.trim() : r);
+
   const adjustQualityQty = (reason: string, delta: number) => {
     setQualityLines((prev) =>
       prev.map((l) => l.reason === reason ? { ...l, quantity: Math.max(1, l.quantity + delta) } : l)
@@ -111,20 +115,20 @@ export default function ReceivingScreen() {
     for (const line of lines) {
       const payload = {
         section: 'receiving_reject', ref_id: bucketId, quantity: line.quantity,
-        reason: line.reason, notes, farm, greenhouse: gh, variety,
+        reason: resolveReason(line.reason), notes, farm, greenhouse: gh, variety,
         quarantined: 0, quarantine_action: '',
       };
       if (isConnected) {
         try {
-          await submitQualityEntry('receiving_reject', bucketId, line.quantity, line.reason, notes, farm, gh, variety, false, '');
-          await addQualityEntry('receiving_reject', bucketId, line.quantity, line.reason, notes, farm, true, gh, variety, false, '');
+          await submitQualityEntry('receiving_reject', bucketId, line.quantity, resolveReason(line.reason), notes, farm, gh, variety, false, '');
+          await addQualityEntry('receiving_reject', bucketId, line.quantity, resolveReason(line.reason), notes, farm, true, gh, variety, false, '');
         } catch {
           await addToSyncQueue('create_quality_entry', payload);
-          await addQualityEntry('receiving_reject', bucketId, line.quantity, line.reason, notes, farm, false, gh, variety, false, '');
+          await addQualityEntry('receiving_reject', bucketId, line.quantity, resolveReason(line.reason), notes, farm, false, gh, variety, false, '');
         }
       } else {
         await addToSyncQueue('create_quality_entry', payload);
-        await addQualityEntry('receiving_reject', bucketId, line.quantity, line.reason, notes, farm, false, gh, variety, false, '');
+        await addQualityEntry('receiving_reject', bucketId, line.quantity, resolveReason(line.reason), notes, farm, false, gh, variety, false, '');
       }
     }
 
@@ -164,6 +168,10 @@ export default function ReceivingScreen() {
   // Submit rejects (if any) then do the actual receiving — called by submit button
   const handleQualitySubmit = async () => {
     if (!pendingQuality) return;
+    if (qualityLines.some((l) => l.reason === 'Other') && !otherText.trim()) {
+      showConfirmation('error', 'Type the reason for “Other”');
+      return;
+    }
     setSubmittingQuality(true);
     await doReceive(
       pendingQuality.bucketId,
@@ -180,6 +188,7 @@ export default function ReceivingScreen() {
     setPendingQuality(null);
     setQualityLines([]);
     setQualityNotes('');
+    setOtherText('');
   };
 
   // ── mona: single scan — fetch bucket info first, show quality panel before receiving ──
@@ -200,6 +209,7 @@ export default function ReceivingScreen() {
         );
         setQualityLines([]);
         setQualityNotes('');
+        setOtherText('');
       }
 
       // Look up bucket info (variety/greenhouse/qty + harvester) from harvest entry pre-receive
@@ -401,15 +411,18 @@ export default function ReceivingScreen() {
         {/* ── Inline quality check card ── */}
         {pendingQuality && (
           <View style={styles.qualityCard}>
+            {/* Accept-or-reject is the decision being made here, and it cannot be
+                made without knowing the variety and length. It used to sit in a
+                12px dot-separated line with the length stripped out of the name. */}
+            <VarietyBanner
+              variety={pendingQuality.variety}
+              stems={pendingQuality.qty ?? null}
+              context={pendingQuality.greenhouse || null}
+            />
             <View style={styles.qualityCardHeader}>
               <Ionicons name="shield-checkmark-outline" size={16} color={colors.warning} />
               <View style={{ flex: 1 }}>
                 <Text style={styles.qualityCardTitle}>Intake Check — {pendingQuality.bucketId}</Text>
-                {(pendingQuality.variety || pendingQuality.greenhouse || pendingQuality.qty) ? (
-                  <Text style={styles.qualityCardSub}>
-                    {[stripStemLength(pendingQuality.variety || ''), pendingQuality.greenhouse, pendingQuality.qty ? `${pendingQuality.qty} stems` : ''].filter(Boolean).join('  ·  ')}
-                  </Text>
-                ) : null}
                 {(pendingQuality.harvester || pendingQuality.harvestTime) ? (
                   <View style={styles.harvestMeta}>
                     {pendingQuality.harvester ? (
@@ -448,6 +461,19 @@ export default function ReceivingScreen() {
                 );
               })}
             </View>
+
+            {qualityLines.some((l) => l.reason === 'Other') && (
+              <View style={styles.otherReasonWrap}>
+                <Text style={styles.modalLabel}>Other reason</Text>
+                <TextInput
+                  style={styles.modalInput}
+                  value={otherText}
+                  onChangeText={setOtherText}
+                  placeholder="Type the reason"
+                  placeholderTextColor={colors.textMuted}
+                />
+              </View>
+            )}
 
             {qualityLines.length > 0 && (
               <View style={styles.qualityLines}>
@@ -541,9 +567,12 @@ export default function ReceivingScreen() {
                 <Text style={styles.entryId}>{entry.bucket_id}</Text>
                 {entry.coldroom_bucket_id ? <Text style={styles.coldroomId}>→ {entry.coldroom_bucket_id}</Text> : null}
                 {(entry.variety || entry.greenhouse) ? (
-                  <Text style={styles.entryDetail}>
-                    {[stripStemLength(entry.variety || ''), entry.greenhouse, entry.qty ? `${entry.qty} stems` : ''].filter(Boolean).join('  ·  ')}
-                  </Text>
+                  <VarietyBanner
+                    size="sm"
+                    variety={entry.variety}
+                    stems={entry.qty ?? null}
+                    context={entry.greenhouse || null}
+                  />
                 ) : null}
                 <Text style={styles.entryTime}>{entry.time}</Text>
               </View>
@@ -699,6 +728,7 @@ const styles = StyleSheet.create({
   qualityReasonLabel: { fontFamily: fontFamily.medium, fontSize: fontSize.sm, color: colors.text, marginBottom: spacing.sm },
   qualityOptional: { fontFamily: fontFamily.regular, fontSize: fontSize.xs, color: colors.textMuted },
   reasonGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: spacing.xs, marginBottom: spacing.md },
+  otherReasonWrap: { marginBottom: spacing.sm },
   reasonChip: {
     flexDirection: 'row', alignItems: 'center',
     paddingHorizontal: spacing.sm, paddingVertical: 5,
