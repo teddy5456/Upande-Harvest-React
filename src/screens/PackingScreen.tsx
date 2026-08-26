@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useEffect } from 'react';
+import React, { useState, useCallback, useMemo } from 'react';
 import {
   View,
   Text,
@@ -6,20 +6,12 @@ import {
   ScrollView,
   TouchableOpacity,
   Alert,
-  ActivityIndicator,
+  Modal,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { useApp } from '../context/AppContext';
 import {
-  upsertPackingBox,
-  addBunchToBox as addBunchLocal,
-  markBoxClosed,
-} from '../database/packing';
-import { addToSyncQueue } from '../database/sync-queue';
-import {
-  addBunchToBoxApi,
   closePackBox,
-  getOpenBoxForOpl,
   getPackBoxRecipe,
   packBunchToOpl,
   MixRecipeItem,
@@ -27,41 +19,21 @@ import {
 import ScanInput from '../components/ScanInput';
 import ScanConfirmation from '../components/ScanConfirmation';
 import OplPicker from '../components/OplPicker';
-import { PackingListEntry, PackBoxSummary, PackableOpl } from '../types';
+import FixStickerSheet from '../components/FixStickerSheet';
+import { PackingListEntry, PackableOpl, PackLineChoice, PackBunchToOplResponse } from '../types';
 import { extractGradingQRValue } from '../utils/grading-utils';
 import { onScanSuccess, onScanError } from '../utils/feedback';
+import { useCompact } from '../hooks/useCompact';
+import { pauseScanFocus } from '../utils/scan-focus';
 import { colors, fontFamily, fontSize, spacing, borderRadius } from '../theme';
 
-type Mode = 'box' | 'opl';
-
 /**
- * Derive OPL name from either an OPL scan ("OPL-2026-0003")
- * or a box scan ("OPL-2026-0003-B1"). The Pack Box naming rule is
- * "{opl}-B{sequence}" — so anything after the last "-B" is the box suffix.
- * Accepts JSON-wrapped QR payloads like {"opl":"..."} or {"box_id":"..."}.
+ * Packing — pack-by-OPL only. Scanning a box label used to be a second mode
+ * here (add_bunch_to_box), but it had none of pack_bunch_to_opl's variety /
+ * mix-group / per-variety-cap guards, so a mis-scan could land in the wrong
+ * box uncontested. Removed rather than kept as a fallback: no offline queue,
+ * no box-label scan — always go through the OPL flow, which is online-only.
  */
-function deriveOplFromScan(input: string): { opl: string; box_id: string | null } {
-  let cleaned = (input || '').trim();
-  if (!cleaned) return { opl: '', box_id: null };
-  try {
-    const parsed = JSON.parse(cleaned);
-    cleaned = String(parsed.box_id ?? parsed.opl ?? parsed.name ?? cleaned).trim();
-  } catch {
-    // raw string — use as-is
-  }
-  const match = cleaned.match(/^(.+)-B\d+$/);
-  if (match) return { opl: match[1], box_id: cleaned };
-  return { opl: cleaned, box_id: null };
-}
-
-interface ActiveBoxSession {
-  opl: string;
-  customer: string;
-  farm: string;
-  pack_rate: number;
-  active_box: PackBoxSummary;
-  all_boxes: PackBoxSummary[];
-}
 
 interface ActiveOplSession {
   opl: PackableOpl;
@@ -75,23 +47,31 @@ interface ActiveOplSession {
 
 export default function PackingScreen() {
   const { isConnected } = useApp();
+  const compact = useCompact();
+  // Style pair helper — `s(styles.x, c.x)` picks up the compact override.
+  const s = (base: any, small?: any) => (compact && small ? [base, small] : base);
+  const icon = compact ? 14 : 20;
+  // On a wrist screen the scan list is scroll-away noise; keep the tail only.
+  const tail = <T,>(list: T[]) => (compact ? list.slice(0, 3) : list);
 
-  const [mode, setMode] = useState<Mode>('box');
+  // Packing is where a wrong sticker actually surfaces — the packer scans a
+  // bunch for an order and the label does not match — so the repair lives here.
+  const [fixOpen, setFixOpen] = useState(false);
 
-  // Box-label mode (existing flow)
-  const [session, setSession] = useState<ActiveBoxSession | null>(null);
-  const [loadingSession, setLoadingSession] = useState(false);
-  const [bunches, setBunches] = useState<PackingListEntry[]>([]);
-  const [stemsInBox, setStemsInBox] = useState(0);
-  const [closing, setClosing] = useState(false);
-  const [recipe, setRecipe] = useState<MixRecipeItem[] | null>(null);
-  const [isMixBox, setIsMixBox] = useState(false);
-
-  // OPL mode (new direct-to-FPL flow)
   const [oplSession, setOplSession] = useState<ActiveOplSession | null>(null);
   const [oplBunches, setOplBunches] = useState<PackingListEntry[]>([]);
+  // Mix composition is one tap away, not printed on the card by default.
+  const [showMixInfo, setShowMixInfo] = useState(false);
   const [oplScanning, setOplScanning] = useState(false);
   const [boxFullDialog, setBoxFullDialog] = useState(false);
+  // Scanned variety sits on >1 line of the OPL (straight + mix, or two mix
+  // groups) — ask the packer which one instead of guessing.
+  const [choicePrompt, setChoicePrompt] = useState<{
+    visible: boolean;
+    bunchId: string;
+    scannedVariety: string;
+    choices: PackLineChoice[];
+  } | null>(null);
 
   const [confirmation, setConfirmation] = useState<{
     visible: boolean;
@@ -101,205 +81,6 @@ export default function PackingScreen() {
 
   const show = (type: 'success' | 'error', message: string) =>
     setConfirmation({ visible: true, type, message });
-
-  // ── Box-label mode handlers ───────────────────────────────────────────────
-
-  const refreshRecipe = useCallback(async (packBoxName: string) => {
-    try {
-      const r = await getPackBoxRecipe(packBoxName);
-      setIsMixBox(!!r.is_mix_box);
-      setRecipe(r.is_mix_box ? r.recipe : null);
-    } catch {
-      setIsMixBox(false);
-      setRecipe(null);
-    }
-  }, []);
-
-  useEffect(() => {
-    if (session?.active_box) {
-      setStemsInBox(session.active_box.stems_count);
-      refreshRecipe(session.active_box.name);
-    } else {
-      setRecipe(null);
-      setIsMixBox(false);
-    }
-  }, [session?.active_box.name, refreshRecipe]);
-
-  const loadSessionForOpl = useCallback(async (opl: string, preferredBoxId: string | null) => {
-    if (!isConnected) {
-      show('error', 'Go online to start — OPL details must be fetched');
-      onScanError();
-      return;
-    }
-    setLoadingSession(true);
-    try {
-      const resp = await getOpenBoxForOpl(opl);
-      const chosen = preferredBoxId
-        ? resp.boxes.find((b) => b.box_id === preferredBoxId) ?? resp.open_box
-        : resp.open_box;
-
-      if (!chosen) {
-        show('error', `No open boxes for ${opl} — all ${resp.boxes.length} boxes closed`);
-        onScanError();
-        return;
-      }
-
-      await upsertPackingBox(chosen.box_id, resp.farm, {
-        opl: resp.opl,
-        customer: resp.customer,
-        pack_rate: resp.pack_rate,
-        status: chosen.status,
-        box_sequence: chosen.box_sequence,
-        total_boxes: resp.boxes.length,
-      });
-
-      setSession({
-        opl: resp.opl,
-        customer: resp.customer,
-        farm: resp.farm,
-        pack_rate: resp.pack_rate,
-        active_box: chosen,
-        all_boxes: resp.boxes,
-      });
-      setBunches([]);
-      setStemsInBox(chosen.stems_count);
-      onScanSuccess();
-      show('success', `Box ${chosen.box_sequence}/${resp.boxes.length} — ${resp.customer}`);
-    } catch (error: any) {
-      onScanError();
-      show('error', error.message || 'Could not load OPL');
-    } finally {
-      setLoadingSession(false);
-    }
-  }, [isConnected]);
-
-  const handleScanEntry = useCallback(async (data: string) => {
-    const { opl, box_id } = deriveOplFromScan(data);
-    if (!opl) return;
-    await loadSessionForOpl(opl, box_id);
-  }, [loadSessionForOpl]);
-
-  const switchToNextOpenBox = useCallback(async () => {
-    if (!session) return;
-    await loadSessionForOpl(session.opl, null);
-  }, [session, loadSessionForOpl]);
-
-  const handleBunchScanned = useCallback(async (data: string) => {
-    if (!session) return;
-    const bunchId = extractGradingQRValue(data);
-    if (!bunchId) return;
-
-    if (bunches.some((b) => b.bunch_id === bunchId)) {
-      onScanError();
-      show('error', `${bunchId} already scanned`);
-      return;
-    }
-
-    if (!isConnected) {
-      if (stemsInBox >= session.pack_rate) {
-        onScanError();
-        show('error', `Box full — ${stemsInBox}/${session.pack_rate} stems`);
-        return;
-      }
-      await addBunchLocal(session.active_box.box_id, bunchId, { stems: 0 });
-      await addToSyncQueue('add_bunch_to_box', {
-        bunch_id: bunchId,
-        box_id: session.active_box.box_id,
-        opl: session.opl,
-        farm: session.farm,
-      });
-      setBunches((prev) => [{
-        bunch_id: bunchId,
-        time: new Date().toLocaleTimeString(),
-        status: 'queued',
-        message: 'Queued',
-      }, ...prev]);
-      onScanSuccess();
-      show('success', `${bunchId} queued`);
-      return;
-    }
-
-    try {
-      const resp = await addBunchToBoxApi({
-        bunch_id: bunchId,
-        box_id: session.active_box.box_id,
-        opl: session.opl,
-        farm: session.farm,
-      });
-
-      await addBunchLocal(resp.box_id, bunchId, { stems: resp.stems });
-      setStemsInBox(resp.stems_count);
-      setBunches((prev) => [{
-        bunch_id: bunchId,
-        time: new Date().toLocaleTimeString(),
-        status: 'success',
-        stems: resp.stems,
-        message: `${resp.stems} stems`,
-      }, ...prev]);
-
-      if (isMixBox && session.active_box.name) {
-        refreshRecipe(session.active_box.name);
-      }
-
-      onScanSuccess();
-      if (resp.full) {
-        show('success', `Box full — ${resp.stems_count}/${resp.pack_rate}. Close it to continue.`);
-      } else {
-        show('success', `+${resp.stems} → ${resp.stems_count}/${resp.pack_rate}`);
-      }
-    } catch (error: any) {
-      onScanError();
-      show('error', error.message || 'Could not add bunch');
-    }
-  }, [session, bunches, isConnected, stemsInBox, isMixBox, refreshRecipe]);
-
-  const handleCloseBox = useCallback(async () => {
-    if (!session) return;
-    Alert.alert(
-      'Close Box',
-      `Close box ${session.active_box.box_sequence}/${session.all_boxes.length} with ${stemsInBox}/${session.pack_rate} stems?`,
-      [
-        { text: 'Cancel', style: 'cancel' },
-        {
-          text: 'Close',
-          onPress: async () => {
-            setClosing(true);
-            try {
-              if (isConnected) {
-                await closePackBox(session.active_box.name);
-              } else {
-                await addToSyncQueue('close_pack_box', { box_name: session.active_box.name });
-              }
-              await markBoxClosed(session.active_box.box_id);
-              show('success', `Box ${session.active_box.box_sequence} closed`);
-
-              const remaining = session.all_boxes.filter(
-                (b) => b.name !== session.active_box.name && b.status === 'Open'
-              );
-              if (remaining.length > 0 && isConnected) {
-                await loadSessionForOpl(session.opl, null);
-              } else {
-                setSession(null);
-                setBunches([]);
-                setStemsInBox(0);
-              }
-            } catch (error: any) {
-              show('error', error.message || 'Could not close box');
-            } finally {
-              setClosing(false);
-            }
-          },
-        },
-      ]
-    );
-  }, [session, stemsInBox, isConnected, loadSessionForOpl]);
-
-  const resetSession = () => {
-    Alert.alert('Reset', 'Return to the OPL scan screen?', [
-      { text: 'Cancel', style: 'cancel' },
-      { text: 'Reset', style: 'destructive', onPress: () => { setSession(null); setBunches([]); setStemsInBox(0); } },
-    ]);
-  };
 
   // ── OPL mode handlers ─────────────────────────────────────────────────────
 
@@ -314,6 +95,7 @@ export default function PackingScreen() {
       recipe: null,
     });
     setOplBunches([]);
+    setShowMixInfo(false);
     show('success', `${opl.customer_name} — ready to scan`);
   }, []);
 
@@ -327,6 +109,7 @@ export default function PackingScreen() {
           setOplSession(null);
           setOplBunches([]);
           setBoxFullDialog(false);
+          setShowMixInfo(false);
         },
       },
     ]);
@@ -345,11 +128,58 @@ export default function PackingScreen() {
     }
   }, []);
 
+  // Shared by a plain scan and a scan resolved through the "choose which
+  // one" prompt — same box-state update either way.
+  const applyPackResult = useCallback((bunchId: string, resp: PackBunchToOplResponse) => {
+    const previousBoxId = oplSession?.current_box_id ?? null;
+    const switchedBox = !!previousBoxId && previousBoxId !== resp.box_id;
+
+    setOplSession((prev) => prev ? {
+      ...prev,
+      current_box_id: resp.box_id,
+      current_box_sequence: resp.box_sequence,
+      pack_box_name: resp.pack_box_name,
+      stems_in_box: resp.stems_count,
+      // If we switched boxes, clear the local bunch list — it only tracked
+      // the previous box's session and would otherwise look wrong.
+    } : prev);
+
+    if (switchedBox) {
+      setOplBunches([]);
+    }
+
+    setOplBunches((prev) => [{
+      bunch_id: bunchId,
+      time: new Date().toLocaleTimeString(),
+      status: 'success',
+      stems: resp.bunch.stems,
+      variety: resp.bunch.variety,
+      message: `${resp.bunch.stems} stems · Box ${resp.box_sequence}`,
+    }, ...prev]);
+
+    if (oplSession?.opl.is_mix && resp.pack_box_name) {
+      refreshOplRecipe(resp.pack_box_name);
+    }
+
+    onScanSuccess();
+    if (switchedBox) {
+      show(
+        'success',
+        `New variety detected — opened Box ${resp.box_sequence} for ${resp.bunch.variety}.`
+      );
+    } else if (resp.full) {
+      setBoxFullDialog(true);
+      show('success', `Box ${resp.box_sequence} full — ${resp.stems_count}/${resp.pack_rate}`);
+    } else {
+      show('success', `+${resp.bunch.stems} → ${resp.stems_count}/${resp.pack_rate}`);
+    }
+  }, [oplSession, refreshOplRecipe]);
+
   const handleOplBunchScanned = useCallback(async (data: string) => {
-    if (!oplSession || boxFullDialog) return;
+    if (!oplSession || boxFullDialog || choicePrompt?.visible) return;
     if (!isConnected) {
       onScanError();
-      show('error', 'Pack-by-OPL requires online — switch to Scan Box Label to queue offline');
+      show('error', 'Pack by OPL requires online — no offline queue for packing');
       return;
     }
     const bunchId = extractGradingQRValue(data);
@@ -367,55 +197,44 @@ export default function PackingScreen() {
         bunch_id: bunchId,
       });
 
-      const previousBoxId = oplSession.current_box_id;
-      const switchedBox = !!previousBoxId && previousBoxId !== resp.box_id;
-
-      setOplSession((prev) => prev ? {
-        ...prev,
-        current_box_id: resp.box_id,
-        current_box_sequence: resp.box_sequence,
-        pack_box_name: resp.pack_box_name,
-        stems_in_box: resp.stems_count,
-        // If we switched boxes, clear the local bunch list — it only tracked
-        // the previous box's session and would otherwise look wrong.
-      } : prev);
-
-      if (switchedBox) {
-        setOplBunches([]);
+      if (resp.needs_choice) {
+        setChoicePrompt({
+          visible: true,
+          bunchId,
+          scannedVariety: resp.scanned_variety || '',
+          choices: resp.choices || [],
+        });
+        return;
       }
 
-      setOplBunches((prev) => [{
-        bunch_id: bunchId,
-        time: new Date().toLocaleTimeString(),
-        status: 'success',
-        stems: resp.bunch.stems,
-        variety: resp.bunch.variety,
-        message: `${resp.bunch.stems} stems · Box ${resp.box_sequence}`,
-      }, ...prev]);
-
-      if (oplSession.opl.is_mix && resp.pack_box_name) {
-        refreshOplRecipe(resp.pack_box_name);
-      }
-
-      onScanSuccess();
-      if (switchedBox) {
-        show(
-          'success',
-          `New variety detected — opened Box ${resp.box_sequence} for ${resp.bunch.variety}.`
-        );
-      } else if (resp.full) {
-        setBoxFullDialog(true);
-        show('success', `Box ${resp.box_sequence} full — ${resp.stems_count}/${resp.pack_rate}`);
-      } else {
-        show('success', `+${resp.bunch.stems} → ${resp.stems_count}/${resp.pack_rate}`);
-      }
+      applyPackResult(bunchId, resp);
     } catch (error: any) {
       onScanError();
       show('error', error.message || 'Could not add bunch');
     } finally {
       setOplScanning(false);
     }
-  }, [oplSession, oplBunches, isConnected, boxFullDialog, refreshOplRecipe]);
+  }, [oplSession, oplBunches, isConnected, boxFullDialog, choicePrompt, applyPackResult]);
+
+  const handleChoiceSelected = useCallback(async (choice: PackLineChoice) => {
+    const prompt = choicePrompt;
+    if (!prompt || !oplSession) return;
+    setChoicePrompt(null);
+    setOplScanning(true);
+    try {
+      const resp = await packBunchToOpl({
+        opl: oplSession.opl.opl,
+        bunch_id: prompt.bunchId,
+        choice: choice.key,
+      });
+      applyPackResult(prompt.bunchId, resp);
+    } catch (error: any) {
+      onScanError();
+      show('error', error.message || 'Could not add bunch');
+    } finally {
+      setOplScanning(false);
+    }
+  }, [choicePrompt, oplSession, applyPackResult]);
 
   // Manual close — operator can wrap a box at any point (not just at packrate)
   const handleManualCloseOplBox = useCallback(async () => {
@@ -464,12 +283,89 @@ export default function PackingScreen() {
 
   // ── Render helpers ─────────────────────────────────────────────────────────
 
-  const capPct = session ? Math.min(100, Math.round((stemsInBox / session.pack_rate) * 100)) : 0;
-  const atCap = session ? stemsInBox >= session.pack_rate : false;
-
   const oplCapPct = oplSession
     ? Math.min(100, Math.round((oplSession.stems_in_box / oplSession.opl.pack_rate) * 100))
     : 0;
+
+  /**
+   * One pill per variety, answering "what's packed, what's left, what am I on".
+   *
+   * A mix box carries real per-variety targets from the recipe, so its pills
+   * show packed/target and tick over when a variety is complete. A plain box
+   * holds a single variety, so the OPL's variety list is shown instead with
+   * the one currently in the box marked active — that is the only per-variety
+   * fact available client-side without another round-trip.
+   */
+  const varietyPills = useMemo(() => {
+    if (!oplSession) return [];
+
+    const recipe = oplSession.recipe;
+    if (recipe && recipe.length > 0) {
+      return recipe.map((r) => {
+        const target = r.target_stems || 0;
+        const packed = r.packed_stems || 0;
+        return {
+          name: r.item_name || r.item_code,
+          packed,
+          target,
+          pct: target > 0 ? Math.min(100, Math.round((packed / target) * 100)) : 0,
+          done: !!r.done,
+          active: !r.done && packed > 0,
+        };
+      });
+    }
+
+    // The Packing tab: what the customer bought, with a stem target per
+    // variety. On a downgrade this is the 50cm line, not the 60cm bunch the
+    // picker carried — measuring packing against the issuing rows would ask
+    // the packer to fill a length the order never had.
+    const lines = oplSession.opl.pack_lines;
+    if (lines && lines.length > 0) {
+      // What the server already counted across every box, plus what has been
+      // scanned since this OPL was opened. The two never overlap: picking an
+      // OPL clears the session list, and the server figure is from that same
+      // moment.
+      const packedBy: Record<string, number> = {};
+      oplBunches.forEach((b) => {
+        if (!b.variety) return;
+        packedBy[b.variety] = (packedBy[b.variety] || 0) + (b.stems || 0);
+      });
+      return lines.map((l) => {
+        const target = l.target_stems || 0;
+        // A scan carries the bunch's physical code, so a line is also filled
+        // by whatever was downgraded into it.
+        const sources = l.counts_as && l.counts_as.length ? l.counts_as : [l.item_code];
+        const thisSession = sources.reduce((n, code) => n + (packedBy[code] || 0), 0);
+        const packed = (l.packed_stems || 0) + thisSession;
+        return {
+          name: l.item_name || l.item_code,
+          packed,
+          target,
+          pct: target > 0 ? Math.min(100, Math.round((packed / target) * 100)) : 0,
+          done: target > 0 && packed >= target,
+          active: packed > 0 && !(target > 0 && packed >= target),
+        };
+      });
+    }
+
+    const list = (oplSession.opl.varieties || '')
+      .split(',')
+      .map((v) => v.trim())
+      .filter(Boolean);
+    if (list.length === 0) return [];
+
+    // Whatever went into the current box tells us which variety is in hand.
+    const current = oplBunches.find((b) => b.variety)?.variety || '';
+    const norm = (v: string) => v.toLowerCase().replace(/[\s-]+/g, '');
+    return list.map((name) => ({
+      name,
+      packed: 0,
+      target: 0,
+      pct: 0,
+      done: false,
+      active: !!current && norm(current).startsWith(norm(name).slice(0, 6)),
+    }));
+  }, [oplSession, oplBunches]);
 
   // ── Render ───────────────────────────────────────────────────────────────
   return (
@@ -477,258 +373,137 @@ export default function PackingScreen() {
 
       <ScrollView
         style={styles.scroll}
-        contentContainerStyle={styles.scrollContent}
+        contentContainerStyle={s(styles.scrollContent, c.scrollContent)}
         keyboardShouldPersistTaps="handled"
+        // Dragging means the operator wants to read something further up; the
+        // scan field must stop pulling the view back to itself while they do.
+        onScrollBeginDrag={() => pauseScanFocus()}
+        onMomentumScrollBegin={() => pauseScanFocus()}
+        scrollEventThrottle={16}
       >
 
-        {/* Mode toggle — only shown when no active session in either mode */}
-        {!session && !oplSession && (
-          <View style={styles.modeToggle}>
-            <TouchableOpacity
-              style={[styles.modeOption, mode === 'box' && styles.modeOptionActive]}
-              onPress={() => setMode('box')}
-              activeOpacity={0.7}
-            >
-              <Ionicons
-                name="qr-code-outline"
-                size={14}
-                color={mode === 'box' ? colors.textOnPrimary : colors.textMuted}
-              />
-              <Text style={[
-                styles.modeOptionText,
-                mode === 'box' && styles.modeOptionTextActive,
-              ]}>Scan Box Label</Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={[styles.modeOption, mode === 'opl' && styles.modeOptionActive]}
-              onPress={() => setMode('opl')}
-              activeOpacity={0.7}
-            >
-              <Ionicons
-                name="list-outline"
-                size={14}
-                color={mode === 'opl' ? colors.textOnPrimary : colors.textMuted}
-              />
-              <Text style={[
-                styles.modeOptionText,
-                mode === 'opl' && styles.modeOptionTextActive,
-              ]}>Pack by OPL</Text>
-            </TouchableOpacity>
-          </View>
-        )}
+        <TouchableOpacity
+          style={s(styles.fixEntry, c.fixEntry)}
+          onPress={() => setFixOpen(true)}
+          activeOpacity={0.8}
+        >
+          <Ionicons name="construct-outline" size={compact ? 12 : 14} color={colors.text} />
+          <Text style={s(styles.fixEntryText, c.fixEntryText)} numberOfLines={1}>
+            {compact ? 'Fix sticker' : "Fix a wrong sticker"}
+          </Text>
+          <Ionicons name="chevron-forward" size={compact ? 12 : 14} color={colors.textMuted} />
+        </TouchableOpacity>
 
-        {/* ─── Box-label mode ──────────────────────────────────────── */}
-        {mode === 'box' && (!session ? (
-          <View style={styles.section}>
-            <View style={styles.sectionHeader}>
-              <Ionicons name="qr-code-outline" size={20} color={colors.text} />
-              <Text style={styles.sectionTitle}>Start Packing</Text>
+        {!oplSession ? (
+          <View style={s(styles.oplPickerWrap, c.oplPickerWrap)}>
+            <View style={s(styles.sectionHeader, c.sectionHeader)}>
+              <Ionicons name="list-outline" size={icon} color={colors.text} />
+              <Text style={s(styles.sectionTitle, c.sectionTitle)}>Pick an OPL</Text>
             </View>
-            <Text style={styles.sectionHint}>
-              Scan an <Text style={styles.bold}>OPL</Text> to pack into the next open box,
-              or scan a <Text style={styles.bold}>box label</Text> to open that specific box.
-            </Text>
-            <ScanInput
-              placeholder="OPL number or box ID"
-              scannerTitle="Scan OPL / Box Label"
-              onScan={handleScanEntry}
-              disabled={loadingSession}
-              keepFocused
-            />
-            {loadingSession && (
-              <View style={styles.loading}>
-                <ActivityIndicator size="small" color={colors.textMuted} />
-                <Text style={styles.loadingText}>Loading OPL…</Text>
-              </View>
-            )}
-          </View>
-        ) : (
-          <>
-            <View style={styles.sessionCard}>
-              <View style={styles.sessionHeaderRow}>
-                <View style={{ flex: 1 }}>
-                  <Text style={styles.sessionCustomer} numberOfLines={1}>{session.customer}</Text>
-                  <Text style={styles.sessionOpl}>{session.opl}</Text>
-                </View>
-                <TouchableOpacity onPress={resetSession} style={styles.resetBtn}>
-                  <Ionicons name="close-outline" size={18} color={colors.textMuted} />
-                </TouchableOpacity>
-              </View>
-
-              <View style={styles.boxSequenceRow}>
-                <Ionicons name="cube" size={16} color={colors.primary} />
-                <Text style={styles.boxSequenceText}>
-                  Box {session.active_box.box_sequence} of {session.all_boxes.length}
-                </Text>
-                {session.all_boxes.length > 1 && (
-                  <TouchableOpacity onPress={switchToNextOpenBox} style={styles.switchBtn}>
-                    <Text style={styles.switchBtnText}>Next open</Text>
-                    <Ionicons name="chevron-forward" size={12} color={colors.primary} />
-                  </TouchableOpacity>
-                )}
-              </View>
-
-              <View style={styles.progressCard}>
-                <View style={styles.progressRow}>
-                  <Text style={styles.progressLabel}>Stems</Text>
-                  <Text style={[styles.progressValue, atCap && styles.progressValueFull]}>
-                    {stemsInBox} / {session.pack_rate}
-                  </Text>
-                </View>
-                <View style={styles.progressBarWrap}>
-                  <View
-                    style={[
-                      styles.progressBarFill,
-                      { width: `${capPct}%` },
-                      atCap && styles.progressBarFillFull,
-                    ]}
-                  />
-                </View>
-              </View>
-            </View>
-
-            {isMixBox && recipe && recipe.length > 0 && (
-              <View style={styles.section}>
-                <View style={styles.sectionHeader}>
-                  <Ionicons name="list-outline" size={20} color={colors.text} />
-                  <Text style={styles.sectionTitle}>Mix Recipe</Text>
-                </View>
-                {recipe.map((r) => (
-                  <View key={r.item_code} style={styles.recipeRow}>
-                    <Ionicons
-                      name={r.done ? 'checkmark-circle' : 'ellipse-outline'}
-                      size={18}
-                      color={r.done ? colors.success || '#10b981' : colors.textMuted}
-                    />
-                    <Text style={styles.recipeName} numberOfLines={1}>
-                      {r.item_name}
-                    </Text>
-                    <Text style={[styles.recipeCount, r.done && styles.recipeCountDone]}>
-                      {r.packed_stems}/{r.target_stems}
-                    </Text>
-                  </View>
-                ))}
-              </View>
-            )}
-
-            <View style={styles.section}>
-              <View style={styles.sectionHeader}>
-                <Ionicons name="leaf-outline" size={20} color={colors.text} />
-                <Text style={styles.sectionTitle}>Scan Bunch</Text>
-                <View style={styles.countBadge}>
-                  <Text style={styles.countBadgeText}>{bunches.length}</Text>
-                </View>
-              </View>
-              <ScanInput
-                placeholder="Bunch ID"
-                scannerTitle="Scan Bunch QR Code"
-                onScan={handleBunchScanned}
-                disabled={closing || atCap}
-                keepFocused
-              />
-              {atCap && (
-                <View style={styles.capWarning}>
-                  <Ionicons name="warning-outline" size={14} color="#92400E" />
-                  <Text style={styles.capWarningText}>
-                    Pack rate reached — close this box to start the next.
-                  </Text>
-                </View>
-              )}
-            </View>
-
-            {bunches.length > 0 && (
-              <View style={styles.listSection}>
-                <Text style={styles.listHeader}>Scanned this session</Text>
-                {bunches.map((item) => (
-                  <View key={item.bunch_id} style={styles.listItem}>
-                    <View style={[
-                      styles.statusDot,
-                      item.status === 'success' ? styles.dotOk
-                        : item.status === 'error' ? styles.dotErr : styles.dotQ,
-                    ]} />
-                    <Text style={styles.listItemId} numberOfLines={1}>{item.bunch_id}</Text>
-                    {typeof item.stems === 'number' && item.stems > 0 && (
-                      <Text style={styles.listItemStems}>{item.stems} st</Text>
-                    )}
-                    <Text style={styles.listItemTime}>{item.time}</Text>
-                  </View>
-                ))}
-              </View>
-            )}
-
-            <TouchableOpacity
-              style={[styles.closeBoxBtn, (closing || stemsInBox === 0) && styles.closeBoxBtnDisabled]}
-              onPress={handleCloseBox}
-              disabled={closing || stemsInBox === 0}
-              activeOpacity={0.8}
-            >
-              <Ionicons name="checkmark-circle-outline" size={20} color={colors.textOnPrimary} />
-              <Text style={styles.closeBoxBtnText}>
-                {closing ? 'Closing…' : `Close Box (${stemsInBox} stems)`}
-              </Text>
-            </TouchableOpacity>
-          </>
-        ))}
-
-        {/* ─── OPL mode ────────────────────────────────────────────── */}
-        {mode === 'opl' && (!oplSession ? (
-          <View style={styles.oplPickerWrap}>
-            <View style={styles.sectionHeader}>
-              <Ionicons name="list-outline" size={20} color={colors.text} />
-              <Text style={styles.sectionTitle}>Pick an OPL</Text>
-            </View>
-            <Text style={styles.sectionHint}>
-              Choose by <Text style={styles.bold}>customer</Text>. The first scanned bunch
-              opens a new box automatically — no need to print labels first.
-            </Text>
-            <View style={styles.pickerHost}>
+            <View style={s(styles.pickerHost, c.pickerHost)}>
               <OplPicker onSelect={handleOplPicked} />
             </View>
           </View>
         ) : (
           <>
-            <View style={styles.sessionCard}>
-              <View style={styles.sessionHeaderRow}>
+            <View style={s(styles.sessionCard, c.sessionCard)}>
+              <View style={s(styles.sessionHeaderRow, c.sessionHeaderRow)}>
                 <View style={{ flex: 1 }}>
                   <View style={styles.oplHeaderTitleRow}>
-                    <Text style={styles.sessionCustomer} numberOfLines={1}>
+                    <Text style={s(styles.sessionCustomer, c.sessionCustomer)} numberOfLines={1}>
                       {oplSession.opl.customer_name || oplSession.opl.customer || '—'}
                     </Text>
                     {oplSession.opl.is_mix && (
-                      <View style={styles.mixPillSmall}>
-                        <Text style={styles.mixPillSmallText}>MIX</Text>
-                      </View>
+                      <TouchableOpacity
+                        onPress={() => setShowMixInfo((v) => !v)}
+                        hitSlop={8}
+                        style={styles.mixIconBtn}
+                      >
+                        <Ionicons
+                          name="git-merge-outline"
+                          size={16}
+                          color={showMixInfo ? colors.primary : colors.textSecondary}
+                        />
+                      </TouchableOpacity>
                     )}
                   </View>
-                  <Text style={styles.sessionOpl}>{oplSession.opl.opl}</Text>
-                  {oplSession.opl.varieties ? (
-                    <Text style={styles.sessionVarieties} numberOfLines={2}>
-                      {oplSession.opl.varieties}
+                  {!compact && (
+                    <Text style={styles.sessionOpl} numberOfLines={1}>
+                      {oplSession.opl.opl}
+                      {/* Same customer, two orders — line code / drop-off point
+                          are what actually tell them apart while packing. */}
+                      {[oplSession.opl.line_code, oplSession.opl.delivery_point].filter(Boolean).length > 0
+                        ? '  ·  ' + [oplSession.opl.line_code, oplSession.opl.delivery_point].filter(Boolean).join(' · ')
+                        : ''}
                     </Text>
-                  ) : null}
+                  )}
                 </View>
                 <TouchableOpacity onPress={resetOplSession} style={styles.resetBtn}>
                   <Ionicons name="close-outline" size={18} color={colors.textMuted} />
                 </TouchableOpacity>
               </View>
 
-              <View style={styles.boxSequenceRow}>
-                <Ionicons name="cube" size={16} color={colors.primary} />
-                <Text style={styles.boxSequenceText}>
-                  {oplSession.current_box_id
-                    ? `Box ${oplSession.current_box_sequence}`
-                    : 'Next scan opens a new box'}
+              {/* Single-variety orders: a quiet caption, always visible. Mix
+                  orders: the same info sits behind the icon above instead —
+                  tapping it reveals per-variety progress below. */}
+              {oplSession.opl.varieties && !compact && !oplSession.opl.is_mix ? (
+                <Text style={styles.sessionVarieties} numberOfLines={3}>
+                  {oplSession.opl.varieties}
+                </Text>
+              ) : null}
+
+              {/* Per-variety progress, as plain rows — no pill chrome. A real
+                  mix box knows its recipe counts; anything else can at least
+                  say which variety this box is on. */}
+              {varietyPills.length > 0 && (!oplSession.opl.is_mix || showMixInfo) && (
+                <View style={s(styles.varietyList, c.varietyList)}>
+                  {varietyPills.map((p) => (
+                    <View key={p.name} style={s(styles.varietyRow, c.varietyRow)}>
+                      <Ionicons
+                        name={p.done ? 'checkmark-circle' : p.active ? 'ellipse' : 'ellipse-outline'}
+                        size={compact ? 12 : 14}
+                        color={p.done ? colors.success : p.active ? colors.primary : colors.textMuted}
+                      />
+                      <Text style={s(styles.varietyName, c.varietyName)} numberOfLines={1}>{p.name}</Text>
+                      {p.target > 0 && (
+                        <View style={styles.varietyBarWrap}>
+                          <View style={[styles.varietyBarFill, { width: `${p.pct}%` }]} />
+                        </View>
+                      )}
+                      {p.target > 0 ? (
+                        <Text style={styles.varietyCount}>{p.done ? '100%' : `${p.packed}/${p.target}`}</Text>
+                      ) : p.active ? (
+                        <Text style={styles.varietyCount}>current</Text>
+                      ) : null}
+                    </View>
+                  ))}
+                </View>
+              )}
+
+              <View style={s(styles.boxSequenceRow, c.boxSequenceRow)}>
+                <Ionicons name="cube" size={14} color={colors.primary} />
+                <Text style={s(styles.boxSequenceText, c.boxSequenceText)} numberOfLines={1}>
+                  {compact
+                    ? `${oplSession.opl.opl} · ${oplSession.current_box_id ? `Box ${oplSession.current_box_sequence}` : 'new box'}`
+                    : oplSession.current_box_id
+                      ? `Box ${oplSession.current_box_sequence}`
+                      : 'Next scan opens a new box'}
                 </Text>
               </View>
 
-              <View style={styles.progressCard}>
+              <View style={s(styles.progressCard, c.progressCard)}>
                 <View style={styles.progressRow}>
-                  <Text style={styles.progressLabel}>Stems</Text>
-                  <Text style={[
-                    styles.progressValue,
-                    boxFullDialog && styles.progressValueFull,
-                  ]}>
-                    {oplSession.stems_in_box} / {oplSession.opl.pack_rate}
+                  <View style={styles.progressCount}>
+                    <Text style={[
+                      s(styles.progressBig, c.progressBig),
+                      boxFullDialog && styles.progressValueFull,
+                    ]}>
+                      {oplSession.stems_in_box}
+                    </Text>
+                    <Text style={styles.progressOf}>/ {oplSession.opl.pack_rate} stems</Text>
+                  </View>
+                  <Text style={[styles.progressPct, boxFullDialog && styles.progressValueFull]}>
+                    {oplCapPct}%
                   </Text>
                 </View>
                 <View style={styles.progressBarWrap}>
@@ -743,34 +518,14 @@ export default function PackingScreen() {
               </View>
             </View>
 
-            {oplSession.is_mix_box && oplSession.recipe && oplSession.recipe.length > 0 && (
-              <View style={styles.section}>
-                <View style={styles.sectionHeader}>
-                  <Ionicons name="list-outline" size={20} color={colors.text} />
-                  <Text style={styles.sectionTitle}>Mix Recipe</Text>
-                </View>
-                {oplSession.recipe.map((r) => (
-                  <View key={r.item_code} style={styles.recipeRow}>
-                    <Ionicons
-                      name={r.done ? 'checkmark-circle' : 'ellipse-outline'}
-                      size={18}
-                      color={r.done ? colors.success || '#10b981' : colors.textMuted}
-                    />
-                    <Text style={styles.recipeName} numberOfLines={1}>
-                      {r.item_name}
-                    </Text>
-                    <Text style={[styles.recipeCount, r.done && styles.recipeCountDone]}>
-                      {r.packed_stems}/{r.target_stems}
-                    </Text>
-                  </View>
-                ))}
-              </View>
-            )}
+            {/* Mix recipe counts now live in the variety pills above. */}
 
-            <View style={styles.section}>
-              <View style={styles.sectionHeader}>
-                <Ionicons name="leaf-outline" size={20} color={colors.text} />
-                <Text style={styles.sectionTitle}>Scan Bunch</Text>
+            <View style={s(styles.section, c.section)}>
+              {/* Compact: the input placeholder already reads "Bunch ID" and
+                  the stem counter is one row up — this header is pure cost. */}
+              <View style={[s(styles.sectionHeader, c.sectionHeader), compact && styles.hidden]}>
+                <Ionicons name="leaf-outline" size={icon} color={colors.text} />
+                <Text style={s(styles.sectionTitle, c.sectionTitle)}>Scan Bunch</Text>
                 <View style={styles.countBadge}>
                   <Text style={styles.countBadgeText}>{oplBunches.length}</Text>
                 </View>
@@ -788,16 +543,16 @@ export default function PackingScreen() {
                   Hidden while the auto-close dialog is up (it has its own CTA). */}
               {oplSession.pack_box_name && !boxFullDialog && (
                 <TouchableOpacity
-                  style={styles.closeBoxInlineBtn}
+                  style={s(styles.closeBoxInlineBtn, c.closeBoxInlineBtn)}
                   onPress={handleManualCloseOplBox}
                   activeOpacity={0.8}
                   disabled={oplScanning}
                 >
                   <Ionicons name="checkmark-done" size={16} color={colors.text} />
-                  <Text style={styles.closeBoxInlineText}>
-                    Close Box {oplSession.current_box_sequence}
+                  <Text style={styles.closeBoxInlineText} numberOfLines={1}>
+                    {compact ? 'Close' : 'Close Box'} {oplSession.current_box_sequence}
                     {oplSession.stems_in_box > 0
-                      ? ` (${oplSession.stems_in_box} stems)`
+                      ? compact ? ` (${oplSession.stems_in_box})` : ` (${oplSession.stems_in_box} stems)`
                       : ''}
                   </Text>
                 </TouchableOpacity>
@@ -805,32 +560,32 @@ export default function PackingScreen() {
             </View>
 
             {boxFullDialog && (
-              <View style={styles.boxFullCard}>
+              <View style={s(styles.boxFullCard, c.boxFullCard)}>
                 <View style={styles.boxFullHeader}>
-                  <Ionicons name="checkmark-circle" size={20} color={colors.success} />
-                  <Text style={styles.boxFullTitle}>
+                  <Ionicons name="checkmark-circle" size={compact ? 16 : 20} color={colors.success} />
+                  <Text style={s(styles.boxFullTitle, c.boxFullTitle)}>
                     Box {oplSession.current_box_sequence} full
                   </Text>
                 </View>
                 <Text style={styles.boxFullBody}>
-                  {oplSession.stems_in_box}/{oplSession.opl.pack_rate} stems. Closed and synced to FPL.
+                  {oplSession.stems_in_box}/{oplSession.opl.pack_rate} stems.{compact ? '' : ' Closed and synced to FPL.'}
                 </Text>
                 <TouchableOpacity
-                  style={styles.boxFullBtn}
+                  style={s(styles.boxFullBtn, c.boxFullBtn)}
                   onPress={handleStartNextBox}
                   activeOpacity={0.8}
                 >
-                  <Ionicons name="add-circle-outline" size={18} color={colors.textOnPrimary} />
-                  <Text style={styles.boxFullBtnText}>Start Next Box</Text>
+                  <Ionicons name="add-circle-outline" size={compact ? 14 : 18} color={colors.textOnPrimary} />
+                  <Text style={styles.boxFullBtnText}>{compact ? 'Next Box' : 'Start Next Box'}</Text>
                 </TouchableOpacity>
               </View>
             )}
 
             {oplBunches.length > 0 && (
-              <View style={styles.listSection}>
-                <Text style={styles.listHeader}>Scanned this box</Text>
-                {oplBunches.map((item) => (
-                  <View key={item.bunch_id} style={styles.listItem}>
+              <View style={s(styles.listSection, c.listSection)}>
+                {!compact && <Text style={styles.listHeader}>Scanned this box</Text>}
+                {tail(oplBunches).map((item) => (
+                  <View key={item.bunch_id} style={s(styles.listItem, c.listItem)}>
                     <View style={[
                       styles.statusDot,
                       item.status === 'success' ? styles.dotOk
@@ -846,9 +601,54 @@ export default function PackingScreen() {
               </View>
             )}
           </>
-        ))}
+        )}
 
       </ScrollView>
+
+      <FixStickerSheet visible={fixOpen} onClose={() => setFixOpen(false)} />
+
+      <Modal
+        visible={!!choicePrompt?.visible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setChoicePrompt(null)}
+      >
+        <View style={styles.choiceBackdrop}>
+          <View style={styles.choiceCard}>
+            <Ionicons name="help-circle" size={32} color={colors.warning} />
+            <Text style={styles.choiceTitle}>
+              {choicePrompt?.scannedVariety || 'This variety'} is on more than one line
+            </Text>
+            <Text style={styles.choiceHint}>Choose which one this bunch belongs to.</Text>
+            {(choicePrompt?.choices || []).map((c) => (
+              <TouchableOpacity
+                key={c.key}
+                style={styles.choiceOption}
+                onPress={() => handleChoiceSelected(c)}
+                activeOpacity={0.8}
+              >
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.choiceOptionTitle}>
+                    {c.mix_group ? `Mix: ${c.mix_group}` : 'Straight line'}
+                  </Text>
+                  <Text style={styles.choiceOptionSub}>
+                    {[c.line_code, c.delivery_point].filter(Boolean).join(' · ') || c.item_code}
+                    {typeof c.total_stems === 'number' ? ` · ${c.total_stems} stems` : ''}
+                  </Text>
+                </View>
+                <Ionicons name="chevron-forward" size={18} color={colors.textMuted} />
+              </TouchableOpacity>
+            ))}
+            <TouchableOpacity
+              style={styles.choiceCancel}
+              onPress={() => setChoicePrompt(null)}
+              activeOpacity={0.8}
+            >
+              <Text style={styles.choiceCancelText}>Cancel</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
 
       <ScanConfirmation
         visible={confirmation.visible}
@@ -862,48 +662,20 @@ export default function PackingScreen() {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: colors.background },
+  hidden: { display: 'none' },
+  fixEntry: {
+    flexDirection: 'row', alignItems: 'center', gap: spacing.sm,
+    paddingHorizontal: spacing.md, paddingVertical: spacing.sm,
+    backgroundColor: colors.surface, borderWidth: 1, borderColor: colors.border,
+    borderRadius: borderRadius.md, marginBottom: spacing.md,
+  },
+  fixEntryText: { flex: 1, fontFamily: fontFamily.medium, fontSize: fontSize.sm, color: colors.text },
   scroll: { flex: 1 },
   scrollContent: { padding: spacing.lg, paddingBottom: spacing.xxl },
-
-  // Mode toggle (segmented control)
-  modeToggle: {
-    flexDirection: 'row',
-    backgroundColor: colors.surfaceAlt,
-    borderRadius: borderRadius.full,
-    padding: 3,
-    marginBottom: spacing.lg,
-  },
-  modeOption: {
-    flex: 1,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: spacing.xs,
-    paddingVertical: spacing.sm,
-    paddingHorizontal: spacing.md,
-    borderRadius: borderRadius.full,
-  },
-  modeOptionActive: {
-    backgroundColor: colors.primary,
-  },
-  modeOptionText: {
-    fontFamily: fontFamily.semiBold,
-    fontSize: fontSize.xs,
-    color: colors.textMuted,
-    letterSpacing: 0.2,
-  },
-  modeOptionTextActive: {
-    color: colors.textOnPrimary,
-  },
 
   section: { marginBottom: spacing.lg },
   sectionHeader: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm, marginBottom: spacing.sm },
   sectionTitle: { fontFamily: fontFamily.semiBold, fontSize: fontSize.md, color: colors.text, flex: 1 },
-  sectionHint: { fontFamily: fontFamily.regular, fontSize: fontSize.sm, color: colors.textMuted, marginBottom: spacing.md },
-  bold: { fontFamily: fontFamily.semiBold, color: colors.text },
-
-  loading: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm, marginTop: spacing.sm },
-  loadingText: { fontFamily: fontFamily.regular, fontSize: fontSize.xs, color: colors.textMuted },
 
   countBadge: {
     backgroundColor: colors.primary,
@@ -925,32 +697,65 @@ const styles = StyleSheet.create({
     marginBottom: spacing.lg,
   },
   sessionHeaderRow: { flexDirection: 'row', alignItems: 'center', marginBottom: spacing.sm },
-  sessionCustomer: { fontFamily: fontFamily.bold, fontSize: fontSize.lg, color: colors.text },
+  // flexShrink so a long customer name actually truncates against
+  // numberOfLines={1} instead of overflowing past its row and rendering on
+  // top of the mix icon / reset (✕) button next to it.
+  sessionCustomer: { fontFamily: fontFamily.bold, fontSize: fontSize.lg, color: colors.text, flexShrink: 1 },
   sessionOpl: { fontFamily: fontFamily.regular, fontSize: fontSize.xs, color: colors.textMuted, marginTop: 2 },
   sessionVarieties: { fontFamily: fontFamily.regular, fontSize: 11, color: colors.textMuted, marginTop: 3, fontStyle: 'italic' },
   resetBtn: { padding: spacing.xs },
 
-  oplHeaderTitleRow: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm },
+  oplHeaderTitleRow: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm, flexShrink: 1 },
 
   boxSequenceRow: { flexDirection: 'row', alignItems: 'center', gap: spacing.xs, marginBottom: spacing.md },
   boxSequenceText: { fontFamily: fontFamily.semiBold, fontSize: fontSize.sm, color: colors.text, flex: 1 },
-  switchBtn: { flexDirection: 'row', alignItems: 'center', gap: 2 },
-  switchBtnText: { fontFamily: fontFamily.medium, fontSize: fontSize.xs, color: colors.primary },
 
-  progressCard: { backgroundColor: colors.surfaceAlt, borderRadius: borderRadius.sm, padding: spacing.sm },
-  progressRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: spacing.xs },
-  progressLabel: { fontFamily: fontFamily.regular, fontSize: fontSize.xs, color: colors.textMuted, textTransform: 'uppercase', letterSpacing: 0.5 },
-  progressValue: { fontFamily: fontFamily.bold, fontSize: fontSize.md, color: colors.text },
+  progressCard: { backgroundColor: colors.surfaceAlt, borderRadius: borderRadius.md, padding: spacing.md },
+  progressRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: spacing.sm },
+  // Count reads number-first: the stem total is what the packer tracks.
+  progressCount: { flexDirection: 'row', alignItems: 'baseline', gap: spacing.xs },
+  progressBig: { fontFamily: fontFamily.bold, fontSize: fontSize.xxl, color: colors.text, letterSpacing: -0.5 },
+  progressOf: { fontFamily: fontFamily.regular, fontSize: fontSize.xs, color: colors.textMuted },
+  progressPct: { fontFamily: fontFamily.semiBold, fontSize: fontSize.sm, color: colors.textMuted },
   progressValueFull: { color: colors.warning },
+
+  // Per-variety progress — plain rows, each with its own thin bar. No pill
+  // chrome: a mix box's composition is opt-in (behind the header icon), so
+  // once it's open it reads like any other list, not a wall of chips.
+  varietyList: {
+    marginTop: spacing.sm,
+    marginBottom: spacing.md,
+    gap: spacing.xs,
+  },
+  varietyRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.sm,
+  },
+  varietyName: {
+    fontFamily: fontFamily.medium,
+    fontSize: fontSize.sm,
+    color: colors.text,
+    flex: 1,
+  },
+  varietyBarWrap: {
+    width: 60,
+    height: 5,
+    backgroundColor: colors.surfaceAlt,
+    borderRadius: 3,
+    overflow: 'hidden',
+  },
+  varietyBarFill: { height: '100%', backgroundColor: colors.primary, borderRadius: 3 },
+  varietyCount: {
+    fontFamily: fontFamily.semiBold,
+    fontSize: fontSize.xs,
+    color: colors.textMuted,
+    minWidth: 50,
+    textAlign: 'right',
+  },
   progressBarWrap: { height: 6, backgroundColor: colors.border, borderRadius: 3, overflow: 'hidden' },
   progressBarFill: { height: '100%', backgroundColor: colors.primary, borderRadius: 3 },
   progressBarFillFull: { backgroundColor: colors.warning },
-
-  capWarning: {
-    flexDirection: 'row', alignItems: 'center', gap: spacing.xs,
-    marginTop: spacing.sm, backgroundColor: '#FEF3C7', borderRadius: borderRadius.sm, padding: spacing.sm,
-  },
-  capWarningText: { fontFamily: fontFamily.medium, fontSize: fontSize.xs, color: '#92400E', flex: 1 },
 
   listSection: { marginBottom: spacing.lg },
   listHeader: { fontFamily: fontFamily.semiBold, fontSize: fontSize.sm, color: colors.text, marginBottom: spacing.sm },
@@ -973,47 +778,15 @@ const styles = StyleSheet.create({
   listItemStems: { fontFamily: fontFamily.semiBold, fontSize: fontSize.xs, color: colors.textMuted },
   listItemTime: { fontFamily: fontFamily.regular, fontSize: fontSize.xs, color: colors.textMuted },
 
-  closeBoxBtn: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: spacing.sm,
-    backgroundColor: colors.primary,
-    borderRadius: borderRadius.md,
-    padding: spacing.lg,
-  },
-  closeBoxBtnDisabled: { opacity: 0.4 },
-  closeBoxBtnText: { fontFamily: fontFamily.semiBold, fontSize: fontSize.md, color: colors.textOnPrimary },
-
-  recipeRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: spacing.sm,
-    paddingVertical: spacing.sm,
-  },
-  recipeName: { flex: 1, fontFamily: fontFamily.medium, fontSize: fontSize.sm, color: colors.text },
-  recipeCount: { fontFamily: fontFamily.semiBold, fontSize: fontSize.sm, color: colors.textMuted },
-  recipeCountDone: { color: colors.success || '#10b981' },
-
   // OPL picker host
   oplPickerWrap: { flex: 1, minHeight: 500 },
   pickerHost: { flex: 1, minHeight: 400 },
 
-  // OPL mode — MIX pill (small variant, inside session card)
-  mixPillSmall: {
-    backgroundColor: colors.primary,
-    paddingHorizontal: spacing.sm,
-    paddingVertical: 1,
-    borderRadius: borderRadius.full,
-  },
-  mixPillSmallText: {
-    fontFamily: fontFamily.bold,
-    fontSize: 9,
-    color: colors.textOnPrimary,
-    letterSpacing: 0.5,
-  },
+  // OPL mode — mix indicator: a plain icon button, not a pill. Tapping it
+  // reveals the per-variety breakdown below instead of shouting it in color.
+  mixIconBtn: { padding: 2 },
 
-  // Box-full confirmation card (OPL mode)
+  // Box-full confirmation card
   boxFullCard: {
     backgroundColor: colors.surface,
     borderWidth: 1,
@@ -1055,4 +828,91 @@ const styles = StyleSheet.create({
     fontSize: fontSize.sm,
     color: colors.text,
   },
+
+  // "Choose which one" prompt — scanned variety is on >1 OPL line.
+  choiceBackdrop: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.5)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: spacing.lg,
+  },
+  choiceCard: {
+    width: '100%',
+    maxWidth: 420,
+    backgroundColor: colors.surface,
+    borderRadius: borderRadius.lg,
+    padding: spacing.lg,
+    alignItems: 'center',
+    gap: spacing.sm,
+  },
+  choiceTitle: {
+    fontFamily: fontFamily.semiBold,
+    fontSize: fontSize.md,
+    color: colors.text,
+    textAlign: 'center',
+  },
+  choiceHint: {
+    fontFamily: fontFamily.regular,
+    fontSize: fontSize.sm,
+    color: colors.textMuted,
+    textAlign: 'center',
+    marginBottom: spacing.sm,
+  },
+  choiceOption: {
+    width: '100%',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: spacing.sm,
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: borderRadius.md,
+    padding: spacing.md,
+  },
+  choiceOptionTitle: { fontFamily: fontFamily.semiBold, fontSize: fontSize.sm, color: colors.text },
+  choiceOptionSub: { fontFamily: fontFamily.regular, fontSize: fontSize.xs, color: colors.textMuted, marginTop: 2 },
+  choiceCancel: { marginTop: spacing.sm, padding: spacing.sm },
+  choiceCancelText: { fontFamily: fontFamily.medium, fontSize: fontSize.sm, color: colors.textMuted },
+});
+
+/**
+ * Wrist-scanner overrides (Zebra WS50 & co, ~240–320dp wide). Applied on top
+ * of `styles` via the `s()` helper — padding and type shrink, nothing moves.
+ */
+const c = StyleSheet.create({
+  fixEntry: { paddingVertical: spacing.xs, paddingHorizontal: spacing.sm, marginBottom: spacing.sm, gap: spacing.xs },
+  fixEntryText: { fontSize: fontSize.xs },
+  scrollContent: { padding: spacing.sm, paddingBottom: spacing.md },
+
+  boxSequenceText: { fontSize: fontSize.xs },
+
+  progressBig: { fontSize: fontSize.xl },
+  varietyList: { marginTop: spacing.xs, marginBottom: spacing.sm, gap: 4 },
+  varietyRow: { gap: spacing.xs },
+  varietyName: { fontSize: fontSize.xs },
+
+  section: { marginBottom: spacing.sm },
+  sectionHeader: { gap: spacing.xs, marginBottom: spacing.xs },
+  sectionTitle: { fontSize: fontSize.sm },
+
+  sessionCard: { padding: spacing.sm, marginBottom: spacing.sm },
+  sessionHeaderRow: { marginBottom: spacing.xs },
+  sessionCustomer: { fontSize: fontSize.md },
+
+  boxSequenceRow: { marginBottom: spacing.xs },
+  progressCard: { padding: spacing.xs },
+
+  listSection: { marginBottom: spacing.sm },
+  listItem: { padding: spacing.sm, gap: spacing.xs },
+
+  closeBoxInlineBtn: { marginTop: spacing.sm, paddingVertical: spacing.sm },
+
+  boxFullCard: { padding: spacing.sm, marginBottom: spacing.sm, gap: spacing.xs },
+  boxFullTitle: { fontSize: fontSize.sm },
+  boxFullBtn: { paddingVertical: spacing.sm },
+
+  // The picker owns the remaining height instead of forcing a 500dp scroll.
+  // ~320dp tall minus header/tab bar leaves ~230dp of viewport to share.
+  oplPickerWrap: { minHeight: 0 },
+  pickerHost: { minHeight: 150 },
 });

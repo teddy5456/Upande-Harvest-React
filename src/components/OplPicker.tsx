@@ -13,9 +13,11 @@ import {
   FlatList,
   ActivityIndicator,
   RefreshControl,
+  Modal,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { listOpenOplsForPacking } from '../services/api';
+import { getSetting, setSetting } from '../database/settings';
 import { PackableOpl } from '../types';
 import {
   colors,
@@ -23,17 +25,26 @@ import {
   fontSize,
   spacing,
   borderRadius,
+  scale,
 } from '../theme';
 
 type LayoutMode = 'list' | 'grid';
 type RangeKey = '1d' | '7d' | '14d' | '30d' | 'all';
+type StatusKey = 'all' | 'ready' | 'in_progress' | 'mix';
 
 const RANGES: { key: RangeKey; label: string; days: number | null }[] = [
   { key: '1d',  label: 'Today', days: 0 },
-  { key: '7d',  label: '7d',    days: 7 },
-  { key: '14d', label: '14d',   days: 14 },
-  { key: '30d', label: '30d',   days: 30 },
-  { key: 'all', label: 'All',   days: null },
+  { key: '7d',  label: 'Last 7 days',    days: 7 },
+  { key: '14d', label: 'Last 14 days',   days: 14 },
+  { key: '30d', label: 'Last 30 days',   days: 30 },
+  { key: 'all', label: 'All time',       days: null },
+];
+
+const STATUSES: { key: StatusKey; label: string }[] = [
+  { key: 'all',         label: 'All orders' },
+  { key: 'ready',       label: 'Ready to pack' },
+  { key: 'in_progress', label: 'In progress' },
+  { key: 'mix',         label: 'Mix boxes only' },
 ];
 
 interface Props {
@@ -47,17 +58,6 @@ function isoDay(d: Date): string {
   const m = String(d.getMonth() + 1).padStart(2, '0');
   const day = String(d.getDate()).padStart(2, '0');
   return `${y}-${m}-${day}`;
-}
-function formatPretty(iso: string): string {
-  try {
-    const d = new Date(iso + 'T00:00:00');
-    return d.toLocaleDateString(undefined, {
-      day: 'numeric',
-      month: 'short',
-    });
-  } catch {
-    return iso;
-  }
 }
 function daysAgo(n: number): Date {
   const d = new Date();
@@ -82,6 +82,44 @@ function ageBadge(iso: string | null): string {
   return `${diff}d ago`;
 }
 
+/**
+ * How far along an order is. Pack-tab OPLs carry real per-line stem targets
+ * in `pack_lines`, so that is the true figure — a box can be "closed" while
+ * under target on a partial box, so box counts alone would overstate it.
+ * Older OPLs (no Packing tab) only have box counts, so a box's open/closed
+ * state is the best signal available without inventing numbers client-side.
+ */
+function packingProgress(opl: PackableOpl): { pct: number; label: string } {
+  if (opl.pack_lines && opl.pack_lines.length > 0) {
+    const target = opl.pack_lines.reduce((n, l) => n + (l.target_stems || 0), 0);
+    const packed = opl.pack_lines.reduce((n, l) => n + (l.packed_stems || 0), 0);
+    if (target > 0) {
+      return {
+        pct: Math.min(100, Math.round((packed / target) * 100)),
+        label: `${packed.toLocaleString()} / ${target.toLocaleString()} stems`,
+      };
+    }
+  }
+  if (opl.box_count > 0) {
+    const closed = Math.max(0, opl.box_count - opl.open_count);
+    return {
+      pct: Math.min(100, Math.round((closed / opl.box_count) * 100)),
+      label: `${closed} / ${opl.box_count} boxes packed`,
+    };
+  }
+  return { pct: 0, label: 'Not started' };
+}
+
+function statusMeta(status: PackableOpl['status'], sequence: number) {
+  if (status === 'in_progress') {
+    return { label: sequence > 0 ? `In progress · Box ${sequence}` : 'In progress', color: colors.success };
+  }
+  if (status === 'done') {
+    return { label: 'Done', color: colors.textMuted };
+  }
+  return { label: 'Ready', color: colors.textSecondary };
+}
+
 export default function OplPicker({ onSelect, disabled }: Props) {
   const [opls, setOpls] = useState<PackableOpl[] | null>(null);
   const [loading, setLoading] = useState(false);
@@ -89,11 +127,40 @@ export default function OplPicker({ onSelect, disabled }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [query, setQuery] = useState('');
 
-  // Default: last 14 days — covers a typical week with a few days of slack
-  const [rangeKey, setRangeKey] = useState<RangeKey>('14d');
+  // Default to today — the packer walks in and wants what's on the floor
+  // right now, not a two-week backlog. Overridden below by whatever the
+  // packer last had set, once that's loaded from local settings.
+  const [rangeKey, setRangeKey] = useState<RangeKey>('1d');
+  const [layout, setLayout] = useState<LayoutMode>('list');
+  const [statusFilter, setStatusFilter] = useState<StatusKey>('all');
+  const [filterSheetOpen, setFilterSheetOpen] = useState(false);
+  const [presetsLoaded, setPresetsLoaded] = useState(false);
+
+  // Remember the packer's last filter choices across sessions — re-picking
+  // "This week" / "Mix only" / grid view every single time you open Packing
+  // got old fast.
+  useEffect(() => {
+    (async () => {
+      const [savedRange, savedLayout, savedStatus] = await Promise.all([
+        getSetting('packing_range_key'),
+        getSetting('packing_layout'),
+        getSetting('packing_status_filter'),
+      ]);
+      if (savedRange && RANGES.some((r) => r.key === savedRange)) setRangeKey(savedRange as RangeKey);
+      if (savedLayout === 'list' || savedLayout === 'grid') setLayout(savedLayout);
+      if (savedStatus && STATUSES.some((s) => s.key === savedStatus)) setStatusFilter(savedStatus as StatusKey);
+      setPresetsLoaded(true);
+    })();
+  }, []);
+
+  // Guarded on presetsLoaded so the just-loaded values don't get immediately
+  // overwritten by whatever the defaults were on the very first render.
+  useEffect(() => { if (presetsLoaded) setSetting('packing_range_key', rangeKey); }, [presetsLoaded, rangeKey]);
+  useEffect(() => { if (presetsLoaded) setSetting('packing_layout', layout); }, [presetsLoaded, layout]);
+  useEffect(() => { if (presetsLoaded) setSetting('packing_status_filter', statusFilter); }, [presetsLoaded, statusFilter]);
 
   const { fromDate, toDate } = useMemo(() => {
-    const r = RANGES.find((x) => x.key === rangeKey) ?? RANGES[2];
+    const r = RANGES.find((x) => x.key === rangeKey) ?? RANGES[0];
     if (r.days === null) return { fromDate: undefined, toDate: undefined };
     const today = new Date();
     return {
@@ -101,9 +168,6 @@ export default function OplPicker({ onSelect, disabled }: Props) {
       toDate: isoDay(today),
     };
   }, [rangeKey]);
-
-  const [layout, setLayout] = useState<LayoutMode>('list');
-  const [statusFilter, setStatusFilter] = useState<'all' | 'ready' | 'in_progress' | 'mix'>('all');
 
   const load = useCallback(async (mode: 'initial' | 'refresh') => {
     if (mode === 'initial') setLoading(true);
@@ -128,7 +192,7 @@ export default function OplPicker({ onSelect, disabled }: Props) {
   const filtered = useMemo(() => {
     if (!opls) return [];
     const q = query.trim().toLowerCase();
-    return opls.filter((o) => {
+    const matches = opls.filter((o) => {
       if (statusFilter === 'ready' && o.status !== 'ready') return false;
       if (statusFilter === 'in_progress' && o.status !== 'in_progress') return false;
       if (statusFilter === 'mix' && !o.is_mix) return false;
@@ -140,7 +204,25 @@ export default function OplPicker({ onSelect, disabled }: Props) {
         (o.varieties || '').toLowerCase().includes(q)
       );
     });
+
+    // The server returns these newest-first, which scatters one customer's
+    // orders down the whole list — on a floor day that is a hundred rows the
+    // packer has to scroll for a name they already know. Arrange it the way
+    // they actually work: a box already open is finished before a new one is
+    // started, and within that, customers in alphabetical order so every OPL
+    // for a customer sits together.
+    const rank = (s: string) => (s === 'in_progress' ? 0 : 1);
+    return matches.sort((a, b) => {
+      const byStatus = rank(a.status) - rank(b.status);
+      if (byStatus) return byStatus;
+      const byCustomer = (a.customer_name || '').localeCompare(b.customer_name || '');
+      if (byCustomer) return byCustomer;
+      return (a.opl || '').localeCompare(b.opl || '');
+    });
   }, [opls, query, statusFilter]);
+
+  const filtersActive = rangeKey !== '1d' || statusFilter !== 'all';
+  const activeRangeLabel = RANGES.find((r) => r.key === rangeKey)?.label || 'Today';
 
   // ── Render helpers ────────────────────────────────────────────────────
   const renderListItem = ({ item }: { item: PackableOpl }) => (
@@ -153,97 +235,45 @@ export default function OplPicker({ onSelect, disabled }: Props) {
 
   return (
     <View style={styles.container}>
-      {/* ── Filter bar ───────────────────────────────────────────────── */}
-      <View style={styles.searchWrap}>
-        <Ionicons name="search" size={16} color={colors.textMuted} />
-        <TextInput
-          style={styles.searchInput}
-          placeholder="Customer, OPL, SO or variety"
-          placeholderTextColor={colors.textMuted}
-          value={query}
-          onChangeText={setQuery}
-          autoCorrect={false}
-          autoCapitalize="none"
-          returnKeyType="search"
-        />
-        {query.length > 0 && (
-          <TouchableOpacity onPress={() => setQuery('')} hitSlop={8}>
-            <Ionicons name="close-circle" size={16} color={colors.textMuted} />
-          </TouchableOpacity>
-        )}
-      </View>
-
+      {/* ── Search + filter entry point ─────────────────────────────── */}
       <View style={styles.toolRow}>
-        <View style={styles.rangeGroup}>
-          <Ionicons name="calendar-outline" size={13} color={colors.textSecondary} />
-          {RANGES.map((r) => (
-            <TouchableOpacity
-              key={r.key}
-              style={[styles.rangeChip, rangeKey === r.key && styles.rangeChipActive]}
-              onPress={() => setRangeKey(r.key)}
-              activeOpacity={0.7}
-            >
-              <Text style={[
-                styles.rangeChipText,
-                rangeKey === r.key && styles.rangeChipTextActive,
-              ]}>
-                {r.label}
-              </Text>
+        <View style={styles.searchWrap}>
+          <Ionicons name="search" size={16} color={colors.textMuted} />
+          <TextInput
+            style={styles.searchInput}
+            placeholder="Customer, OPL, SO or variety"
+            placeholderTextColor={colors.textMuted}
+            value={query}
+            onChangeText={setQuery}
+            autoCorrect={false}
+            autoCapitalize="none"
+            returnKeyType="search"
+          />
+          {query.length > 0 && (
+            <TouchableOpacity onPress={() => setQuery('')} hitSlop={8}>
+              <Ionicons name="close-circle" size={16} color={colors.textMuted} />
             </TouchableOpacity>
-          ))}
+          )}
         </View>
 
-        <View style={styles.layoutToggle}>
-          <TouchableOpacity
-            style={[styles.layoutBtn, layout === 'list' && styles.layoutBtnActive]}
-            onPress={() => setLayout('list')}
-            activeOpacity={0.7}
-          >
-            <Ionicons
-              name="list"
-              size={14}
-              color={layout === 'list' ? colors.textOnPrimary : colors.textMuted}
-            />
-          </TouchableOpacity>
-          <TouchableOpacity
-            style={[styles.layoutBtn, layout === 'grid' && styles.layoutBtnActive]}
-            onPress={() => setLayout('grid')}
-            activeOpacity={0.7}
-          >
-            <Ionicons
-              name="grid"
-              size={13}
-              color={layout === 'grid' ? colors.textOnPrimary : colors.textMuted}
-            />
-          </TouchableOpacity>
-        </View>
+        <TouchableOpacity
+          style={styles.filterBtn}
+          onPress={() => setFilterSheetOpen(true)}
+          activeOpacity={0.7}
+        >
+          <Ionicons name="options-outline" size={18} color={colors.text} />
+          {filtersActive && <View style={styles.filterDot} />}
+        </TouchableOpacity>
       </View>
 
-      {/* Quick status filters */}
-      <View style={styles.chipRow}>
-        {(
-          [
-            { key: 'all',         label: 'All' },
-            { key: 'ready',       label: 'Ready' },
-            { key: 'in_progress', label: 'In progress' },
-            { key: 'mix',         label: 'Mix box' },
-          ] as const
-        ).map((c) => (
-          <TouchableOpacity
-            key={c.key}
-            style={[styles.filterChip, statusFilter === c.key && styles.filterChipActive]}
-            onPress={() => setStatusFilter(c.key)}
-            activeOpacity={0.7}
-          >
-            <Text style={[
-              styles.filterChipText,
-              statusFilter === c.key && styles.filterChipTextActive,
-            ]}>
-              {c.label}
-            </Text>
-          </TouchableOpacity>
-        ))}
-      </View>
+      {/* Only surfaces when the view isn't the default — a quiet reminder of
+          why the list looks the way it does, not a permanent fixture. */}
+      {filtersActive && (
+        <Text style={styles.filterSummary} numberOfLines={1}>
+          {activeRangeLabel}
+          {statusFilter !== 'all' ? ` · ${STATUSES.find((s) => s.key === statusFilter)?.label}` : ''}
+        </Text>
+      )}
 
       {/* ── List / Grid / States ─────────────────────────────────────── */}
       {loading && !opls ? (
@@ -265,8 +295,21 @@ export default function OplPicker({ onSelect, disabled }: Props) {
           <Text style={styles.centerText}>
             {query
               ? `No OPLs match "${query}"`
-              : 'No OPLs in this range.'}
+              // opls.length > 0 means the server DID return real OPLs for this
+              // date range — a status filter (persisted from last time, per
+              // the presets feature) is what's hiding them, not an actually
+              // empty range. Saying so, instead of the same generic line
+              // either way, is the difference between "the app is broken"
+              // and "oh, I still had Mix Only on".
+              : (opls && opls.length > 0)
+                ? `${opls.length} OPL${opls.length !== 1 ? 's' : ''} in this range, but none match "${STATUSES.find((s) => s.key === statusFilter)?.label || statusFilter}".`
+                : 'No OPLs in this range.'}
           </Text>
+          {!query && statusFilter !== 'all' && opls && opls.length > 0 && (
+            <TouchableOpacity style={styles.retry} onPress={() => setStatusFilter('all')}>
+              <Text style={styles.retryText}>Clear status filter</Text>
+            </TouchableOpacity>
+          )}
         </View>
       ) : layout === 'list' ? (
         <FlatList
@@ -302,7 +345,103 @@ export default function OplPicker({ onSelect, disabled }: Props) {
         />
       )}
 
+      <FilterSheet
+        visible={filterSheetOpen}
+        onClose={() => setFilterSheetOpen(false)}
+        rangeKey={rangeKey}
+        onRange={setRangeKey}
+        statusFilter={statusFilter}
+        onStatus={setStatusFilter}
+        layout={layout}
+        onLayout={setLayout}
+      />
     </View>
+  );
+}
+
+// ── Filter sheet — everything that used to be a row of chips now lives here,
+// one tap away instead of permanently on screen ─────────────────────────────
+function FilterSheet({
+  visible, onClose,
+  rangeKey, onRange,
+  statusFilter, onStatus,
+  layout, onLayout,
+}: {
+  visible: boolean;
+  onClose: () => void;
+  rangeKey: RangeKey;
+  onRange: (r: RangeKey) => void;
+  statusFilter: StatusKey;
+  onStatus: (s: StatusKey) => void;
+  layout: LayoutMode;
+  onLayout: (l: LayoutMode) => void;
+}) {
+  return (
+    <Modal visible={visible} animationType="slide" transparent onRequestClose={onClose}>
+      <View style={sheetStyles.backdrop}>
+        <View style={sheetStyles.sheet}>
+          <View style={sheetStyles.head}>
+            <Text style={sheetStyles.title}>Filters</Text>
+            <TouchableOpacity onPress={onClose} hitSlop={{ top: 12, bottom: 12, left: 12, right: 12 }}>
+              <Ionicons name="close" size={22} color={colors.textMuted} />
+            </TouchableOpacity>
+          </View>
+
+          <Text style={sheetStyles.label}>Date range</Text>
+          {RANGES.map((r) => (
+            <FilterRow
+              key={r.key}
+              label={r.label}
+              selected={rangeKey === r.key}
+              onPress={() => onRange(r.key)}
+            />
+          ))}
+
+          <Text style={sheetStyles.label}>Status</Text>
+          {STATUSES.map((s) => (
+            <FilterRow
+              key={s.key}
+              label={s.label}
+              selected={statusFilter === s.key}
+              onPress={() => onStatus(s.key)}
+            />
+          ))}
+
+          <Text style={sheetStyles.label}>Layout</Text>
+          <View style={sheetStyles.layoutRow}>
+            <TouchableOpacity
+              style={[sheetStyles.layoutBtn, layout === 'list' && sheetStyles.layoutBtnActive]}
+              onPress={() => onLayout('list')}
+              activeOpacity={0.7}
+            >
+              <Ionicons name="list" size={16} color={layout === 'list' ? colors.textOnPrimary : colors.text} />
+              <Text style={[sheetStyles.layoutText, layout === 'list' && sheetStyles.layoutTextActive]}>List</Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={[sheetStyles.layoutBtn, layout === 'grid' && sheetStyles.layoutBtnActive]}
+              onPress={() => onLayout('grid')}
+              activeOpacity={0.7}
+            >
+              <Ionicons name="grid" size={16} color={layout === 'grid' ? colors.textOnPrimary : colors.text} />
+              <Text style={[sheetStyles.layoutText, layout === 'grid' && sheetStyles.layoutTextActive]}>Grid</Text>
+            </TouchableOpacity>
+          </View>
+
+          <TouchableOpacity style={sheetStyles.doneBtn} onPress={onClose} activeOpacity={0.85}>
+            <Text style={sheetStyles.doneBtnText}>Done</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    </Modal>
+  );
+}
+
+function FilterRow({ label, selected, onPress }: { label: string; selected: boolean; onPress: () => void }) {
+  return (
+    <TouchableOpacity style={sheetStyles.row} onPress={onPress} activeOpacity={0.7}>
+      <Text style={[sheetStyles.rowText, selected && sheetStyles.rowTextActive]}>{label}</Text>
+      {selected && <Ionicons name="checkmark" size={18} color={colors.primary} />}
+    </TouchableOpacity>
   );
 }
 
@@ -313,23 +452,31 @@ function ListCard({ opl, disabled, onSelect }: {
   onSelect: (o: PackableOpl) => void;
 }) {
   const age = ageBadge(opl.date_created);
+  const status = statusMeta(opl.status, opl.current_sequence);
+  const progress = packingProgress(opl);
+  const [showMix, setShowMix] = useState(false);
+
   return (
-    <TouchableOpacity
-      style={[listCardStyles.card, disabled && listCardStyles.disabled]}
-      onPress={() => !disabled && onSelect(opl)}
-      activeOpacity={0.75}
-      disabled={disabled}
-    >
-      <View style={listCardStyles.body}>
+    <View style={[listCardStyles.card, disabled && listCardStyles.disabled]}>
+      <TouchableOpacity
+        onPress={() => !disabled && onSelect(opl)}
+        activeOpacity={0.75}
+        disabled={disabled}
+      >
         <View style={listCardStyles.headerRow}>
           <Text style={listCardStyles.customer} numberOfLines={1}>
             {opl.customer_name || opl.customer || '—'}
           </Text>
           {opl.is_mix && (
-            <View style={listCardStyles.mixPill}>
-              <Text style={listCardStyles.mixPillText}>MIX</Text>
-            </View>
+            <TouchableOpacity
+              onPress={(e) => { e.stopPropagation(); setShowMix((v) => !v); }}
+              hitSlop={8}
+              style={listCardStyles.mixIcon}
+            >
+              <Ionicons name="git-merge-outline" size={16} color={colors.textSecondary} />
+            </TouchableOpacity>
           )}
+          <Ionicons name="chevron-forward" size={18} color={colors.textMuted} />
         </View>
 
         <View style={listCardStyles.metaRow}>
@@ -340,27 +487,46 @@ function ListCard({ opl, disabled, onSelect }: {
               <Text style={listCardStyles.metaMuted}>{age}</Text>
             </>
           )}
+          {/* Two orders for the same customer otherwise look identical here -
+              line code / drop-off point tell them apart by route, not variety. */}
+          {!!opl.line_code && (
+            <>
+              <View style={listCardStyles.bullet} />
+              <Text style={listCardStyles.metaMuted} numberOfLines={1}>{opl.line_code}</Text>
+            </>
+          )}
+          {!!opl.delivery_point && (
+            <>
+              <View style={listCardStyles.bullet} />
+              <Text style={listCardStyles.metaMuted} numberOfLines={1}>{opl.delivery_point}</Text>
+            </>
+          )}
+          <View style={listCardStyles.bullet} />
+          <View style={[listCardStyles.statusDot, { backgroundColor: status.color }]} />
+          <Text style={[listCardStyles.metaMuted, { color: status.color }]}>{status.label}</Text>
         </View>
 
-        <View style={listCardStyles.statsRow}>
-          <StatPill
-            icon="layers-outline"
-            label={`${opl.pack_rate}/box`}
-          />
-          <StatPill
-            icon="leaf-outline"
-            label={`${opl.total_stems.toLocaleString()} stems`}
-          />
-          <StatusBadge status={opl.status} sequence={opl.current_sequence} />
+        <View style={listCardStyles.progressWrap}>
+          <View style={listCardStyles.progressBarWrap}>
+            <View style={[listCardStyles.progressBarFill, { width: `${progress.pct}%` }]} />
+          </View>
+          <Text style={listCardStyles.progressLabel}>{progress.label}</Text>
         </View>
-      </View>
 
-      <View style={listCardStyles.actions}>
-        <View style={listCardStyles.cta}>
-          <Ionicons name="chevron-forward" size={18} color={colors.text} />
+        <Text style={listCardStyles.statsCaption}>
+          {opl.total_stems.toLocaleString()} stems total · {opl.pack_rate}/box
+        </Text>
+      </TouchableOpacity>
+
+      {showMix && (
+        <View style={listCardStyles.mixDetail}>
+          <Ionicons name="git-merge-outline" size={13} color={colors.textMuted} />
+          <Text style={listCardStyles.mixDetailText} numberOfLines={2}>
+            Mixed: {opl.varieties || 'variety breakdown not available'}
+          </Text>
         </View>
-      </View>
-    </TouchableOpacity>
+      )}
+    </View>
   );
 }
 
@@ -370,88 +536,48 @@ function GridCard({ opl, disabled, onSelect }: {
   disabled?: boolean;
   onSelect: (o: PackableOpl) => void;
 }) {
+  const status = statusMeta(opl.status, opl.current_sequence);
+  const progress = packingProgress(opl);
+  const [showMix, setShowMix] = useState(false);
+
   return (
-    <TouchableOpacity
-      style={[gridCardStyles.card, disabled && gridCardStyles.disabled]}
-      onPress={() => !disabled && onSelect(opl)}
-      activeOpacity={0.75}
-      disabled={disabled}
-    >
-      <View style={gridCardStyles.topRow}>
-        <StatusBadge status={opl.status} sequence={opl.current_sequence} compact />
-        {opl.is_mix && (
-          <View style={gridCardStyles.mixPillCompact}>
-            <Text style={gridCardStyles.mixPillTextCompact}>MIX</Text>
-          </View>
-        )}
-      </View>
-
-      <Text style={gridCardStyles.customer} numberOfLines={2}>
-        {opl.customer_name || opl.customer || '—'}
-      </Text>
-
-      <Text style={gridCardStyles.opl} numberOfLines={1}>{opl.opl}</Text>
-
-      <View style={gridCardStyles.statsRow}>
-        <View style={gridCardStyles.stat}>
-          <Text style={gridCardStyles.statValue}>
-            {opl.total_stems.toLocaleString()}
+    <View style={[gridCardStyles.card, disabled && gridCardStyles.disabled]}>
+      <TouchableOpacity onPress={() => !disabled && onSelect(opl)} activeOpacity={0.75} disabled={disabled}>
+        <View style={gridCardStyles.topRow}>
+          <View style={[gridCardStyles.statusDot, { backgroundColor: status.color }]} />
+          <Text style={[gridCardStyles.statusText, { color: status.color }]} numberOfLines={1}>
+            {status.label}
           </Text>
-          <Text style={gridCardStyles.statLabel}>stems</Text>
+          {opl.is_mix && (
+            <TouchableOpacity onPress={(e) => { e.stopPropagation(); setShowMix((v) => !v); }} hitSlop={8}>
+              <Ionicons name="git-merge-outline" size={15} color={colors.textSecondary} />
+            </TouchableOpacity>
+          )}
         </View>
-        <View style={gridCardStyles.statDivider} />
-        <View style={gridCardStyles.stat}>
-          <Text style={gridCardStyles.statValue}>{opl.pack_rate}</Text>
-          <Text style={gridCardStyles.statLabel}>per box</Text>
+
+        <Text style={gridCardStyles.customer} numberOfLines={2}>
+          {opl.customer_name || opl.customer || '—'}
+        </Text>
+        <Text style={gridCardStyles.opl} numberOfLines={1}>{opl.opl}</Text>
+        {/* Same customer, two orders — line code / drop-off point are what
+            actually tell them apart on this compact card. */}
+        {(!!opl.line_code || !!opl.delivery_point) && (
+          <Text style={gridCardStyles.progressLabel} numberOfLines={1}>
+            {[opl.line_code, opl.delivery_point].filter(Boolean).join(' · ')}
+          </Text>
+        )}
+
+        <View style={gridCardStyles.progressBarWrap}>
+          <View style={[gridCardStyles.progressBarFill, { width: `${progress.pct}%` }]} />
         </View>
-      </View>
-    </TouchableOpacity>
-  );
-}
+        <Text style={gridCardStyles.progressLabel} numberOfLines={1}>{progress.label}</Text>
+      </TouchableOpacity>
 
-// ── Sub-components ────────────────────────────────────────────────────────
-function StatPill({ icon, label }: {
-  icon: React.ComponentProps<typeof Ionicons>['name'];
-  label: string;
-}) {
-  return (
-    <View style={pillStyles.pill}>
-      <Ionicons name={icon} size={11} color={colors.textSecondary} />
-      <Text style={pillStyles.text}>{label}</Text>
-    </View>
-  );
-}
-
-function StatusBadge({ status, sequence, compact }: {
-  status: PackableOpl['status'];
-  sequence: number;
-  compact?: boolean;
-}) {
-  const meta = (() => {
-    if (status === 'in_progress') return {
-      label: sequence > 0 ? `Box ${sequence}` : 'In progress',
-      bg: 'rgba(34, 197, 94, 0.12)',
-      fg: '#15803d',
-    };
-    if (status === 'done') return {
-      label: 'Done',
-      bg: 'rgba(163, 163, 163, 0.18)',
-      fg: '#525252',
-    };
-    return {
-      label: 'Ready',
-      bg: 'rgba(14, 165, 233, 0.12)',
-      fg: '#0369a1',
-    };
-  })();
-  return (
-    <View style={[
-      badgeStyles.badge,
-      { backgroundColor: meta.bg },
-      compact && badgeStyles.badgeCompact,
-    ]}>
-      <View style={[badgeStyles.dot, { backgroundColor: meta.fg }]} />
-      <Text style={[badgeStyles.text, { color: meta.fg }]}>{meta.label}</Text>
+      {showMix && (
+        <Text style={gridCardStyles.mixDetailText} numberOfLines={2}>
+          Mixed: {opl.varieties || 'n/a'}
+        </Text>
+      )}
     </View>
   );
 }
@@ -460,16 +586,19 @@ function StatusBadge({ status, sequence, compact }: {
 const styles = StyleSheet.create({
   container: { flex: 1 },
 
-  // Filter bar
+  toolRow: {
+    flexDirection: 'row', alignItems: 'center', gap: spacing.sm,
+    marginBottom: spacing.sm,
+  },
   searchWrap: {
+    flex: 1,
     flexDirection: 'row', alignItems: 'center',
     gap: spacing.sm,
     backgroundColor: colors.surface,
     borderWidth: 1, borderColor: colors.border,
-    borderRadius: borderRadius.full,
+    borderRadius: borderRadius.lg,
     paddingHorizontal: spacing.md,
     paddingVertical: spacing.sm + 2,
-    marginBottom: spacing.sm,
   },
   searchInput: {
     flex: 1,
@@ -478,70 +607,21 @@ const styles = StyleSheet.create({
     color: colors.text,
     padding: 0,
   },
-
-  toolRow: {
-    flexDirection: 'row', alignItems: 'center', gap: spacing.sm,
-    marginBottom: spacing.sm,
-  },
-  rangeGroup: {
-    flexDirection: 'row', alignItems: 'center', gap: 4,
-    backgroundColor: colors.surfaceAlt,
-    borderRadius: borderRadius.full,
-    paddingHorizontal: 6, paddingVertical: 3,
-    flex: 1,
-  },
-  rangeChip: {
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-    borderRadius: borderRadius.full,
-  },
-  rangeChipActive: { backgroundColor: colors.primary },
-  rangeChipText: {
-    fontFamily: fontFamily.semiBold,
-    fontSize: 11,
-    color: colors.textSecondary,
-    letterSpacing: 0.2,
-  },
-  rangeChipTextActive: {
-    color: colors.textOnPrimary,
-  },
-
-  layoutToggle: {
-    flexDirection: 'row',
-    backgroundColor: colors.surfaceAlt,
-    borderRadius: borderRadius.full,
-    padding: 2,
-  },
-  layoutBtn: {
-    width: 30, height: 26,
+  filterBtn: {
+    width: 40, height: 40,
     alignItems: 'center', justifyContent: 'center',
-    borderRadius: borderRadius.full,
-  },
-  layoutBtnActive: { backgroundColor: colors.primary },
-
-  chipRow: {
-    flexDirection: 'row', gap: 6, flexWrap: 'wrap',
-    marginBottom: spacing.md,
-  },
-  filterChip: {
-    paddingHorizontal: spacing.sm + 2,
-    paddingVertical: 5,
-    borderRadius: borderRadius.full,
     backgroundColor: colors.surface,
     borderWidth: 1, borderColor: colors.border,
+    borderRadius: borderRadius.md,
   },
-  filterChipActive: {
+  filterDot: {
+    position: 'absolute', top: 7, right: 7,
+    width: 7, height: 7, borderRadius: 3.5,
     backgroundColor: colors.primary,
-    borderColor: colors.primary,
   },
-  filterChipText: {
-    fontFamily: fontFamily.medium,
-    fontSize: fontSize.xs,
-    color: colors.textSecondary,
-  },
-  filterChipTextActive: {
-    color: colors.textOnPrimary,
-    fontFamily: fontFamily.semiBold,
+  filterSummary: {
+    fontFamily: fontFamily.medium, fontSize: fontSize.xs, color: colors.textMuted,
+    marginBottom: spacing.sm,
   },
 
   // Lists
@@ -564,7 +644,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: spacing.lg,
     paddingVertical: spacing.sm,
     backgroundColor: colors.primary,
-    borderRadius: borderRadius.full,
+    borderRadius: borderRadius.md,
   },
   retryText: {
     fontFamily: fontFamily.semiBold,
@@ -575,15 +655,19 @@ const styles = StyleSheet.create({
 
 const listCardStyles = StyleSheet.create({
   card: {
-    flexDirection: 'row', alignItems: 'center', gap: spacing.md,
     backgroundColor: colors.surface,
-    borderWidth: 1, borderColor: colors.border,
     borderRadius: borderRadius.lg,
-    paddingHorizontal: spacing.md,
-    paddingVertical: spacing.md,
+    padding: spacing.md,
+    // Pure white card, no border — a soft shadow gives it edges instead of
+    // a grey outline (the page background is a hair off-white, so this
+    // reads clearly without needing a hard line around every card).
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.06,
+    shadowRadius: 6,
+    elevation: 2,
   },
   disabled: { opacity: 0.5 },
-  body: { flex: 1, gap: 4 },
   headerRow: {
     flexDirection: 'row', alignItems: 'center', gap: spacing.sm,
   },
@@ -594,19 +678,10 @@ const listCardStyles = StyleSheet.create({
     color: colors.text,
     letterSpacing: -0.3,
   },
-  mixPill: {
-    backgroundColor: colors.primary,
-    paddingHorizontal: 8, paddingVertical: 2,
-    borderRadius: borderRadius.full,
-  },
-  mixPillText: {
-    fontFamily: fontFamily.bold,
-    fontSize: 9,
-    color: colors.textOnPrimary,
-    letterSpacing: 0.7,
-  },
+  mixIcon: { padding: 2 },
   metaRow: {
     flexDirection: 'row', alignItems: 'center', gap: 6,
+    marginTop: 4,
   },
   opl: {
     fontFamily: fontFamily.medium,
@@ -622,18 +697,25 @@ const listCardStyles = StyleSheet.create({
     fontSize: fontSize.xs,
     color: colors.textMuted,
   },
-  statsRow: {
-    flexDirection: 'row', alignItems: 'center',
-    gap: 6, marginTop: 6, flexWrap: 'wrap',
+  statusDot: { width: 6, height: 6, borderRadius: 3 },
+  progressWrap: { marginTop: spacing.sm, gap: 4 },
+  progressBarWrap: { height: 6, backgroundColor: colors.surfaceAlt, borderRadius: 3, overflow: 'hidden' },
+  progressBarFill: { height: '100%', backgroundColor: colors.primary, borderRadius: 3 },
+  progressLabel: {
+    fontFamily: fontFamily.semiBold, fontSize: fontSize.xs, color: colors.text,
   },
-  actions: {
-    flexDirection: 'row', alignItems: 'center',
-    gap: spacing.xs,
+  statsCaption: {
+    fontFamily: fontFamily.regular, fontSize: fontSize.xs, color: colors.textMuted,
+    marginTop: 4,
   },
-  cta: {
-    width: 28, height: 28, borderRadius: 14,
-    backgroundColor: colors.surfaceAlt,
-    alignItems: 'center', justifyContent: 'center',
+  mixDetail: {
+    flexDirection: 'row', alignItems: 'flex-start', gap: 6,
+    marginTop: spacing.sm, paddingTop: spacing.sm,
+    borderTopWidth: 1, borderTopColor: colors.border,
+  },
+  mixDetailText: {
+    flex: 1,
+    fontFamily: fontFamily.regular, fontSize: fontSize.xs, color: colors.textSecondary,
   },
 });
 
@@ -641,17 +723,23 @@ const gridCardStyles = StyleSheet.create({
   card: {
     flex: 1,
     backgroundColor: colors.surface,
-    borderWidth: 1, borderColor: colors.border,
     borderRadius: borderRadius.lg,
     padding: spacing.md,
     gap: 6,
-    minHeight: 152,
+    minHeight: scale(152),
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.06,
+    shadowRadius: 6,
+    elevation: 2,
   },
   disabled: { opacity: 0.5 },
   topRow: {
-    flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center',
+    flexDirection: 'row', alignItems: 'center', gap: 6,
     marginBottom: 4,
   },
+  statusDot: { width: 6, height: 6, borderRadius: 3 },
+  statusText: { flex: 1, fontFamily: fontFamily.semiBold, fontSize: 10, letterSpacing: 0.2 },
   customer: {
     fontFamily: fontFamily.bold,
     fontSize: fontSize.md,
@@ -665,82 +753,61 @@ const gridCardStyles = StyleSheet.create({
     fontSize: fontSize.xs,
     color: colors.textSecondary,
   },
-  mixPillCompact: {
-    backgroundColor: colors.primary,
-    paddingHorizontal: 6, paddingVertical: 2,
-    borderRadius: borderRadius.full,
-  },
-  mixPillTextCompact: {
-    fontFamily: fontFamily.bold,
-    fontSize: 9,
-    color: colors.textOnPrimary,
-    letterSpacing: 0.5,
-  },
-  statsRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: colors.surfaceAlt,
-    borderRadius: borderRadius.md,
-    paddingVertical: 8,
-    paddingHorizontal: 10,
+  progressBarWrap: {
+    height: 6, backgroundColor: colors.surfaceAlt, borderRadius: 3, overflow: 'hidden',
     marginTop: 'auto',
   },
-  stat: {
-    flex: 1, alignItems: 'center',
+  progressBarFill: { height: '100%', backgroundColor: colors.primary, borderRadius: 3 },
+  progressLabel: {
+    fontFamily: fontFamily.semiBold, fontSize: 10, color: colors.text,
   },
-  statValue: {
-    fontFamily: fontFamily.bold,
-    fontSize: fontSize.md,
-    color: colors.text,
-    letterSpacing: -0.3,
-  },
-  statLabel: {
-    fontFamily: fontFamily.regular,
-    fontSize: 9,
-    color: colors.textMuted,
-    letterSpacing: 0.4,
-    textTransform: 'uppercase',
-    marginTop: 1,
-  },
-  statDivider: {
-    width: 1, alignSelf: 'stretch',
-    backgroundColor: colors.border,
-    marginHorizontal: 4,
+  mixDetailText: {
+    fontFamily: fontFamily.regular, fontSize: 10, color: colors.textSecondary,
+    marginTop: 2,
   },
 });
 
-const pillStyles = StyleSheet.create({
-  pill: {
-    flexDirection: 'row', alignItems: 'center', gap: 4,
-    backgroundColor: colors.surfaceAlt,
-    borderRadius: borderRadius.full,
-    paddingHorizontal: 8,
-    paddingVertical: 3,
+const sheetStyles = StyleSheet.create({
+  backdrop: { flex: 1, backgroundColor: colors.overlay, justifyContent: 'flex-end' },
+  sheet: {
+    backgroundColor: colors.background,
+    borderTopLeftRadius: 24,
+    borderTopRightRadius: 24,
+    paddingHorizontal: spacing.lg,
+    paddingTop: spacing.lg,
+    paddingBottom: spacing.xl,
   },
-  text: {
-    fontFamily: fontFamily.medium,
-    fontSize: 11,
-    color: colors.textSecondary,
+  head: { flexDirection: 'row', alignItems: 'center', marginBottom: spacing.md },
+  title: { flex: 1, fontFamily: fontFamily.bold, fontSize: fontSize.xl, color: colors.text, letterSpacing: -0.4 },
+  label: {
+    fontFamily: fontFamily.semiBold, fontSize: fontSize.xs, color: colors.textMuted,
+    textTransform: 'uppercase', letterSpacing: 0.8,
+    marginTop: spacing.lg, marginBottom: spacing.xs,
   },
-});
-
-const badgeStyles = StyleSheet.create({
-  badge: {
-    flexDirection: 'row', alignItems: 'center', gap: 5,
-    paddingHorizontal: 8,
-    paddingVertical: 3,
-    borderRadius: borderRadius.full,
+  row: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
+    paddingVertical: spacing.sm + 2,
+    borderBottomWidth: 1, borderBottomColor: colors.border,
   },
-  badgeCompact: {
-    paddingHorizontal: 7,
-    paddingVertical: 2,
+  rowText: { fontFamily: fontFamily.regular, fontSize: fontSize.md, color: colors.text },
+  rowTextActive: { fontFamily: fontFamily.semiBold, color: colors.primary },
+  layoutRow: { flexDirection: 'row', gap: spacing.sm },
+  layoutBtn: {
+    flex: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: spacing.xs,
+    paddingVertical: spacing.sm + 2,
+    borderWidth: 1, borderColor: colors.border,
+    borderRadius: borderRadius.md,
+    backgroundColor: colors.surface,
   },
-  dot: {
-    width: 6, height: 6, borderRadius: 3,
+  layoutBtnActive: { backgroundColor: colors.primary, borderColor: colors.primary },
+  layoutText: { fontFamily: fontFamily.semiBold, fontSize: fontSize.sm, color: colors.text },
+  layoutTextActive: { color: colors.textOnPrimary },
+  doneBtn: {
+    marginTop: spacing.xl,
+    alignItems: 'center',
+    backgroundColor: colors.primary,
+    borderRadius: borderRadius.md,
+    paddingVertical: spacing.md,
   },
-  text: {
-    fontFamily: fontFamily.semiBold,
-    fontSize: 11,
-    letterSpacing: 0.2,
-  },
+  doneBtnText: { fontFamily: fontFamily.semiBold, fontSize: fontSize.md, color: colors.textOnPrimary },
 });

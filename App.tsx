@@ -16,6 +16,7 @@ import {
   Poppins_700Bold,
 } from '@expo-google-fonts/poppins';
 import { AppProvider, useApp } from './src/context/AppContext';
+import { useCompact } from './src/hooks/useCompact';
 import LoginScreen from './src/screens/LoginScreen';
 import DashboardScreen from './src/screens/DashboardScreen';
 import HarvestScreen from './src/screens/HarvestScreen';
@@ -48,6 +49,7 @@ import DrawerMenu from './src/components/DrawerContent';
 import UpdatePrompt from './src/components/UpdatePrompt';
 import ChangelogModal from './src/components/ChangelogModal';
 import TutorialModal from './src/components/TutorialModal';
+import ErrorBoundary from './src/components/ErrorBoundary';
 import { colors, fontFamily, fontSize, spacing } from './src/theme';
 
 const Tab = createBottomTabNavigator();
@@ -142,6 +144,7 @@ function AppContent() {
   const { isReady, isLoggedIn, isXflora, storageMode } = useApp();
   const isDirectToGrader = storageMode === 'Direct-to-Grader';
   const insets = useSafeAreaInsets();
+  const compact = useCompact();
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [changelogOpen, setChangelogOpen] = useState(false);
   const [tutorialOpen, setTutorialOpen] = useState(false);
@@ -186,25 +189,28 @@ function AppContent() {
           headerTintColor: colors.text,
           headerTitleStyle: {
             fontFamily: fontFamily.semiBold,
-            fontSize: fontSize.lg,
+            fontSize: compact ? fontSize.sm : fontSize.lg,
           },
+          // Wrist scanners have ~320dp of height to spend — the stock 56dp
+          // header plus a 52dp tab bar would eat a third of the screen.
+          headerStatusBarHeight: compact ? 0 : undefined,
           headerLeft: () => (
             <TouchableOpacity
               onPress={openDrawer}
-              style={{ marginLeft: spacing.lg }}
+              style={{ marginLeft: compact ? spacing.sm : spacing.lg }}
               activeOpacity={0.7}
             >
-              <Ionicons name="menu-outline" size={24} color={colors.text} />
+              <Ionicons name="menu-outline" size={compact ? 20 : 24} color={colors.text} />
             </TouchableOpacity>
           ),
-          headerRight: () => <HeaderSupportButton />,
+          headerRight: () => (compact ? null : <HeaderSupportButton />),
           tabBarActiveTintColor: colors.text,
           tabBarInactiveTintColor: colors.textMuted,
           tabBarShowLabel: false,
           tabBarStyle: {
             backgroundColor: colors.surface,
             borderTopColor: colors.border,
-            height: 52 + insets.bottom,
+            height: (compact ? 38 : 52) + insets.bottom,
             paddingBottom: insets.bottom,
           },
           tabBarIcon: ({ focused, size }) => {
@@ -213,7 +219,7 @@ function AppContent() {
             return (
               <Ionicons
                 name={iconName ?? 'help-outline'}
-                size={size}
+                size={compact ? 18 : size}
                 color={focused ? colors.text : colors.textMuted}
               />
             );
@@ -295,12 +301,14 @@ export default function App() {
   if (!fontsLoaded) return null;
 
   return (
-    <SafeAreaProvider>
-      <AppProvider>
-        <AppContent />
-        <UpdatePrompt />
-      </AppProvider>
-    </SafeAreaProvider>
+    <ErrorBoundary>
+      <SafeAreaProvider>
+        <AppProvider>
+          <AppContent />
+          <UpdatePrompt />
+        </AppProvider>
+      </SafeAreaProvider>
+    </ErrorBoundary>
   );
 }
 

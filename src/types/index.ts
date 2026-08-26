@@ -379,6 +379,10 @@ export interface PackableOpl {
   customer: string;
   customer_name: string;
   sales_order: string | null;
+  // Two orders for the same customer can otherwise look identical in the
+  // picker — these differentiate by route/logistics rather than variety.
+  line_code?: string | null;
+  delivery_point?: string | null;
   pack_rate: number;
   is_mix: boolean;
   total_stems: number;
@@ -387,10 +391,36 @@ export interface PackableOpl {
   current_sequence: number;
   date_created: string | null;
   status: 'ready' | 'in_progress' | 'done';
-  // Comma-separated variety list from Pick List Items (server-populated).
+  // Comma-separated variety list, in the lengths the customer BOUGHT.
   // Powers the OPL picker search and the small variety caption on the
   // packing screen once an OPL is chosen.
   varieties?: string;
+  /**
+   * Per-variety targets from the OPL's Packing tab — what has to go in the
+   * boxes, in sold lengths. On a downgrade this differs from the issuing
+   * rows: the picker fetched 60cm, the order is 50cm, and packing must be
+   * measured against the 50cm line.
+   */
+  pack_lines?: PackLine[];
+  /** False for pick lists made before the Packing tab existed. */
+  from_pack_tab?: boolean;
+}
+
+export interface PackLine {
+  item_code: string;
+  item_name: string;
+  stem_length: string | null;
+  target_stems: number;
+  pack_rate: number;
+  /** Already in a box for this OPL, counted across every box. */
+  packed_stems?: number;
+  remaining?: number;
+  /**
+   * The codes that fill this line: its own, plus any physical codes
+   * downgraded into it. A scan reads the bunch's PHYSICAL code, so a 60cm
+   * bunch has to be recognised as filling the 50cm line it was picked for.
+   */
+  counts_as?: string[];
 }
 
 export interface ListOpenOplsResponse {
@@ -416,6 +446,22 @@ export interface PackBunchToOplResponse {
     bunch_size: string;
     stems: number;
   };
+  // The scanned variety sits on more than one line of this OPL (a straight
+  // line AND a mix group, or two different mix groups) — the server refused
+  // to guess. `choices` are the candidate lines; resubmit with `choice` set
+  // to the picked one's `key`.
+  needs_choice?: boolean;
+  scanned_variety?: string;
+  choices?: PackLineChoice[];
+}
+
+export interface PackLineChoice {
+  key: string;
+  item_code: string;
+  line_code: string | null;
+  delivery_point: string | null;
+  mix_group: string | null;
+  total_stems: number | null;
 }
 
 export interface PackableVariety {
@@ -571,6 +617,17 @@ export function setPackableVarieties(varieties: PackableVariety[]): void {
   cachedPackableVarieties = varieties;
 }
 
+// Callers feed this both item_name-style names ("Madam Red") and, for
+// varieties pulled off a Link field (Warehouse.custom_varieties_grown etc.),
+// item_code-style names ("Madam-Red") — Frappe autonames multi-word items by
+// swapping spaces for hyphens, so the two forms differ only in that
+// separator. Folding both "-" and " " to a single space before comparing
+// makes the two forms equal instead of silently failing every match for a
+// compound variety name while single-word varieties (no separator to get
+// wrong) pass by accident.
+const foldSeparators = (s: string): string =>
+  (s || '').trim().toLowerCase().replace(/[\s-]+/g, ' ');
+
 /**
  * Resolve a display variety name to its full item_code.
  * First tries to find a match in the cached packable varieties,
@@ -578,26 +635,25 @@ export function setPackableVarieties(varieties: PackableVariety[]): void {
  */
 export function resolveVarietyToItemCode(display: string): string {
   if (!display) return '';
-  
+
   // Try to find matching packable variety
-  const match = cachedPackableVarieties.find(v => 
-    v.display === display || 
-    v.item_name === display ||
-    v.item_name === `${display} ${PACKABLE_STEM_LENGTH}` ||
-    v.item_name === `${display} 50cm` ||
-    v.item_code === display ||
-    v.item_code === display.toUpperCase().replace(/\s+/g, '-')
+  const target = foldSeparators(display);
+  const match = cachedPackableVarieties.find(v =>
+    foldSeparators(v.display) === target ||
+    foldSeparators(v.item_name) === target ||
+    foldSeparators(v.item_name) === foldSeparators(`${display} ${PACKABLE_STEM_LENGTH}`) ||
+    foldSeparators(v.item_code) === target
   );
-  
+
   if (match) {
     return match.item_code;
   }
-  
+
   // Already carries a stem length? keep as-is.
   if (STEM_LENGTH_TAIL.test(display)) {
     return display;
   }
-  
+
   // Fallback: append the default stem length
   return `${display} ${PACKABLE_STEM_LENGTH}`;
 }

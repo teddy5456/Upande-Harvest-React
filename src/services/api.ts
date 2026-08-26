@@ -216,6 +216,11 @@ async function apiPost<T>(endpoint: string, payload: object, _retry = false): Pr
       durationMs: Date.now() - startedAt,
       error: err?.message || 'network failure',
     });
+    // Tag it so callers can tell "never reached the server, safe to queue
+    // for retry" apart from "the server rejected this" below — a screen
+    // that requeues a definite rejection (already received, shelf full,
+    // not harvested) just replays the same failure again later.
+    err.isNetworkError = true;
     throw err;
   }
 
@@ -397,6 +402,62 @@ export async function submitShelve(
     ...(postingDate && { posting_date: postingDate }),
     ...(postingTime && { posting_time: postingTime }),
   });
+}
+
+// ── Shelving suggestions (what to prioritise, what to do when a shelf is full)
+
+export interface WantedVariety {
+  item_code: string;
+  item_name: string;
+  remaining_qty: number;
+  so_count: number;
+  customer_count: number;
+  shelved_qty: number;
+}
+
+export interface EvictionCandidate {
+  shelf_id: string;
+  bucket_id: string;
+  variety: string;
+  stem_length: string | null;
+  stem_qty: number;
+  greenhouse: string | null;
+  warehouse: string | null;
+  date_added: string | null;
+  farm: string | null;
+}
+
+export interface OverflowBucket {
+  bucket_id: string;
+  item_code: string;
+  item_name: string;
+  qty: number;
+  farm: string | null;
+  received_at: string;
+  suggested_evict: EvictionCandidate | null;
+}
+
+export interface ShelvingSuggestions {
+  target_date: string;
+  farm: string | null;
+  wanted_varieties: WantedVariety[];
+  shelved_no_demand: EvictionCandidate[];
+  overflow_buckets: OverflowBucket[];
+}
+
+export async function getShelvingSuggestions(farm?: string, daysAhead = 1): Promise<ShelvingSuggestions> {
+  const res = await apiPost<any>('upande_harvest.api.get_shelving_suggestions', {
+    ...(farm ? { farm } : {}),
+    days_ahead: daysAhead,
+  });
+  const m: any = (res as any).message ?? res;
+  return {
+    target_date: m?.target_date ?? '',
+    farm: m?.farm ?? null,
+    wanted_varieties: m?.wanted_varieties ?? [],
+    shelved_no_demand: m?.shelved_no_demand ?? [],
+    overflow_buckets: m?.overflow_buckets ?? [],
+  };
 }
 
 // ── Shelf Transfer (mobile ShelveScreen → Transfer tab) ────────────────────
@@ -607,6 +668,10 @@ export async function listOpenOplsForPacking(params?: {
 export async function packBunchToOpl(params: {
   opl: string;
   bunch_id: string;
+  // Which line to use when the scanned variety matches more than one
+  // pack_summary row (straight + mix, or two mix groups) — the `key` from
+  // the needs_choice response's `choices`.
+  choice?: string;
 }): Promise<PackBunchToOplResponse> {
   return apiPost<PackBunchToOplResponse>('pack_bunch_to_opl', params);
 }
@@ -692,8 +757,80 @@ export interface DispatchResult {
   line_count: number;
 }
 
+// Dispatch by box: each printed box label is scanned off the truck, then the
+// notes are raised for exactly what was scanned. `expected_boxes` is the
+// pack list's full roster — the server is the only thing that knows it, since
+// Pack Box.total_boxes is not filled in on live.
+export interface DispatchBoxItem {
+  item_code: string;
+  qty: number;
+}
+
+export interface DispatchBox {
+  name: string;
+  box_id: string;
+  box_sequence: number;
+  total_boxes: number;
+  stems: number;
+  sales_order: string;
+  customer: string;
+  items: DispatchBoxItem[];
+}
+
+export interface DispatchScan {
+  box: DispatchBox;
+  fpl: string;
+  opl: string;
+  consignee: string;
+  expected_boxes: string[];
+  open_boxes: string[];
+}
+
+export interface DispatchNote {
+  delivery_note: string;
+  sales_order: string;
+  customer: string;
+  total_qty: number;
+  line_count: number;
+}
+
+export interface DispatchSubmitResult {
+  delivery_notes: DispatchNote[];
+  fpl: string;
+  opl: string;
+  boxes: number;
+  total_qty: number;
+}
+
+export async function getDispatchBox(boxId: string): Promise<DispatchScan> {
+  const res = await apiPost<any>('upande_harvest.api.get_dispatch_box', { box_id: boxId });
+  const m: any = (res as any).message ?? res;
+  return {
+    ...m,
+    box: { ...m?.box, items: m?.box?.items ?? [] },
+    expected_boxes: m?.expected_boxes ?? [],
+    open_boxes: m?.open_boxes ?? [],
+  } as DispatchScan;
+}
+
+export async function createDeliveryNotesFromBoxes(params: {
+  box_ids: string[];
+  driver_name: string;
+  truck_reg: string;
+  posting_date?: string;
+}): Promise<DispatchSubmitResult> {
+  const res = await apiPost<any>('upande_harvest.api.create_delivery_notes_from_boxes', params);
+  const m: any = (res as any).message ?? res;
+  return { ...m, delivery_notes: m?.delivery_notes ?? [] } as DispatchSubmitResult;
+}
+
 export async function getFplPreview(fpl: string): Promise<FplPreview> {
-  return apiPost<FplPreview>('upande_harvest.api.get_fpl_preview', { fpl });
+  // Whitelisted app methods answer as { message: {...} }; Server Scripts answer
+  // flat. Both shapes reach here — miss the unwrap and `preview.items` is
+  // undefined, which grey-screens Dispatch on the first scan (no ErrorBoundary).
+  const res = await apiPost<any>('upande_harvest.api.get_fpl_preview', { fpl });
+  const m: any = (res as any).message ?? res;
+  return { ...m, items: m?.items ?? [] } as FplPreview;
 }
 
 export async function createDeliveryNoteFromFpl(params: {
@@ -702,7 +839,8 @@ export async function createDeliveryNoteFromFpl(params: {
   truck_reg: string;
   posting_date?: string;
 }): Promise<DispatchResult> {
-  return apiPost<DispatchResult>('upande_harvest.api.create_delivery_note_from_fpl', params);
+  const res = await apiPost<any>('upande_harvest.api.create_delivery_note_from_fpl', params);
+  return ((res as any).message ?? res) as DispatchResult;
 }
 
 export async function submitActualHarvest(
@@ -862,6 +1000,54 @@ export async function getIssuingVarieties(): Promise<{ varieties: IssuingVariety
   }>('upande_harvest.api.get_issuing_varieties', {});
   const m: any = (res as any).message ?? res;
   return { varieties: m?.varieties ?? [] };
+}
+
+export interface IssuingCustomer {
+  customer: string | null;
+  customer_name: string | null;
+  stems_owed: number;
+  bucket_count: number;
+  variety_count: number;
+  opl_count: number;
+}
+
+// Customer-first counterpart to getIssuingVarieties() — used when
+// Upande Harvest Config.issuing_group_by = 'Customer First'.
+export async function getIssuingCustomers(): Promise<{ customers: IssuingCustomer[] }> {
+  const res = await apiPost<any>('upande_harvest.api.get_issuing_customers', {});
+  const m: any = (res as any).message ?? res;
+  return { customers: m?.customers ?? [] };
+}
+
+export interface IssuingVarietyForCustomer {
+  variety: string;
+  stems_owed: number;
+  bucket_count: number;
+  opl_count: number;
+}
+
+// Drill-down step for Customer First: varieties owed by one customer
+// (or by one Grade to Stock OPL, via the same PREGRADE: key getIssuingCustomers hands out).
+export async function getIssuingVarietiesForCustomer(
+  customer: string
+): Promise<{ varieties: IssuingVarietyForCustomer[] }> {
+  const res = await apiPost<any>('upande_harvest.api.get_issuing_varieties_for_customer', { customer });
+  const m: any = (res as any).message ?? res;
+  return { varieties: m?.varieties ?? [] };
+}
+
+export type IssuingGroupBy = 'Variety First' | 'Customer First';
+
+// Same reasoning as getStorageMode() — Upande Harvest Config is
+// System-Manager-only, so this reads it through a public wrapper.
+export async function getIssuingGroupBy(): Promise<IssuingGroupBy> {
+  const res = await apiPost<{ message?: { issuing_group_by?: string } }>(
+    'upande_harvest.api.get_issuing_group_by',
+    {}
+  );
+  const m: any = (res as any).message ?? res;
+  const v = m?.issuing_group_by;
+  return (v === 'Customer First' ? 'Customer First' : 'Variety First');
 }
 
 export async function getIssuingBuckets(
@@ -1910,11 +2096,144 @@ export async function traceItemJourney(code: string): Promise<JourneyTrace> {
   return unwrapFrappeMessage<JourneyTrace>(resp);
 }
 
+export interface RelabelOption { item_code: string; length: number }
+
+export interface RelabelInfo {
+  found: boolean;
+  message?: string;
+  bunch_id?: string;
+  stock_entry?: string;
+  bucket_id?: string | null;
+  /** What the bucket physically held — the truth the sticker should match. */
+  bucket_variety?: string;
+  /** What the sticker currently claims. */
+  current_label?: string;
+  stems?: number;
+  options?: RelabelOption[];
+}
+
+/**
+ * What a mis-stickered bunch may legitimately be corrected to. The server
+ * only offers lengths at or below the bucket's, so the options can never
+ * include something the correction would then refuse.
+ */
+export async function getRelabelOptions(bunchId: string): Promise<RelabelInfo> {
+  const resp = await apiPost<any>('upande_harvest.api.get_relabel_options', { bunch_id: bunchId });
+  return unwrapFrappeMessage<RelabelInfo>(resp);
+}
+
+/**
+ * Correct a bunch that was graded under the wrong sticker. Re-posts the
+ * grading stock entry as well as the label, so the ledger matches the stems.
+ */
+/** Stem lengths that exist as items — the batch relabel picker. */
+export async function getRelabelLengths(): Promise<number[]> {
+  const resp = await apiPost<any>('upande_harvest.api.get_relabel_lengths', {});
+  return unwrapFrappeMessage<number[]>(resp);
+}
+
+/**
+ * Relabel one bunch to a length, keeping its own variety. Built for the batch
+ * case: set "60cm" once, then scan a whole tray — a mixed tray still lands on
+ * the right item code per bunch.
+ */
+export async function relabelBunchToLength(params: {
+  bunchId: string;
+  lengthCm: number;
+  /** Omit both when the signed-in user is already a supervisor. */
+  supervisorUser?: string;
+  supervisorPin?: string;
+}): Promise<{ status: string; bunch_id: string; to: string; applied: string[] }> {
+  const resp = await apiPost<any>('upande_harvest.api.relabel_bunch_to_length', {
+    bunch_id: params.bunchId,
+    length_cm: params.lengthCm,
+    ...(params.supervisorUser ? { supervisor_user: params.supervisorUser } : {}),
+    ...(params.supervisorPin ? { supervisor_pin: params.supervisorPin } : {}),
+  });
+  return unwrapFrappeMessage(resp);
+}
+
+export interface PinCheck {
+  ok: boolean;
+  /** self | pin | wrong_pin | no_pin | not_supervisor | unknown_user | no_supervisor */
+  reason: string;
+  user?: string;
+  full_name?: string;
+  message?: string;
+}
+
+/** Check a supervisor PIN before arming, so the operator learns what is wrong now. */
+export async function verifyCorrectionPin(
+  supervisorUser?: string, supervisorPin?: string,
+): Promise<PinCheck> {
+  const resp = await apiPost<any>('upande_harvest.api.verify_correction_pin', {
+    ...(supervisorUser ? { supervisor_user: supervisorUser } : {}),
+    ...(supervisorPin ? { supervisor_pin: supervisorPin } : {}),
+  });
+  return unwrapFrappeMessage<PinCheck>(resp);
+}
+
+export interface CorrectionAuthContext {
+  user: string;
+  full_name: string;
+  /** True when the signed-in user already holds a supervisor role. */
+  self_authorized: boolean;
+}
+
+/** Whether this device's user can correct on their own authority. */
+export async function getCorrectionAuthContext(): Promise<CorrectionAuthContext> {
+  const resp = await apiPost<any>('upande_harvest.api.correction_auth_context', {});
+  return unwrapFrappeMessage<CorrectionAuthContext>(resp);
+}
+
+export async function relabelBunch(params: {
+  bunchId: string;
+  itemCode: string;
+  supervisorUser?: string;
+  supervisorPin?: string;
+}): Promise<{ status: string; applied: string[] }> {
+  return applyJourneyCorrection({
+    code: params.bunchId,
+    changes: { relabel: params.itemCode },
+    supervisorUser: params.supervisorUser,
+    supervisorPin: params.supervisorPin,
+  });
+}
+
+/**
+ * A bucket correction refuses once grading has already happened against it —
+ * rewriting the harvest entry alone would leave every grading Stock Entry
+ * pointing at the old, wrong variety. This is the fallback the server itself
+ * names in that refusal ("Use relabel_bucket_cycle..."): it re-issues the
+ * harvest/receiving entry at the corrected variety/length AND re-posts every
+ * grading already taken off the bucket against that correction, so the whole
+ * cycle moves together. Refuses on its own if the cycle has rejects posted
+ * (those carry P&L entries) or if the correction would cross varieties, not
+ * just length.
+ */
+export async function relabelBucketCycle(params: {
+  bucketId: string;
+  correctItemCode: string;
+  supervisorUser?: string;
+  supervisorPin?: string;
+}): Promise<{ status: string; bucket_id: string; to: string; applied: string[] }> {
+  const resp = await journeyPost<any>(
+    'upande_harvest.api.relabel_bucket_cycle', 'relabel_bucket_cycle', {
+      bucket_id: params.bucketId,
+      correct_item_code: params.correctItemCode,
+      ...(params.supervisorUser ? { supervisor_user: params.supervisorUser } : {}),
+      ...(params.supervisorPin ? { supervisor_pin: params.supervisorPin } : {}),
+    });
+  return unwrapFrappeMessage(resp);
+}
+
 export async function applyJourneyCorrection(params: {
   code: string;
   changes: Record<string, string | number>;
-  supervisorUser: string;
-  supervisorPwd: string;
+  /** All optional: a signed-in supervisor authorises on their own role. */
+  supervisorUser?: string;
+  supervisorPwd?: string;
+  supervisorPin?: string;
   /** Buckets only: 'new_cycle' posts a fresh Harvesting entry, 'amend' rewrites
    *  the last one. Omitted → the server keeps its legacy 'amend' default, which
    *  is what servers still running the old Server Script will do regardless. */
@@ -1922,10 +2241,11 @@ export async function applyJourneyCorrection(params: {
 }): Promise<{ status: string; applied: string[]; mode?: string }> {
   const resp = await journeyPost<any>(
     'upande_harvest.api.apply_journey_correction', 'apply_journey_correction', {
-      code:            params.code,
-      changes:         params.changes,
-      supervisor_user: params.supervisorUser,
-      supervisor_pwd:  params.supervisorPwd,
+      code:    params.code,
+      changes: params.changes,
+      ...(params.supervisorUser ? { supervisor_user: params.supervisorUser } : {}),
+      ...(params.supervisorPwd ? { supervisor_pwd: params.supervisorPwd } : {}),
+      ...(params.supervisorPin ? { supervisor_pin: params.supervisorPin } : {}),
       ...(params.mode ? { mode: params.mode } : {}),
     });
   return unwrapFrappeMessage(resp);

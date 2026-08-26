@@ -67,6 +67,12 @@ export default function ReceivingScreen() {
   const [qualityNotes, setQualityNotes] = useState('');
   const [otherText, setOtherText] = useState('');
   const [submittingQuality, setSubmittingQuality] = useState(false);
+  // Synchronous mirror of pendingQuality (see handleScanMona) + the idle
+  // auto-commit timer for whichever bucket is currently pending.
+  const pendingRef = useRef<typeof pendingQuality>(null);
+  const idleCommitTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Bucket IDs with a receiving submission currently in flight — see doReceive.
+  const receivingInFlightRef = useRef<Set<string>>(new Set());
 
   // Batch mode
   const [batchExpanded, setBatchExpanded] = useState(false);
@@ -102,6 +108,31 @@ export default function ReceivingScreen() {
 
   // Core submit logic — explicit params so it can be called from button OR auto-advance
   const doReceive = async (
+    bucketId: string,
+    variety: string,
+    gh: string,
+    lines: RejectLine[],
+    notes: string,
+  ) => {
+    // A scanner double-fire on the SAME bucket doesn't hit the
+    // prev.bucketId !== bucketId branch in handleScanMona (it's the same
+    // bucket, deliberately not treated as "a new one arrived") — it just
+    // reschedules a second independent 4s idle timer. Whichever call's
+    // getBucketBalance() resolves first isn't guaranteed to be the one
+    // whose timer fires first, so the "already superseded" null-check in
+    // that timer can lose the race. This is the one guard every caller
+    // (idle timer, auto-submit-previous, the quality submit button) goes
+    // through, checked synchronously so only the first ever gets past it.
+    if (receivingInFlightRef.current.has(bucketId)) return;
+    receivingInFlightRef.current.add(bucketId);
+    try {
+      await doReceiveInner(bucketId, variety, gh, lines, notes);
+    } finally {
+      receivingInFlightRef.current.delete(bucketId);
+    }
+  };
+
+  const doReceiveInner = async (
     bucketId: string,
     variety: string,
     gh: string,
@@ -148,12 +179,20 @@ export default function ReceivingScreen() {
           message: totalRejects > 0 ? `${totalRejects} rejected` : 'Synced',
         }, ...prev]);
         await refreshStats();
+        onScanSuccess();
         showConfirmation('success', totalRejects > 0 ? `Received — ${totalRejects} reject${totalRejects !== 1 ? 's' : ''} logged` : bucketId);
       } catch (error: any) {
-        await addToSyncQueue('receiving_entry', { bucket_id: bucketId });
-        await addReceivingEntry(bucketId, false);
+        // Only requeue when the request never reached the server. A definite
+        // rejection (e.g. "already received") will just fail the same way on
+        // retry — queuing it anyway is what turned one rejected duplicate
+        // scan into a second real duplicate attempt later from the sync loop.
+        if (error?.isNetworkError) {
+          await addToSyncQueue('receiving_entry', { bucket_id: bucketId });
+          await addReceivingEntry(bucketId, false);
+        }
         setEntries((prev) => [{ bucket_id: bucketId, time: now, status: 'error', message: error.message }, ...prev]);
         await refreshStats();
+        onScanError();
         showConfirmation('error', error.message);
       }
     } else {
@@ -161,6 +200,7 @@ export default function ReceivingScreen() {
       await addReceivingEntry(bucketId, false);
       setEntries((prev) => [{ bucket_id: bucketId, time: now, status: 'queued', message: 'Saved offline' }, ...prev]);
       await refreshStats();
+      onScanSuccess();
       showConfirmation('success', 'Saved offline');
     }
   };
@@ -173,6 +213,10 @@ export default function ReceivingScreen() {
       return;
     }
     setSubmittingQuality(true);
+    // Claim it before awaiting — otherwise the idle timer armed for this
+    // same bucket could fire mid-flight and submit it a second time.
+    pendingRef.current = null;
+    if (idleCommitTimer.current) { clearTimeout(idleCommitTimer.current); idleCommitTimer.current = null; }
     await doReceive(
       pendingQuality.bucketId,
       pendingQuality.variety ?? '',
@@ -185,6 +229,8 @@ export default function ReceivingScreen() {
   };
 
   const clearQualityCheck = () => {
+    pendingRef.current = null;
+    if (idleCommitTimer.current) { clearTimeout(idleCommitTimer.current); idleCommitTimer.current = null; }
     setPendingQuality(null);
     setQualityLines([]);
     setQualityNotes('');
@@ -192,21 +238,36 @@ export default function ReceivingScreen() {
   };
 
   // ── mona: single scan — fetch bucket info first, show quality panel before receiving ──
+  //
+  // pendingQuality (React state) mirrors what's on screen; pendingRef is the
+  // same value read/cleared synchronously. Two scans landing back-to-back
+  // (a fast burst, or a stray double-fire from the scanner input) both close
+  // over whatever `pendingQuality` was at render time — without the ref,
+  // both would see the SAME previous bucket and doReceive() it twice. The
+  // ref lets the first call claim it (set to null) before the second one
+  // even runs.
+  //
+  // idleCommitTimer covers the opposite gap: if nothing else gets scanned,
+  // the last bucket in a fast burst used to just sit in the quality panel
+  // forever waiting for a tap — "some buckets don't go in" turned out to be
+  // this. After a few idle seconds it commits itself with no defects, same
+  // as scanning the next bucket would have done.
   const handleScanMona = useCallback(
     async (data: string) => {
       const bucketId = parseScannedBucketQR(data);
+      // No sound here — reading the QR isn't the outcome. doReceive() below
+      // plays the accept/error sound once the server actually decides.
       if (!bucketId) { onScanError(); return; }
-      onScanSuccess();
 
-      // Auto-submit the previously pending bucket with no defects
-      if (pendingQuality && pendingQuality.bucketId !== bucketId) {
-        await doReceive(
-          pendingQuality.bucketId,
-          pendingQuality.variety ?? '',
-          pendingQuality.greenhouse ?? '',
-          [],   // no defects assumed
-          '',
-        );
+      if (idleCommitTimer.current) { clearTimeout(idleCommitTimer.current); idleCommitTimer.current = null; }
+
+      // Auto-submit the previously pending bucket with no defects — claim
+      // it from the ref first so a second near-simultaneous call can't also
+      // pick it up.
+      const prev = pendingRef.current;
+      if (prev && prev.bucketId !== bucketId) {
+        pendingRef.current = null;
+        await doReceive(prev.bucketId, prev.variety ?? '', prev.greenhouse ?? '', [], '');
         setQualityLines([]);
         setQualityNotes('');
         setOtherText('');
@@ -228,10 +289,25 @@ export default function ReceivingScreen() {
           harvestTime = info.harvest_time;
         } catch {}
       }
-      setPendingQuality({ bucketId, variety, greenhouse, qty, harvester, harvestTime });
+      const next = { bucketId, variety, greenhouse, qty, harvester, harvestTime };
+      pendingRef.current = next;
+      setPendingQuality(next);
       if (batchMode) setBatchBuckets((prev) => prev.includes(bucketId) ? prev : [...prev, bucketId]);
+
+      idleCommitTimer.current = setTimeout(() => {
+        idleCommitTimer.current = null;
+        if (pendingRef.current?.bucketId !== bucketId) return; // superseded already
+        pendingRef.current = null;
+        doReceive(bucketId, variety ?? '', greenhouse ?? '', [], '');
+        setQualityLines([]);
+        setQualityNotes('');
+        setOtherText('');
+      }, 4000);
     },
-    [isConnected, batchMode, pendingQuality, doReceive]
+    // pendingQuality itself is read via pendingRef (see comment above), so
+    // it's deliberately not a dependency here — that's what keeps this
+    // callback identity stable across the auto-commit's own re-renders.
+    [isConnected, batchMode, doReceive]
   );
 
   // ── xflora: single-scan receiving (transfer is on its own screen) ────────
@@ -275,6 +351,10 @@ export default function ReceivingScreen() {
   );
 
   useEffect(() => { handleScanRef.current = handleScanMona; }, [handleScanMona]);
+
+  useEffect(() => () => {
+    if (idleCommitTimer.current) clearTimeout(idleCommitTimer.current);
+  }, []);
 
   useEffect(() => {
     if (!prefillBucketId || isXflora) return;
@@ -548,6 +628,7 @@ export default function ReceivingScreen() {
         <EntriesLog
           entries={entries}
           label="bucket"
+          onClear={() => setEntries([])}
           renderEntry={(entry, idx) => (
             <View key={`${entry.bucket_id}-${idx}`} style={styles.entryRow}>
               <Ionicons

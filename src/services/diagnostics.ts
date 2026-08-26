@@ -16,7 +16,7 @@ import * as Device from 'expo-device';
 import * as Updates from 'expo-updates';
 import { Platform } from 'react-native';
 import { getApiTraces, ApiCallTrace } from './api';
-import { getApiUrl, getSid, getUserEmail, getFullName } from '../database/settings';
+import { getApiUrl, getSid, getUserEmail, getFullName, getSetting, setSetting } from '../database/settings';
 import { getPendingCount, getFailedCount } from '../database/sync-queue';
 
 export interface DiagnosticBundle {
@@ -52,17 +52,27 @@ export interface DiagnosticBundle {
     failed: number;
   };
   apiTraces: ApiCallTrace[];
+  // The last render/JS crash ErrorBoundary caught, if any happened since it
+  // was last read — this is what used to be an unattributable "black
+  // screen" support ticket. Cleared once read so it's reported exactly once.
+  lastCrash: Record<string, any> | null;
 }
 
 export async function captureDiagnostics(opts: { online: boolean }): Promise<DiagnosticBundle> {
-  const [serverUrl, sid, userEmail, fullName, pending, failed] = await Promise.all([
+  const [serverUrl, sid, userEmail, fullName, pending, failed, lastCrashRaw] = await Promise.all([
     getApiUrl(),
     getSid(),
     getUserEmail(),
     getFullName(),
     safe(() => getPendingCount(), 0),
     safe(() => getFailedCount(), 0),
+    safe(() => getSetting('lastCrash'), null),
   ]);
+  let lastCrash: Record<string, any> | null = null;
+  if (lastCrashRaw) {
+    try { lastCrash = JSON.parse(lastCrashRaw); } catch { lastCrash = { raw: lastCrashRaw }; }
+    setSetting('lastCrash', '').catch(() => {});
+  }
 
   return {
     capturedAt: new Date().toISOString(),
@@ -97,6 +107,7 @@ export async function captureDiagnostics(opts: { online: boolean }): Promise<Dia
       failed: failed ?? 0,
     },
     apiTraces: getApiTraces(),
+    lastCrash,
   };
 }
 
