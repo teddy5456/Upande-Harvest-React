@@ -20,6 +20,7 @@ import ScanInput from '../components/ScanInput';
 import ScanConfirmation from '../components/ScanConfirmation';
 import OplPicker from '../components/OplPicker';
 import FixStickerSheet from '../components/FixStickerSheet';
+import PackingDashboardModal from '../components/PackingDashboardModal';
 import { PackingListEntry, PackableOpl, PackLineChoice, PackBunchToOplResponse } from '../types';
 import { extractGradingQRValue } from '../utils/grading-utils';
 import { onScanSuccess, onScanError } from '../utils/feedback';
@@ -57,6 +58,7 @@ export default function PackingScreen() {
   // Packing is where a wrong sticker actually surfaces — the packer scans a
   // bunch for an order and the label does not match — so the repair lives here.
   const [fixOpen, setFixOpen] = useState(false);
+  const [dashboardOpen, setDashboardOpen] = useState(false);
 
   const [oplSession, setOplSession] = useState<ActiveOplSession | null>(null);
   const [oplBunches, setOplBunches] = useState<PackingListEntry[]>([]);
@@ -371,6 +373,15 @@ export default function PackingScreen() {
   return (
     <View style={styles.container}>
 
+      <TouchableOpacity
+        style={styles.dashboardToggle}
+        onPress={() => setDashboardOpen(true)}
+        hitSlop={10}
+        activeOpacity={0.8}
+      >
+        <Ionicons name="stats-chart" size={compact ? 14 : 18} color={colors.text} />
+      </TouchableOpacity>
+
       <ScrollView
         style={styles.scroll}
         contentContainerStyle={s(styles.scrollContent, c.scrollContent)}
@@ -606,6 +617,7 @@ export default function PackingScreen() {
       </ScrollView>
 
       <FixStickerSheet visible={fixOpen} onClose={() => setFixOpen(false)} />
+      <PackingDashboardModal visible={dashboardOpen} onClose={() => setDashboardOpen(false)} />
 
       <Modal
         visible={!!choicePrompt?.visible}
@@ -662,6 +674,20 @@ export default function PackingScreen() {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: colors.background },
+  dashboardToggle: {
+    position: 'absolute',
+    top: spacing.md,
+    right: spacing.md,
+    zIndex: 10,
+    width: 32,
+    height: 32,
+    borderRadius: borderRadius.full,
+    backgroundColor: colors.surface,
+    borderWidth: 1,
+    borderColor: colors.border,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
   hidden: { display: 'none' },
   fixEntry: {
     flexDirection: 'row', alignItems: 'center', gap: spacing.sm,

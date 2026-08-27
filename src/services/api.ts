@@ -11,6 +11,7 @@ import {
   QualitySection,
   QuarantineAction,
   GradingDashboardData,
+  PackingDashboardData,
   BucketBalance,
   RejectResponse,
   CreateBoxesForOplResponse,
@@ -879,6 +880,13 @@ export async function fetchDashboardData(fromDate?: string, toDate?: string): Pr
       to_date: toDate,
     });
   }
+}
+
+export async function fetchPackingDashboard(fromDate?: string, toDate?: string): Promise<PackingDashboardData> {
+  return apiPost<PackingDashboardData>('upande_harvest.api.get_packing_dashboard_data', {
+    from_date: fromDate,
+    to_date: toDate,
+  });
 }
 
 export async function fetchShelvesDashboard(): Promise<any> {

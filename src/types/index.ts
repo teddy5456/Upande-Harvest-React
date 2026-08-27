@@ -780,6 +780,40 @@ export interface GradingDashboardData {
   rejection_rate: number;
 }
 
+export interface PackingDashboardTotals {
+  boxes: number;
+  open: number;
+  closed: number;
+  stems: number;
+  avg_fill_pct: number;
+  downsized_stems: number;
+  downsized_entries: number;
+  avg_boxes_per_day: number;
+}
+
+export interface PackingDashboardBreakdown {
+  customer?: string;
+  variety?: string;
+  farm?: string;
+  boxes?: number;
+  bunches?: number;
+  stems: number;
+}
+
+export interface PackingDashboardData {
+  from_date: string;
+  to_date: string;
+  totals: PackingDashboardTotals;
+  mix_vs_single: {
+    mix: { boxes: number; stems: number };
+    single: { boxes: number; stems: number };
+  } | null;
+  per_customer: PackingDashboardBreakdown[];
+  per_variety: PackingDashboardBreakdown[];
+  per_farm: PackingDashboardBreakdown[];
+  timeline: { day: string; boxes: number; stems: number }[];
+}
+
 export interface BucketBalance {
   bucket_id: string;
   variety: string;
