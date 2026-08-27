@@ -23,10 +23,11 @@ const C = {
   warmAmber: '#FFFBEB',
 };
 
-function BreakdownCard({ title, rows, unitLabel }: {
+function BreakdownCard({ title, rows, unitLabel, showBoxes }: {
   title: string;
   rows: PackingDashboardBreakdown[];
   unitLabel: string;
+  showBoxes?: boolean;
 }) {
   if (!rows.length) return null;
   const label = (r: PackingDashboardBreakdown) => r.customer || r.variety || r.farm || '—';
@@ -36,9 +37,14 @@ function BreakdownCard({ title, rows, unitLabel }: {
       {rows.map((r, i) => (
         <View key={`${label(r)}-${i}`} style={s.breakdownRow}>
           <Text style={s.breakdownLabel} numberOfLines={1}>{label(r)}</Text>
-          <Text style={s.breakdownValue}>
-            {r.stems.toLocaleString()} <Text style={s.breakdownUnit}>{unitLabel}</Text>
-          </Text>
+          <View style={{ alignItems: 'flex-end' }}>
+            <Text style={s.breakdownValue}>
+              {r.stems.toLocaleString()} <Text style={s.breakdownUnit}>{unitLabel}</Text>
+            </Text>
+            {showBoxes && typeof r.boxes === 'number' && (
+              <Text style={s.breakdownSub}>{r.boxes} box{r.boxes === 1 ? '' : 'es'}</Text>
+            )}
+          </View>
         </View>
       ))}
     </View>
@@ -155,7 +161,32 @@ export default function PackingDashboardModal({ visible, onClose }: {
               </View>
             )}
 
-            <BreakdownCard title="TOP CUSTOMERS" rows={data?.per_customer || []} unitLabel="stems" />
+            {/* Personal performance — scoped to whoever's logged in, not a
+                leaderboard. Pack Box has no dedicated packer field, so this
+                is attributed by `owner` (whoever's session opened the box). */}
+            {data?.personal && (data.personal.boxes > 0 || data.personal.stems > 0) && (
+              <View style={s.varianceCard}>
+                <Text style={s.folderTab}>PERSONAL PERFORMANCE</Text>
+                <View style={s.varianceBody}>
+                  <View style={s.varianceStat}>
+                    <Text style={s.varianceStatLabel}>Your boxes</Text>
+                    <Text style={s.varianceStatNum}>{data.personal.boxes}</Text>
+                  </View>
+                  <View style={s.varianceDivider} />
+                  <View style={s.varianceStat}>
+                    <Text style={s.varianceStatLabel}>Your stems</Text>
+                    <Text style={s.varianceStatNum}>{data.personal.stems.toLocaleString()}</Text>
+                  </View>
+                  <View style={s.varianceDivider} />
+                  <View style={s.varianceStat}>
+                    <Text style={s.varianceStatLabel}>Your avg fill</Text>
+                    <Text style={s.varianceStatNum}>{data.personal.avg_fill_pct}%</Text>
+                  </View>
+                </View>
+              </View>
+            )}
+
+            <BreakdownCard title="CUSTOMER PACKING PERFORMANCE" rows={data?.per_customer || []} unitLabel="stems" showBoxes />
             <BreakdownCard title="TOP VARIETIES" rows={data?.per_variety || []} unitLabel="stems" />
             <BreakdownCard title="PER FARM" rows={data?.per_farm || []} unitLabel="stems" />
 
@@ -296,4 +327,5 @@ const s = StyleSheet.create({
   breakdownLabel: { fontFamily: fontFamily.medium, fontSize: fontSize.sm, color: C.text, flex: 1 },
   breakdownValue: { fontFamily: fontFamily.semiBold, fontSize: fontSize.sm, color: C.text },
   breakdownUnit: { fontFamily: fontFamily.regular, fontSize: fontSize.xs, color: C.textMuted },
+  breakdownSub: { fontFamily: fontFamily.regular, fontSize: fontSize.xs, color: C.textMuted, marginTop: 1 },
 });

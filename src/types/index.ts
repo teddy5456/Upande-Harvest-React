@@ -808,6 +808,9 @@ export interface PackingDashboardData {
     mix: { boxes: number; stems: number };
     single: { boxes: number; stems: number };
   } | null;
+  // "How did I do" — scoped to the calling session's own user.
+  personal: { boxes: number; stems: number; avg_fill_pct: number };
+  per_packer: { packer: string; packer_name: string; boxes: number; stems: number }[];
   per_customer: PackingDashboardBreakdown[];
   per_variety: PackingDashboardBreakdown[];
   per_farm: PackingDashboardBreakdown[];
