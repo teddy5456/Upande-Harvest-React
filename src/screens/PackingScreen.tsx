@@ -373,14 +373,30 @@ export default function PackingScreen() {
   return (
     <View style={styles.container}>
 
-      <TouchableOpacity
-        style={styles.dashboardToggle}
-        onPress={() => setDashboardOpen(true)}
-        hitSlop={10}
-        activeOpacity={0.8}
-      >
-        <Ionicons name="stats-chart" size={compact ? 14 : 18} color={colors.text} />
-      </TouchableOpacity>
+      {/* One toolbar for every screen-level action — a floating button plus
+          an inline row each doing their own thing read as clutter, not two
+          features. */}
+      <View style={s(styles.topBar, c.topBar)}>
+        <Text style={s(styles.topBarTitle, c.topBarTitle)}>Packing</Text>
+        <View style={styles.topBarActions}>
+          <TouchableOpacity
+            style={styles.topBarBtn}
+            onPress={() => setFixOpen(true)}
+            hitSlop={10}
+            activeOpacity={0.8}
+          >
+            <Ionicons name="construct-outline" size={compact ? 14 : 18} color={colors.text} />
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={styles.topBarBtn}
+            onPress={() => setDashboardOpen(true)}
+            hitSlop={10}
+            activeOpacity={0.8}
+          >
+            <Ionicons name="stats-chart" size={compact ? 14 : 18} color={colors.text} />
+          </TouchableOpacity>
+        </View>
+      </View>
 
       <ScrollView
         style={styles.scroll}
@@ -392,18 +408,6 @@ export default function PackingScreen() {
         onMomentumScrollBegin={() => pauseScanFocus()}
         scrollEventThrottle={16}
       >
-
-        <TouchableOpacity
-          style={s(styles.fixEntry, c.fixEntry)}
-          onPress={() => setFixOpen(true)}
-          activeOpacity={0.8}
-        >
-          <Ionicons name="construct-outline" size={compact ? 12 : 14} color={colors.text} />
-          <Text style={s(styles.fixEntryText, c.fixEntryText)} numberOfLines={1}>
-            {compact ? 'Fix sticker' : "Fix a wrong sticker"}
-          </Text>
-          <Ionicons name="chevron-forward" size={compact ? 12 : 14} color={colors.textMuted} />
-        </TouchableOpacity>
 
         {!oplSession ? (
           <View style={s(styles.oplPickerWrap, c.oplPickerWrap)}>
@@ -674,11 +678,21 @@ export default function PackingScreen() {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: colors.background },
-  dashboardToggle: {
-    position: 'absolute',
-    top: spacing.md,
-    right: spacing.md,
-    zIndex: 10,
+  hidden: { display: 'none' },
+  topBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: spacing.lg,
+    paddingTop: spacing.md,
+    paddingBottom: spacing.sm,
+    borderBottomWidth: 1,
+    borderBottomColor: colors.border,
+    backgroundColor: colors.background,
+  },
+  topBarTitle: { fontFamily: fontFamily.semiBold, fontSize: fontSize.lg, color: colors.text },
+  topBarActions: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm },
+  topBarBtn: {
     width: 32,
     height: 32,
     borderRadius: borderRadius.full,
@@ -688,14 +702,6 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
-  hidden: { display: 'none' },
-  fixEntry: {
-    flexDirection: 'row', alignItems: 'center', gap: spacing.sm,
-    paddingHorizontal: spacing.md, paddingVertical: spacing.sm,
-    backgroundColor: colors.surface, borderWidth: 1, borderColor: colors.border,
-    borderRadius: borderRadius.md, marginBottom: spacing.md,
-  },
-  fixEntryText: { flex: 1, fontFamily: fontFamily.medium, fontSize: fontSize.sm, color: colors.text },
   scroll: { flex: 1 },
   scrollContent: { padding: spacing.lg, paddingBottom: spacing.xxl },
 
@@ -906,8 +912,8 @@ const styles = StyleSheet.create({
  * of `styles` via the `s()` helper — padding and type shrink, nothing moves.
  */
 const c = StyleSheet.create({
-  fixEntry: { paddingVertical: spacing.xs, paddingHorizontal: spacing.sm, marginBottom: spacing.sm, gap: spacing.xs },
-  fixEntryText: { fontSize: fontSize.xs },
+  topBar: { paddingHorizontal: spacing.sm, paddingTop: spacing.sm, paddingBottom: spacing.xs },
+  topBarTitle: { fontSize: fontSize.md },
   scrollContent: { padding: spacing.sm, paddingBottom: spacing.md },
 
   boxSequenceText: { fontSize: fontSize.xs },
