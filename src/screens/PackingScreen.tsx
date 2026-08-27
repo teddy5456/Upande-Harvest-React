@@ -26,7 +26,7 @@ import { extractGradingQRValue } from '../utils/grading-utils';
 import { onScanSuccess, onScanError } from '../utils/feedback';
 import { useCompact } from '../hooks/useCompact';
 import { pauseScanFocus } from '../utils/scan-focus';
-import { colors, fontFamily, fontSize, spacing, borderRadius } from '../theme';
+import { colors, fontFamily, fontSize, spacing, borderRadius, shadow } from '../theme';
 
 /**
  * Packing — pack-by-OPL only. Scanning a box label used to be a second mode
@@ -59,6 +59,7 @@ export default function PackingScreen() {
   // bunch for an order and the label does not match — so the repair lives here.
   const [fixOpen, setFixOpen] = useState(false);
   const [dashboardOpen, setDashboardOpen] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
 
   const [oplSession, setOplSession] = useState<ActiveOplSession | null>(null);
   const [oplBunches, setOplBunches] = useState<PackingListEntry[]>([]);
@@ -373,31 +374,6 @@ export default function PackingScreen() {
   return (
     <View style={styles.container}>
 
-      {/* One toolbar for every screen-level action — a floating button plus
-          an inline row each doing their own thing read as clutter, not two
-          features. */}
-      <View style={s(styles.topBar, c.topBar)}>
-        <Text style={s(styles.topBarTitle, c.topBarTitle)}>Packing</Text>
-        <View style={styles.topBarActions}>
-          <TouchableOpacity
-            style={styles.topBarBtn}
-            onPress={() => setFixOpen(true)}
-            hitSlop={10}
-            activeOpacity={0.8}
-          >
-            <Ionicons name="construct-outline" size={compact ? 14 : 18} color={colors.text} />
-          </TouchableOpacity>
-          <TouchableOpacity
-            style={styles.topBarBtn}
-            onPress={() => setDashboardOpen(true)}
-            hitSlop={10}
-            activeOpacity={0.8}
-          >
-            <Ionicons name="stats-chart" size={compact ? 14 : 18} color={colors.text} />
-          </TouchableOpacity>
-        </View>
-      </View>
-
       <ScrollView
         style={styles.scroll}
         contentContainerStyle={s(styles.scrollContent, c.scrollContent)}
@@ -411,12 +387,8 @@ export default function PackingScreen() {
 
         {!oplSession ? (
           <View style={s(styles.oplPickerWrap, c.oplPickerWrap)}>
-            <View style={s(styles.sectionHeader, c.sectionHeader)}>
-              <Ionicons name="list-outline" size={icon} color={colors.text} />
-              <Text style={s(styles.sectionTitle, c.sectionTitle)}>Pick an OPL</Text>
-            </View>
             <View style={s(styles.pickerHost, c.pickerHost)}>
-              <OplPicker onSelect={handleOplPicked} />
+              <OplPicker onSelect={handleOplPicked} onMenuPress={() => setMenuOpen(true)} />
             </View>
           </View>
         ) : (
@@ -453,6 +425,9 @@ export default function PackingScreen() {
                     </Text>
                   )}
                 </View>
+                <TouchableOpacity onPress={() => setMenuOpen(true)} style={styles.resetBtn} hitSlop={8}>
+                  <Ionicons name="ellipsis-vertical" size={18} color={colors.textMuted} />
+                </TouchableOpacity>
                 <TouchableOpacity onPress={resetOplSession} style={styles.resetBtn}>
                   <Ionicons name="close-outline" size={18} color={colors.textMuted} />
                 </TouchableOpacity>
@@ -623,6 +598,30 @@ export default function PackingScreen() {
       <FixStickerSheet visible={fixOpen} onClose={() => setFixOpen(false)} />
       <PackingDashboardModal visible={dashboardOpen} onClose={() => setDashboardOpen(false)} />
 
+      <Modal visible={menuOpen} transparent animationType="fade" onRequestClose={() => setMenuOpen(false)}>
+        <TouchableOpacity style={styles.menuBackdrop} activeOpacity={1} onPress={() => setMenuOpen(false)}>
+          <View style={styles.menuCard}>
+            <TouchableOpacity
+              style={styles.menuItem}
+              onPress={() => { setMenuOpen(false); setFixOpen(true); }}
+              activeOpacity={0.7}
+            >
+              <Ionicons name="construct-outline" size={18} color={colors.text} />
+              <Text style={styles.menuItemText}>Fix a wrong sticker</Text>
+            </TouchableOpacity>
+            <View style={styles.menuDivider} />
+            <TouchableOpacity
+              style={styles.menuItem}
+              onPress={() => { setMenuOpen(false); setDashboardOpen(true); }}
+              activeOpacity={0.7}
+            >
+              <Ionicons name="stats-chart" size={18} color={colors.text} />
+              <Text style={styles.menuItemText}>Packing dashboard</Text>
+            </TouchableOpacity>
+          </View>
+        </TouchableOpacity>
+      </Modal>
+
       <Modal
         visible={!!choicePrompt?.visible}
         transparent
@@ -679,29 +678,21 @@ export default function PackingScreen() {
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: colors.background },
   hidden: { display: 'none' },
-  topBar: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingHorizontal: spacing.lg,
-    paddingTop: spacing.md,
-    paddingBottom: spacing.sm,
-    borderBottomWidth: 1,
-    borderBottomColor: colors.border,
-    backgroundColor: colors.background,
-  },
-  topBarTitle: { fontFamily: fontFamily.semiBold, fontSize: fontSize.lg, color: colors.text },
-  topBarActions: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm },
-  topBarBtn: {
-    width: 32,
-    height: 32,
-    borderRadius: borderRadius.full,
+  menuBackdrop: { flex: 1, backgroundColor: 'rgba(0,0,0,0.15)', alignItems: 'flex-end' },
+  menuCard: {
+    marginTop: spacing.xl + spacing.lg,
+    marginRight: spacing.md,
     backgroundColor: colors.surface,
+    borderRadius: borderRadius.md,
     borderWidth: 1,
     borderColor: colors.border,
-    alignItems: 'center',
-    justifyContent: 'center',
+    minWidth: 200,
+    paddingVertical: spacing.xs,
+    ...shadow.md,
   },
+  menuItem: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm, paddingVertical: spacing.sm + 2, paddingHorizontal: spacing.md },
+  menuItemText: { fontFamily: fontFamily.medium, fontSize: fontSize.sm, color: colors.text },
+  menuDivider: { height: 1, backgroundColor: colors.border },
   scroll: { flex: 1 },
   scrollContent: { padding: spacing.lg, paddingBottom: spacing.xxl },
 

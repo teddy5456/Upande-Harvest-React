@@ -50,6 +50,10 @@ const STATUSES: { key: StatusKey; label: string }[] = [
 interface Props {
   onSelect: (opl: PackableOpl) => void;
   disabled?: boolean;
+  // Screen-level actions (Fix sticker, Dashboard, …) that don't belong to
+  // OplPicker itself — the caller owns the menu, this just gives it a home
+  // in the same row as search/filter instead of a separate toolbar.
+  onMenuPress?: () => void;
 }
 
 // ── Date helpers ─────────────────────────────────────────────────────────
@@ -120,7 +124,7 @@ function statusMeta(status: PackableOpl['status'], sequence: number) {
   return { label: 'Ready', color: colors.textSecondary };
 }
 
-export default function OplPicker({ onSelect, disabled }: Props) {
+export default function OplPicker({ onSelect, disabled, onMenuPress }: Props) {
   const [opls, setOpls] = useState<PackableOpl[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
@@ -264,6 +268,12 @@ export default function OplPicker({ onSelect, disabled }: Props) {
           <Ionicons name="options-outline" size={18} color={colors.text} />
           {filtersActive && <View style={styles.filterDot} />}
         </TouchableOpacity>
+
+        {onMenuPress && (
+          <TouchableOpacity style={styles.filterBtn} onPress={onMenuPress} activeOpacity={0.7}>
+            <Ionicons name="ellipsis-vertical" size={18} color={colors.text} />
+          </TouchableOpacity>
+        )}
       </View>
 
       {/* Only surfaces when the view isn't the default — a quiet reminder of

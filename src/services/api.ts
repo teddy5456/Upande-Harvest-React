@@ -883,7 +883,13 @@ export async function fetchDashboardData(fromDate?: string, toDate?: string): Pr
 }
 
 export async function fetchPackingDashboard(fromDate?: string, toDate?: string): Promise<PackingDashboardData> {
-  return apiPost<PackingDashboardData>('upande_harvest.api.get_packing_dashboard_data', {
+  // Bare name, not the dotted Python path: there's a Server Script of this
+  // exact name that calls the api.py function and does
+  // frappe.response.update(result) to answer flat. The dotted path calls
+  // the plain function directly, which just `return`s the dict — Frappe
+  // wraps that under "message" by default, so every field read flat here
+  // came back undefined even though the underlying data was correct.
+  return apiPost<PackingDashboardData>('get_packing_dashboard_data', {
     from_date: fromDate,
     to_date: toDate,
   });
