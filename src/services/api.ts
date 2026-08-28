@@ -2004,13 +2004,13 @@ export async function getMySupportThreads(): Promise<{ threads: SupportThread[] 
 
 // ── Discard Request ─────────────────────────────────────────────────────────
 // Approved-and-incomplete requests power the picker; consumeDiscardRequest
-// applies one scan against the chosen request. Both calls live in
-// upande_harvest.discard_api.
+// applies one scan against the chosen request. Both calls are bare-name
+// Server Scripts (Discards Request doctype), not dotted app.py paths.
 
 export async function getOpenDiscardRequests(
   coldstore: DiscardColdstore,
 ): Promise<{ coldstore: DiscardColdstore; requests: DiscardRequestSummary[] }> {
-  const resp = await apiPost<any>('upande_harvest.discard_api.get_open_discard_requests', { coldstore });
+  const resp = await apiPost<any>('get_open_discards_requests', { coldstore });
   return unwrapFrappeMessage(resp);
 }
 
@@ -2018,7 +2018,7 @@ export async function consumeDiscardRequest(
   requestName: string,
   scanId: string,
 ): Promise<DiscardConsumeResponse> {
-  const resp = await apiPost<any>('upande_harvest.discard_api.consume_discard_request', {
+  const resp = await apiPost<any>('consume_discards_request', {
     request_name: requestName,
     scan_id:      scanId,
   });
